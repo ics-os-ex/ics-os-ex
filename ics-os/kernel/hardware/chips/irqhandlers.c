@@ -29,6 +29,7 @@
 #define IRQ_KEYBOARD 2
 #define IRQ_FDC 64
 #define IRQ_MOUSE 16  //added by jach
+#define IRQ_NETWORK 2048  // IRQ 11 for network card
 
 typedef struct _idtr {
    WORD limit;

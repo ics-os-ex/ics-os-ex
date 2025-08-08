@@ -155,6 +155,8 @@ void dex_init();
 #include "console/dex_DDL.c"
 #include "hardware/dexapm.c"
 #include "hardware/chips/irqhandlers.c"
+#include "hardware/serial/serial.c"
+#include "debug/klog.c"
 #include "memory/dlmalloc.c"
 #include "memory/bsdmallo.c"
 #include "stdlib/time.c"
@@ -241,7 +243,7 @@ void main(){
     
    /* Enable the keyboard IRQ,Timer IRQ and the Floppy Disk IRQ.As more devices that uses IRQs get supported, we should OR more of them here*/
    //program8259(IRQ_TIMER | IRQ_KEYBOARD | IRQ_FDC | IRQ_MOUSE | IRQ_CASCADE); 
-   program8259(IRQ_TIMER | IRQ_KEYBOARD | IRQ_FDC | IRQ_CASCADE); 
+   program8259(IRQ_TIMER | IRQ_KEYBOARD | IRQ_FDC | IRQ_NETWORK | IRQ_CASCADE); 
 
    //sets up the default interrupt handlers, like the PF handler,GPF handler
    setdefaulthandlers();   
@@ -334,6 +336,20 @@ void dex32_startup(){
    //Initialize the extension manager
    printf("Initializing the extension manager...");
    extension_init();
+   printf("[OK]\n");
+
+   //initialize the serial logging system
+   printf("Initializing serial logging...");
+   serial_log_init();
+   printf("[OK]\n");
+
+   //initialize the kernel logging system
+   printf("Initializing kernel logging...");
+   klog_init();
+   klog_set_target(KLOG_TARGET_BOTH);  // Output to both console and serial
+   klog_set_level(KLOG_DEBUG);         // Show all log levels
+   klog_enable_timestamps(1);          // Enable timestamps
+   klog_enable_subsystem_tags(1);      // Enable subsystem tags
    printf("[OK]\n");
 
    //initialize the device manager

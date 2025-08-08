@@ -5,6 +5,7 @@
 #include "../dextypes.h"
 #include "net.h"
 #include "../hardware/rtl8139/rtl8139.h"
+#include "../debug/klog.h"
 
 // Utilities already available elsewhere:
 // memcpy, memset, printf
@@ -213,6 +214,7 @@ static void handle_arp(uint8_t *frame, unsigned len){
     uint16_t op = net_htons(arp->oper);
     if(op == 1){ // request
         if(arp->tpa == net_htonl(net_ip_addr)){
+            klog_info(KLOG_SUBSYS_NETWORK, "ARP request for our IP, sending reply");
             // Build reply
             struct arp_hdr reply;
             reply.htype = net_htons(1);
@@ -262,14 +264,19 @@ static void handle_ipv4(uint8_t *frame, unsigned len, uint8_t *src_mac){
     if((ip->ver_ihl>>4) != 4 || ihl < 20) return;
     if(len < ihl) return;
     if(ip->daddr != net_htonl(net_ip_addr)) return; // not for us
+    
+    klog_debug(KLOG_SUBSYS_NETWORK, "IPv4 packet received, protocol=%d", ip->proto);
+    
     if(ip->proto == 1){ // ICMP
         if(len < ihl + sizeof(struct icmp_echo)) return;
         struct icmp_echo *echo = (struct icmp_echo*)((uint8_t*)ip + ihl);
         if(echo->type == 8){ // echo request
+            klog_info(KLOG_SUBSYS_NETWORK, "ICMP ping request received, sending reply");
             send_icmp_echo_reply(ip, echo, src_mac);
             printf("ICMP echo reply sent\n");
         }
     } else if(ip->proto == 6){ // TCP
+        klog_debug(KLOG_SUBSYS_NETWORK, "TCP packet received");
         handle_tcp(((uint8_t*)ip)+ihl, len - ihl, ip, src_mac);
     }
 }
@@ -283,14 +290,19 @@ void ethernet_handle_packet(uint8_t *data, unsigned len){
     unsigned payload_len = (len >= 14)? (len - 14) : 0;
     (void)dest; // currently unused, but retained for future filtering
 
+    klog_debug(KLOG_SUBSYS_NETWORK, "Ethernet frame received, type=0x%04x, length=%d", eth_type, len);
+
     switch(eth_type){
         case NET_ETH_TYPE_ARP:
+            klog_debug(KLOG_SUBSYS_NETWORK, "Processing ARP packet");
             handle_arp(payload, payload_len);
             break;
         case NET_ETH_TYPE_IP:
+            klog_debug(KLOG_SUBSYS_NETWORK, "Processing IPv4 packet");
             handle_ipv4(payload, payload_len, src);
             break;
         default:
+            klog_debug(KLOG_SUBSYS_NETWORK, "Unknown ethernet type 0x%04x, ignoring", eth_type);
             break; // ignored
     }
 }
@@ -299,6 +311,21 @@ void net_init(){
     uint8_t mac[6];
     get_mac_addr(mac);
     net_set_mac(mac);
+    
+    klog_info(KLOG_SUBSYS_NETWORK, "Network stack initialized");
+    klog_info(KLOG_SUBSYS_NETWORK, "MAC Address: %02x:%02x:%02x:%02x:%02x:%02x", 
+              net_mac_addr[0], net_mac_addr[1], net_mac_addr[2], 
+              net_mac_addr[3], net_mac_addr[4], net_mac_addr[5]);
+    klog_info(KLOG_SUBSYS_NETWORK, "IP Address: %d.%d.%d.%d", 
+              (net_ip_addr>>24)&0xFF, (net_ip_addr>>16)&0xFF, 
+              (net_ip_addr>>8)&0xFF, net_ip_addr & 0xFF);
+    klog_info(KLOG_SUBSYS_NETWORK, "Gateway: %d.%d.%d.%d", 
+              (net_ip_gateway>>24)&0xFF, (net_ip_gateway>>16)&0xFF, 
+              (net_ip_gateway>>8)&0xFF, net_ip_gateway & 0xFF);
+    klog_info(KLOG_SUBSYS_NETWORK, "Netmask: %d.%d.%d.%d", 
+              (net_ip_netmask>>24)&0xFF, (net_ip_netmask>>16)&0xFF, 
+              (net_ip_netmask>>8)&0xFF, net_ip_netmask & 0xFF);
+              
     printf("Network MAC: ");
     net_dump_mac(net_mac_addr); printf("\n");
     printf("IP Address: %d.%d.%d.%d\n", (net_ip_addr>>24)&0xFF,(net_ip_addr>>16)&0xFF,(net_ip_addr>>8)&0xFF, net_ip_addr & 0xFF);
