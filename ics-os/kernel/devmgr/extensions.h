@@ -26,6 +26,9 @@
     Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA. 
 */
 
+#ifndef EXTENSIONS_H_GUARD
+#define EXTENSIONS_H_GUARD
+
 #include "dex32_devmgr.h"
 
 #define EXT_MAXEXTENSIONS 50
@@ -42,3 +45,5 @@ devmgr_generic *iface;
 int extension_busy = 0 ,extension_ps_ready = 0;
 
 extension_info *extension_table = 0;
+
+#endif /* EXTENSIONS_H_GUARD */

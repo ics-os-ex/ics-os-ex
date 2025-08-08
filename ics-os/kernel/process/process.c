@@ -24,6 +24,45 @@
  */
 
 #include "process.h"
+#include "../dextypes.h"
+#include <stdarg.h>
+#include "../startup/multiboot.h"  // defines mmap used in dexmem.h
+#include "../memory/dexmem.h"      // for pagedir1, setgdt, setcallgate
+#include "../devmgr/dex32_devmgr.h" // for devmgr_scheduler_extension, devmgr_generic, extension_table
+#include "../devmgr/bridges.h"
+#include "../process/scheduler.h"
+#include "../console/dexio.h"       // textcolor, textbackground
+#include "../console/console.h"     // console structures
+#include "../console/clipboard.h"
+#include "../console/foreground.h"  // fg related globals
+#include "../console/dex_DDL.h"
+#include "../devmgr/extensions.h"   // CURRENT_SCHEDULER
+#include "../hardware/exceptions.h" // pfwrapper
+#include "../hardware/keyboard/keyboard.h"
+#include "../hardware/keyboard/mouse.h"
+#include "../memory/kheap.h"        // knext
+// dexmalloc has no separate header; functions declared extern below
+#include "../stdlib/time.h"         // ticks
+#include "../dexapi/dex32API.h"      // syscall numbers
+
+// Extern declarations for globals previously satisfied via monolithic linkage
+// pagedir1, knext, userheap, syscallstack, syscallsize, ticks defined in dexmem/time modules
+extern DEX32_DDL_INFO *consoleDDL;
+extern void dex_init();
+// IRQ/exception wrapper entry points (from irqwrap.asm / exceptions)
+extern void kbdwrapper();
+extern void mousewrapper();
+extern void pfwrapper();
+extern void gpfwrapper();
+extern void taskswitcher();
+// dexmalloc interfaces
+extern void dexmalloc_init();
+extern void *dex_malloc(unsigned int size);
+extern void dex_free(void *ptr);
+extern int flushing;
+extern int flushok;
+extern int context_switch_rate; // defined in kernel32.c
+extern unsigned int ticks; // timer ticks from irqhandlers.c
 
 /*
 int lock_var = 0; // actual lock global variable used to provide synchronization

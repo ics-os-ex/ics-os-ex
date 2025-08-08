@@ -8,6 +8,8 @@
   malloc function that the user wants to use.
 */
 
+DWORD auxillary_malloc_base = 0;
+
 /*This functions serves as a brdige to the malloc function, it picks the current
   malloc function being used and then diverts to it, for the actual malloc function
   you have to refer to the module it calls*/

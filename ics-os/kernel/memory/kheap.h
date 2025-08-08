@@ -8,7 +8,10 @@
   malloc function that the user wants to use.
 */
 
-DWORD auxillary_malloc_base = 0;
+#ifndef KHEAP_H_GUARD
+#define KHEAP_H_GUARD
+
+extern DWORD auxillary_malloc_base;
 
 
 /*==============================Prototyp Definitions here=====================================*/
@@ -20,4 +23,6 @@ void *malloc(unsigned int size);
 void *realloc(void *ptr,unsigned int size);
 void free(void *ptr);
 void alloc_init();
+
+#endif /* KHEAP_H_GUARD */
 

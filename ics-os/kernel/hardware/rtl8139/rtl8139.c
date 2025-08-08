@@ -42,26 +42,25 @@ void outports(WORD _port, WORD _data) {
 
 
 void receive_packet() {
-    WORD * t = (WORD*)(rtl8139_device.rx_buffer + current_packet_ptr);
-    // Skip packet header, get packet length
-    WORD packet_length = *(t + 1);
+    // Layout: [status(2)][len(2)][data][CRC(4)]
+    WORD *hdr = (WORD*)(rtl8139_device.rx_buffer + current_packet_ptr);
+    WORD status = hdr[0];
+    WORD packet_length = hdr[1];
+    (void)status;
+    if(packet_length == 0 || packet_length > 1600) {
+        current_packet_ptr = 0; // reset
+        outports(rtl8139_device.io_base + CAPR, current_packet_ptr - 0x10);
+        return;
+    }
+    uint8_t *pkt = (uint8_t*)(hdr + 2);
+    static uint8_t copy_buf[1600];
+    unsigned copy_len = packet_length > sizeof(copy_buf) ? sizeof(copy_buf) : packet_length;
+    memcpy(copy_buf, pkt, copy_len);
+    ethernet_handle_packet(copy_buf, copy_len);
 
-    // Skip, packet header and packet length, now t points to the packet data
-    t = t + 2;
-    //qemu_printf("Printing packet at addr 0x%x\n", (DWORD)t);
-    //xxd(t, packet_length);
-
-    // Now, ethernet layer starts to handle the packet(be sure to make a copy of the packet, insteading of using the buffer)
-    // and probabbly this should be done in a separate thread...
-    //void * packet = kmalloc(packet_length);
-    //memcpy(packet, t, packet_length);
-    //ethernet_handle_packet(packet, packet_length);
-
-    //current_packet_ptr = (current_packet_ptr + packet_length + 4 + 3) & RX_READ_POINTER_MASK;
-
-    //if(current_packet_ptr > RX_BUF_SIZE)
-    //    current_packet_ptr -= RX_BUF_SIZE;
-
+    current_packet_ptr = (current_packet_ptr + packet_length + 4 + 3) & RX_READ_POINTER_MASK;
+    if(current_packet_ptr > RX_BUF_SIZE)
+        current_packet_ptr -= RX_BUF_SIZE;
     outports(rtl8139_device.io_base + CAPR, current_packet_ptr - 0x10);
 }
 
@@ -153,10 +152,12 @@ void rtl8139_init() {
 
    printf("here\n");
 
-    // Allocate receive buffer
-    //rtl8139_device.rx_buffer = kmalloc(8192 + 16 + 1500);
+    // Allocate receive buffer statically for now
+    static char rx_space[8192 + 16 + 1500] __attribute__((aligned(4)));
+    rtl8139_device.rx_buffer = rx_space;
     memset(rtl8139_device.rx_buffer, 0x0, 8192 + 16 + 1500);
-    //outportl(rtl8139_device.io_base + 0x30, (DWORD)virtual2phys(kpage_dir,rtl8139_device.rx_buffer));
+    outportl(rtl8139_device.io_base + 0x30, (DWORD)rtl8139_device.rx_buffer);
+    current_packet_ptr = 0;
 
     // Sets the TOK and ROK bits high
     outports(rtl8139_device.io_base + 0x3C, 0x0005);

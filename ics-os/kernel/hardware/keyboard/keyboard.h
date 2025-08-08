@@ -7,6 +7,8 @@
 */
 
 //The size of the keyboard bufer
+#ifndef KEYBOARD_H_GUARD
+#define KEYBOARD_H_GUARD
 #define BUF_SIZE 256
 
 
@@ -147,5 +149,7 @@ int kb_ready();
 char getch();
 unsigned int getchw();
 void installkeyboard();
+
+#endif /* KEYBOARD_H_GUARD */
 
 

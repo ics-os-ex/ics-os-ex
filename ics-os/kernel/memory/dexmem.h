@@ -29,6 +29,9 @@
   Unlike real-mode, protected mode uses selectors instead of segments. Selectors
   point to a table (the GDT) which contains information like the base of the segment
   and protection bits (See the an Intel 386/486/Pentium manuel for details on these*/
+#ifndef DEXMEM_H_GUARD
+#define DEXMEM_H_GUARD
+
 #define LINEAR_SEL 8
 #define SYS_CODE_SEL 56
 #define SYS_DATA_SEL 0x20
@@ -196,3 +199,5 @@ void dex32_restoreints(DWORD flags);
 void setpageattb(DWORD *pagedir,DWORD vaddr,DWORD attb);
 void *dex32_setpageattb(DWORD virtualaddr,DWORD pages,DWORD *pagedir,DWORD pattb);
 void *dex32_setpageattbblock(DWORD virtualaddr,int amt,DWORD *pagecount,DWORD *pagedir,DWORD attb);
+
+#endif /* DEXMEM_H_GUARD */

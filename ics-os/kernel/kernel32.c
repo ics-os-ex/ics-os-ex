@@ -175,8 +175,10 @@ void dex_init();
 //#include "hardware/pcibus/access.c"
 //#include "hardware/pcibus/generic.c"
 //#include "hardware/pcibus/jachpci.c"
-//#include "hardware/rtl8139/pci.c"
-//#include "hardware/rtl8139/rtl8139.c"
+// RTL8139 NIC + minimal network stack
+#include "hardware/rtl8139/pci.c"
+#include "hardware/rtl8139/rtl8139.c"
+#include "network/net.c"
 //-----------------------------------
 //#include "hardware/pcibus/i386-ports.c"
 //#include "hardware/pcibus/access.c"
@@ -360,11 +362,13 @@ void dex32_startup(){
 
    //Initialize the PCI bus driver
    printf("Initializing PCI devices...");
-   //show_pci();
-   //icsos_pci_init();
+   icsos_pci_init();
    printf("[OK]\n");
    printf("Initializing rtl8139 NIC...");
-   //rtl8139_init();
+   rtl8139_init();
+   printf("[OK]\n");
+   printf("Initializing network stack...");
+   net_init();
    printf("[OK]\n");
    //delay(400/80);
 				

@@ -24,6 +24,9 @@
     Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA. 
 */
 
+#ifndef FOREGROUND_H_GUARD
+#define FOREGROUND_H_GUARD
+
 #include "dex_DDL.h"
 #define FG_MAXCONSOLE 20
 
@@ -67,4 +70,6 @@ void fg_set_state(int state);
 void fg_showmenu(int choice);
 int fg_toggle();
 void fg_updateinfo();
+
+#endif /* FOREGROUND_H_GUARD */
 

@@ -5,6 +5,8 @@
 
 #ifndef RTL8139_H
 #define RTL8139_H
+
+// Types expected to be available from prior inclusion of dextypes.h in kernel32.c
 //#include <system.h>
 //#include <kheap.h>
 //#include <paging.h>
@@ -98,6 +100,9 @@ void read_mac_addr();
 void receive_packet();
 
 void get_mac_addr();
+
+// Network stack hook (implemented in network/net.c)
+void ethernet_handle_packet(uint8_t *data, unsigned len);
 
 
 

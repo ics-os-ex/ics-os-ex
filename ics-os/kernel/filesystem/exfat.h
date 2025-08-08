@@ -30,10 +30,7 @@
 
 #include "../vfs/vfs_core.h"
 
-typedef unsigned char	uint8_t;
-typedef unsigned short	uint16_t;
-typedef unsigned long	uint32_t;
-typedef unsigned long long uint64_t;
+// Integer types supplied by global headers; avoid redefinition here.
 
 // exFAT constants
 #define EXFAT_SIGNATURE 0x4146544558 // "EXFAT"

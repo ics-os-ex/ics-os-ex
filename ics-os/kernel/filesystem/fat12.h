@@ -30,9 +30,7 @@
 
 #include "../vfs/vfs_core.h"
 
-typedef unsigned char	uint8_t;	/* or #include <stdint.h> */
-typedef unsigned short	uint16_t;	/* Note: multi-byte values are little-endian */
-typedef unsigned long	uint32_t;
+// Integer types are provided globally by dextypes.h; avoid redefining here.
 
 #define FAT12_EOC 0x0FFF
 #define FAT16_EOC 0xFFFF
