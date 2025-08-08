@@ -16,6 +16,15 @@ uint32_t net_ip_addr     = (10u<<24) | (0u<<16) | (2u<<8) | 15u;
 uint32_t net_ip_gateway  = (10u<<24) | (0u<<16) | (2u<<8) | 2u;  // 10.0.2.2
 uint32_t net_ip_netmask  = (255u<<24)|(255u<<16)|(255u<<8)|0u;    // 255.255.255.0
 
+// Minimal ARP cache entry for gateway (enough to send one ICMP echo request)
+static uint8_t net_gateway_mac[6];
+static int net_gateway_mac_valid = 0;
+
+// ICMP echo tracking
+static uint16_t icmp_ident = 0x1234;
+static uint16_t icmp_seq   = 0;
+static int icmp_gateway_echo_sent = 0; // send once automatically after ARP resolution
+
 static uint16_t net_htons(uint16_t v){ return (v>>8) | (v<<8); }
 static uint32_t net_htonl(uint32_t v){ return ((v>>24)&0xff) | ((v>>8)&0xff00) | ((v<<8)&0xff0000) | ((v<<24)&0xff000000); }
 
@@ -35,6 +44,8 @@ void net_dump_mac(const uint8_t *m){
 void net_set_mac(const uint8_t *mac){
     memcpy(net_mac_addr, mac, 6);
 }
+
+// (net_send_arp_request declared later after struct arp_hdr definition)
 
 // Frame building helper
 static void net_send_frame(uint8_t *dest, uint16_t eth_type, const void *payload, uint16_t payload_len){
@@ -62,6 +73,22 @@ struct arp_hdr {
     uint8_t  tha[6];
     uint32_t tpa; // target protocol (IP) address
 } __attribute__((packed));
+
+// Build and send an ARP request (who-has target_ip tell our IP)
+static void net_send_arp_request(uint32_t target_ip){
+    struct arp_hdr req;
+    req.htype = net_htons(1);
+    req.ptype = net_htons(NET_ETH_TYPE_IP);
+    req.hlen = 6; req.plen = 4;
+    req.oper = net_htons(1); // request
+    memcpy(req.sha, net_mac_addr, 6);
+    req.spa = net_htonl(net_ip_addr);
+    memset(req.tha, 0x00, 6);
+    req.tpa = net_htonl(target_ip);
+    uint8_t bcast[6]; memset(bcast, 0xFF, 6);
+    klog_info(KLOG_SUBSYS_NETWORK, "Sending ARP request for %d.%d.%d.%d", (target_ip>>24)&0xFF, (target_ip>>16)&0xFF, (target_ip>>8)&0xFF, target_ip & 0xFF);
+    net_send_frame(bcast, NET_ETH_TYPE_ARP, &req, sizeof(req));
+}
 
 // IPv4 + ICMP
 struct ipv4_hdr {
@@ -228,6 +255,13 @@ static void handle_arp(uint8_t *frame, unsigned len){
             net_send_frame(arp->sha, NET_ETH_TYPE_ARP, &reply, sizeof(reply));
             printf("ARP reply sent\n");
         }
+    } else if(op == 2) { // reply
+        // Cache gateway MAC if this is from gateway
+        if(arp->spa == net_htonl(net_ip_gateway) && !net_gateway_mac_valid) {
+            memcpy(net_gateway_mac, arp->sha, 6);
+            net_gateway_mac_valid = 1;
+            klog_info(KLOG_SUBSYS_NETWORK, "Cached gateway MAC %02x:%02x:%02x:%02x:%02x:%02x", net_gateway_mac[0],net_gateway_mac[1],net_gateway_mac[2],net_gateway_mac[3],net_gateway_mac[4],net_gateway_mac[5]);
+        }
     }
 }
 
@@ -257,6 +291,38 @@ static void send_icmp_echo_reply(struct ipv4_hdr *ip, struct icmp_echo *echo, ui
     net_send_frame(src_mac, NET_ETH_TYPE_IP, payload, sizeof(payload));
 }
 
+// Minimal outbound ICMP echo request (to already-known MAC)
+static void send_icmp_echo_request(uint32_t dst_ip, uint8_t *dst_mac){
+    struct ipv4_hdr ip_out;
+    struct icmp_echo echo;
+    // Prepare ICMP echo
+    echo.type = 8; // request
+    echo.code = 0;
+    echo.ident = net_htons(icmp_ident);
+    echo.seq   = net_htons(icmp_seq++);
+    // Simple payload pattern
+    for(int i=0;i<sizeof(echo.data);i++) echo.data[i] = (uint8_t)i;
+    echo.csum = 0;
+    echo.csum = checksum16(&echo, sizeof(echo));
+    // IPv4 header
+    ip_out.ver_ihl = 0x45;
+    ip_out.tos = 0;
+    ip_out.tot_len = net_htons(sizeof(ip_out) + sizeof(echo));
+    ip_out.id = 0;
+    ip_out.frag_off = 0;
+    ip_out.ttl = 64;
+    ip_out.proto = 1; // ICMP
+    ip_out.hdr_checksum = 0;
+    ip_out.saddr = net_htonl(net_ip_addr);
+    ip_out.daddr = net_htonl(dst_ip);
+    ip_out.hdr_checksum = checksum16(&ip_out, sizeof(ip_out));
+    uint8_t payload[sizeof(ip_out)+sizeof(echo)];
+    memcpy(payload, &ip_out, sizeof(ip_out));
+    memcpy(payload+sizeof(ip_out), &echo, sizeof(echo));
+    net_send_frame(dst_mac, NET_ETH_TYPE_IP, payload, sizeof(payload));
+    klog_info(KLOG_SUBSYS_NETWORK, "ICMP echo request sent seq=%u ident=0x%04x", icmp_seq-1, icmp_ident);
+}
+
 static void handle_ipv4(uint8_t *frame, unsigned len, uint8_t *src_mac){
     if(len < sizeof(struct ipv4_hdr)) return;
     struct ipv4_hdr *ip = (struct ipv4_hdr*)frame;
@@ -274,6 +340,8 @@ static void handle_ipv4(uint8_t *frame, unsigned len, uint8_t *src_mac){
             klog_info(KLOG_SUBSYS_NETWORK, "ICMP ping request received, sending reply");
             send_icmp_echo_reply(ip, echo, src_mac);
             printf("ICMP echo reply sent\n");
+        } else if(echo->type == 0) { // echo reply
+            klog_info(KLOG_SUBSYS_NETWORK, "ICMP echo reply received (ident=0x%04x seq=%u)", net_htons(echo->ident), net_htons(echo->seq));
         }
     } else if(ip->proto == 6){ // TCP
         klog_debug(KLOG_SUBSYS_NETWORK, "TCP packet received");
@@ -329,8 +397,18 @@ void net_init(){
     printf("Network MAC: ");
     net_dump_mac(net_mac_addr); printf("\n");
     printf("IP Address: %d.%d.%d.%d\n", (net_ip_addr>>24)&0xFF,(net_ip_addr>>16)&0xFF,(net_ip_addr>>8)&0xFF, net_ip_addr & 0xFF);
+
+    // Proactively announce ourselves and query gateway to exercise TX early.
+    net_send_arp_request(net_ip_addr);      // Gratuitous (target = self)
+    net_send_arp_request(net_ip_gateway);   // Query gateway
 }
 
 void net_periodic(){
-    // Placeholder for future activities (ARP cache aging, timeouts, etc.)
+    // Poll NIC if needed (e.g., IRQ fallback)
+    rtl8139_periodic();
+    // If we have gateway MAC but haven’t sent an echo yet, send one
+    if(net_gateway_mac_valid && !icmp_gateway_echo_sent) {
+        send_icmp_echo_request(net_ip_gateway, net_gateway_mac);
+        icmp_gateway_echo_sent = 1;
+    }
 }

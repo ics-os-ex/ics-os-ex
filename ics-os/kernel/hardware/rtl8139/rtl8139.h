@@ -101,6 +101,9 @@ void receive_packet();
 
 void get_mac_addr();
 
+// Periodic poll (fallback if IRQ not firing)
+void rtl8139_periodic();
+
 // Network stack hook (implemented in network/net.c)
 void ethernet_handle_packet(uint8_t *data, unsigned len);
 

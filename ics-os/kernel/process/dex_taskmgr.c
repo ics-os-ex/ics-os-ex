@@ -24,6 +24,8 @@
     Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA. 
 */
 
+#include "../network/net.h"
+
 DEX32_DDL_INFO *taskmgrout; //holds the handle to the task managers console screen
 int taskmgr_fgid;
 fg_processinfo *taskmgrfg;
@@ -89,6 +91,8 @@ int loop;
         if (dex32_tm_active)
         show_process();
         dd_swaptohardware(taskmgrout);
+  // Network periodic polling (fallback / timers)
+  net_periodic();
         delay(refreshrate);
     };
 };

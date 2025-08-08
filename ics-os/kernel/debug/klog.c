@@ -262,6 +262,17 @@ void klog_printf(klog_level_t level, const char* subsystem, const char* fmt, ...
     va_end(args);
 }
 
+// Backward compatibility: provide function symbol klog_error even if macro alias exists
+#ifdef klog_error
+#undef klog_error
+#endif
+void klog_error(const char* subsystem, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    klog_vprintf(KLOG_ERR, subsystem, fmt, args);
+    va_end(args);
+}
+
 /*
  * Show current log configuration
  */

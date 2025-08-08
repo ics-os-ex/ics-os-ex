@@ -92,6 +92,11 @@ void klog_vprintf(klog_level_t level, const char* subsystem, const char* fmt, va
 #define klog_info(subsys, fmt, ...)     klog_printf(KLOG_INFO, subsys, fmt, ##__VA_ARGS__)
 #define klog_debug(subsys, fmt, ...)    klog_printf(KLOG_DEBUG, subsys, fmt, ##__VA_ARGS__)
 
+// Backward compatibility alias (legacy code may still call klog_error)
+#ifndef klog_error
+#define klog_error(subsys, fmt, ...)    klog_err(subsys, fmt, ##__VA_ARGS__)
+#endif
+
 // Simplified macros without subsystem (use KERNEL as default)
 #define kemerg(fmt, ...)    klog_emerg(KLOG_SUBSYS_KERNEL, fmt, ##__VA_ARGS__)
 #define kalert(fmt, ...)    klog_alert(KLOG_SUBSYS_KERNEL, fmt, ##__VA_ARGS__)

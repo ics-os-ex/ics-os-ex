@@ -38,9 +38,9 @@ inline unsigned char inportb(unsigned int port)
 
 inline DWORD inportl(unsigned int port)
 {
-   unsigned char ret;
-   asm volatile ("inl %%dx,%%eax":"=a" (ret):"d" (port));
-   return ret;
+  unsigned int ret;
+  asm volatile ("inl %%dx,%%eax":"=a" (ret):"d" (port));
+  return ret;
 };
 
 
