@@ -36,6 +36,10 @@
 #define FXN_DPUTC 0x6
 #define FXN_EXIT 3
 #define FXN_SLEEP 0x54
+#define FXN_NET_INFO 0xA8
+#define FXN_NET_RECV 0xA9
+#define FXN_NET_SEND 0xAA
+#define FXN_NET_CFG  0xAB
 #define FXN_GETPARAMS 0x50
 #define FXN_OPENFILE 0x4
 #define FXN_TIME 0x55

@@ -351,6 +351,8 @@ void dex32_startup(){
    klog_enable_timestamps(1);          // Enable timestamps
    klog_enable_subsystem_tags(1);      // Enable subsystem tags
    printf("[OK]\n");
+   // Register klog syscalls for user-space access
+   klog_register_syscalls();
 
    //initialize the device manager
    printf("Initializing the device manager...");
@@ -392,6 +394,9 @@ void dex32_startup(){
    printf("Initializing kernel API...");		  
    api_init();
    printf("[OK]\n");
+
+   // Register networking syscalls (must occur after api_init)
+   net_register_syscalls();
 
    //initialize the keyboard device driver
    printf("Initializing keyboard and mouse drivers...");

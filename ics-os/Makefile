@@ -6,6 +6,12 @@
 vmdex:
 	make -C kernel/
 
+# Build and install contributed applications (netdiag etc.)
+.PHONY: contrib-apps
+contrib-apps:
+	$(MAKE) -C contrib/netdiag install
+	$(MAKE) -C contrib/dmesg install
+
 .PHONY: clean
 clean:
 	rm -f vmdex
@@ -34,7 +40,7 @@ prep_image: vmdex
 	cp sdk/* tmp/tcc1/
 	cp lib/* tmp/lib1/
 
-floppy: prep_image
+floppy: contrib-apps prep_image
 	cp grub.img ics-os-floppy.img                #copy an image with grub
 	-sudo umount mnt 2>/dev/null || true         #unmount if already mounted
 	sudo rm -fr mnt

@@ -125,4 +125,8 @@ klog_config_t* klog_get_config(void);
 // Function to dump current log configuration
 void klog_show_config(void);
 
+// User-space access: register syscalls for klog (call after api_init())
+void klog_register_syscalls(void);
+
+
 #endif /* __KLOG_H__ */

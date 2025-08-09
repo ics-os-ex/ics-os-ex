@@ -6,9 +6,14 @@
 #include "net.h"
 #include "../hardware/rtl8139/rtl8139.h"
 #include "../debug/klog.h"
+#include "../dexapi/dex32API.h"  // for api_addsystemcall prototype
 
 // Utilities already available elsewhere:
 // memcpy, memset, printf
+
+// Forward static prototypes (used before their definitions below)
+static void net_send_arp_request(uint32_t target_ip);
+static void send_icmp_echo_request(uint32_t dst_ip, uint8_t *dst_mac);
 
 uint8_t net_mac_addr[6] = {0};
 // 10.0.2.15 (QEMU user default guest IP typical example)
@@ -24,6 +29,109 @@ static int net_gateway_mac_valid = 0;
 static uint16_t icmp_ident = 0x1234;
 static uint16_t icmp_seq   = 0;
 static int icmp_gateway_echo_sent = 0; // send once automatically after ARP resolution
+
+// --- User space event queue (very small ring) ---
+struct net_event_rec {
+    uint16_t type;   // NET_EVENT_*
+    uint16_t len;    // bytes of data[] used
+    uint8_t  data[64]; // small payload snippet (truncated if larger)
+};
+
+#define NET_EVENT_QUEUE_SIZE 32
+static struct net_event_rec net_event_q[NET_EVENT_QUEUE_SIZE];
+static volatile uint16_t net_event_head = 0; // write position
+static volatile uint16_t net_event_tail = 0; // read position
+
+void net_user_event(uint16_t type, const uint8_t *data, uint16_t len){
+    if(len > 64) len = 64; // truncate
+    uint16_t next = (net_event_head + 1) % NET_EVENT_QUEUE_SIZE;
+    if(next == net_event_tail){
+        // queue full, drop (could count drops later)
+        return;
+    }
+    net_event_q[net_event_head].type = type;
+    net_event_q[net_event_head].len = len;
+    if(len && data) memcpy(net_event_q[net_event_head].data, data, len);
+    net_event_head = next;
+}
+
+static int net_user_event_dequeue(struct net_event_rec *out){
+    if(net_event_tail == net_event_head) return 0; // empty
+    *out = net_event_q[net_event_tail];
+    net_event_tail = (net_event_tail + 1) % NET_EVENT_QUEUE_SIZE;
+    return 1;
+}
+
+// --- Syscall implementations ---
+// Simple info structure
+struct net_info; // forward (defined in header)
+
+// function numbers (choose unused high range) 0xA8-0xAB
+#define SYSCALL_NET_INFO 0xA8
+#define SYSCALL_NET_RECV 0xA9
+#define SYSCALL_NET_SEND 0xAA
+#define SYSCALL_NET_CFG  0xAB
+
+static DWORD sys_net_info(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e){
+    (void)a;(void)b;(void)c;(void)d;(void)e;
+    struct net_info *ni = (struct net_info*)a; // user buffer
+    if(!ni) return (DWORD)-1;
+    ni->ip = net_ip_addr;
+    ni->gateway = net_ip_gateway;
+    ni->netmask = net_ip_netmask;
+    memcpy(ni->mac, net_mac_addr, 6);
+    if(net_gateway_mac_valid) memcpy(ni->gateway_mac, net_gateway_mac, 6); else memset(ni->gateway_mac,0,6);
+    ni->flags = net_gateway_mac_valid ? 1u : 0u;
+    return 0;
+}
+
+static DWORD sys_net_recv(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e){
+    (void)b;(void)c;(void)d;(void)e;
+    struct net_event_rec *uer = (struct net_event_rec*)a; // user supplied buffer
+    if(!uer) return (DWORD)-1;
+    struct net_event_rec tmp;
+    if(!net_user_event_dequeue(&tmp)) return 0; // no event
+    *uer = tmp; // copy out
+    return 1; // one event returned
+}
+
+// sys_net_send: a=op, op=1 send additional gateway ICMP echoes (b=count)
+static DWORD sys_net_send(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e){
+    (void)c;(void)d;(void)e;
+    if(a==1){
+        unsigned cnt = b?b:1;
+        if(!net_gateway_mac_valid) return (DWORD)-2;
+        while(cnt--) send_icmp_echo_request(net_ip_gateway, net_gateway_mac);
+        return 0;
+    }
+    return (DWORD)-1;
+}
+
+struct net_cfg_req { uint32_t ip, gateway, netmask; };
+static DWORD sys_net_cfg(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e){
+    (void)b;(void)c;(void)d;(void)e;
+    struct net_cfg_req *cfg = (struct net_cfg_req*)a;
+    if(!cfg) return (DWORD)-1;
+    net_ip_addr = cfg->ip;
+    net_ip_gateway = cfg->gateway;
+    net_ip_netmask = cfg->netmask;
+    net_gateway_mac_valid = 0;
+    icmp_gateway_echo_sent = 0;
+    net_send_arp_request(net_ip_addr);
+    net_send_arp_request(net_ip_gateway);
+    klog_info(KLOG_SUBSYS_NETWORK, "Network config updated: IP %d.%d.%d.%d GW %d.%d.%d.%d",
+        (net_ip_addr>>24)&0xFF,(net_ip_addr>>16)&0xFF,(net_ip_addr>>8)&0xFF, net_ip_addr&0xFF,
+        (net_ip_gateway>>24)&0xFF,(net_ip_gateway>>16)&0xFF,(net_ip_gateway>>8)&0xFF, net_ip_gateway&0xFF);
+    return 0;
+}
+
+void net_register_syscalls(){
+    api_addsystemcall(SYSCALL_NET_INFO, sys_net_info, 0, 0);
+    api_addsystemcall(SYSCALL_NET_RECV, sys_net_recv, 0, 0);
+    api_addsystemcall(SYSCALL_NET_SEND, sys_net_send, 0, 0);
+    api_addsystemcall(SYSCALL_NET_CFG,  sys_net_cfg,  0, 0);
+    klog_info(KLOG_SUBSYS_NETWORK, "Network syscalls registered (info=0x%X recv=0x%X send=0x%X cfg=0x%X)", SYSCALL_NET_INFO, SYSCALL_NET_RECV, SYSCALL_NET_SEND, SYSCALL_NET_CFG);
+}
 
 static uint16_t net_htons(uint16_t v){ return (v>>8) | (v<<8); }
 static uint32_t net_htonl(uint32_t v){ return ((v>>24)&0xff) | ((v>>8)&0xff00) | ((v<<8)&0xff0000) | ((v<<24)&0xff000000); }
@@ -211,7 +319,14 @@ static void handle_tcp(uint8_t *pkt, unsigned len, struct ipv4_hdr *ip, uint8_t 
         }
         if((th->flags & 0x10) && net_htonl(th->ack_seq) == tcp_my_seq){
             tcp_conn_established = 1;
-            printf("TCP connection established (port %u)\n", tcp_listen_port);
+            klog_info(KLOG_SUBSYS_NETWORK, "TCP connection established (port %u)", tcp_listen_port);
+            // Emit TCP_ESTABLISHED event: data = peer_ip(4) + src_port(2) + dst_port(2)
+            uint8_t ev[8];
+            uint32_t host_ip = net_htonl(ip->saddr);
+            ev[0]=(host_ip>>24)&0xFF; ev[1]=(host_ip>>16)&0xFF; ev[2]=(host_ip>>8)&0xFF; ev[3]=host_ip&0xFF;
+            ev[4]=(uint8_t)(src_port>>8); ev[5]=(uint8_t)(src_port & 0xFF);
+            ev[6]=(uint8_t)(tcp_listen_port>>8); ev[7]=(uint8_t)(tcp_listen_port & 0xFF);
+            net_user_event(NET_EVENT_TCP_ESTABLISHED, ev, sizeof(ev));
         }
         return;
     }
@@ -221,11 +336,24 @@ static void handle_tcp(uint8_t *pkt, unsigned len, struct ipv4_hdr *ip, uint8_t 
         tcp_send(ip->saddr, src_mac, tcp_listen_port, src_port, tcp_my_seq, tcp_peer_seq, 0x11, 0, 0); // FIN+ACK
         tcp_my_seq++;
         tcp_conn_established = 0;
-        printf("TCP connection closed\n");
+    klog_info(KLOG_SUBSYS_NETWORK, "TCP connection closed");
+        uint8_t ev2[8];
+        uint32_t host_ip2 = net_htonl(ip->saddr);
+        ev2[0]=(host_ip2>>24)&0xFF; ev2[1]=(host_ip2>>16)&0xFF; ev2[2]=(host_ip2>>8)&0xFF; ev2[3]=host_ip2&0xFF;
+        ev2[4]=(uint8_t)(src_port>>8); ev2[5]=(uint8_t)(src_port & 0xFF);
+        ev2[6]=(uint8_t)(tcp_listen_port>>8); ev2[7]=(uint8_t)(tcp_listen_port & 0xFF);
+        net_user_event(NET_EVENT_TCP_CLOSED, ev2, sizeof(ev2));
         return;
     }
     if(pay_len){
         tcp_peer_seq = net_htonl(th->seq) + pay_len;
+        // Emit TCP_DATA event: data = pay_len(4) + peer_ip(4) + first bytes up to 56
+        uint8_t evd[64];
+        evd[0]=(uint8_t)(pay_len>>24); evd[1]=(uint8_t)(pay_len>>16); evd[2]=(uint8_t)(pay_len>>8); evd[3]=(uint8_t)pay_len;
+        uint32_t host_ipd = net_htonl(ip->saddr);
+        evd[4]=(host_ipd>>24)&0xFF; evd[5]=(host_ipd>>16)&0xFF; evd[6]=(host_ipd>>8)&0xFF; evd[7]=host_ipd&0xFF;
+        unsigned copy = pay_len; if(copy>56) copy=56; if(copy) memcpy(evd+8, payload, copy);
+        net_user_event(NET_EVENT_TCP_DATA, evd, 8+copy);
         // Echo payload back (PSH+ACK)
         tcp_send(ip->saddr, src_mac, tcp_listen_port, src_port, tcp_my_seq, tcp_peer_seq, 0x18, payload, pay_len);
         tcp_my_seq += pay_len;
@@ -253,14 +381,20 @@ static void handle_arp(uint8_t *frame, unsigned len){
             memcpy(reply.tha, arp->sha, 6);
             reply.tpa = arp->spa;
             net_send_frame(arp->sha, NET_ETH_TYPE_ARP, &reply, sizeof(reply));
-            printf("ARP reply sent\n");
+            klog_info(KLOG_SUBSYS_NETWORK, "ARP reply sent");
         }
+        // Enqueue ARP request event (store sender MAC + IP)
+        uint8_t ev[10];
+        memcpy(ev, arp->sha, 6);
+        memcpy(ev+6, &arp->spa, 4);
+        net_user_event(NET_EVENT_ARP_REQUEST, ev, sizeof(ev));
     } else if(op == 2) { // reply
         // Cache gateway MAC if this is from gateway
         if(arp->spa == net_htonl(net_ip_gateway) && !net_gateway_mac_valid) {
             memcpy(net_gateway_mac, arp->sha, 6);
             net_gateway_mac_valid = 1;
             klog_info(KLOG_SUBSYS_NETWORK, "Cached gateway MAC %02x:%02x:%02x:%02x:%02x:%02x", net_gateway_mac[0],net_gateway_mac[1],net_gateway_mac[2],net_gateway_mac[3],net_gateway_mac[4],net_gateway_mac[5]);
+            net_user_event(NET_EVENT_ARP_REPLY, arp->sha, 6);
         }
     }
 }
@@ -339,9 +473,11 @@ static void handle_ipv4(uint8_t *frame, unsigned len, uint8_t *src_mac){
         if(echo->type == 8){ // echo request
             klog_info(KLOG_SUBSYS_NETWORK, "ICMP ping request received, sending reply");
             send_icmp_echo_reply(ip, echo, src_mac);
-            printf("ICMP echo reply sent\n");
+            klog_info(KLOG_SUBSYS_NETWORK, "ICMP echo reply sent");
+            net_user_event(NET_EVENT_ICMP_ECHO_REQ, (uint8_t*)echo, sizeof(struct icmp_echo));
         } else if(echo->type == 0) { // echo reply
             klog_info(KLOG_SUBSYS_NETWORK, "ICMP echo reply received (ident=0x%04x seq=%u)", net_htons(echo->ident), net_htons(echo->seq));
+            net_user_event(NET_EVENT_ICMP_ECHO_REP, (uint8_t*)echo, sizeof(struct icmp_echo));
         }
     } else if(ip->proto == 6){ // TCP
         klog_debug(KLOG_SUBSYS_NETWORK, "TCP packet received");

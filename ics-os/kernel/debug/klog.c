@@ -14,6 +14,7 @@
 #include "../hardware/serial/serial.h"
 #include "../console/dexio.h"
 #include "../stdlib/dexstdlib.h"
+#include "../dexapi/dex32API.h"
 
 // Global log configuration
 static klog_config_t klog_config = {
@@ -46,6 +47,34 @@ static DWORD klog_uptime_ticks = 0;
 
 // Buffer for formatting log messages
 static char klog_buffer[KLOG_MAX_MSG_LEN];
+
+// --- Ring buffer for logs exposed to user space ---
+#define KLOG_RING_SIZE 64
+#define KLOG_LINE_MAX  160
+typedef struct { char msg[KLOG_LINE_MAX]; } klog_line_t;
+static klog_line_t klog_ring[KLOG_RING_SIZE];
+static volatile unsigned klog_head=0, klog_tail=0; // head=write, tail=read
+static int klog_ring_enabled = 1; // allow disabling buffering if needed
+
+static void klog_ring_push(const char *s){
+    if(!klog_ring_enabled) return;
+    unsigned next = (klog_head+1)%KLOG_RING_SIZE;
+    // drop oldest on full
+    if(next == klog_tail){ klog_tail = (klog_tail+1)%KLOG_RING_SIZE; }
+    // copy msg (truncate)
+    int n=0; while(s[n] && n < (KLOG_LINE_MAX-1)){ klog_ring[klog_head].msg[n]=s[n]; n++; }
+    klog_ring[klog_head].msg[n]='\0';
+    klog_head = next;
+}
+
+static int klog_ring_pop(char *out, int outsz){
+    if(klog_tail == klog_head) return 0; // empty
+    const char *src = klog_ring[klog_tail].msg;
+    int i=0; while(src[i] && i < outsz-1){ out[i]=src[i]; i++; }
+    out[i]='\0';
+    klog_tail = (klog_tail+1)%KLOG_RING_SIZE;
+    return 1;
+}
 
 /*
  * Initialize the kernel logging system
@@ -249,6 +278,9 @@ void klog_vprintf(klog_level_t level, const char* subsystem, const char* fmt, va
             klog_output_serial(klog_buffer);
         }
     }
+
+    // Push to ring buffer (single line preferred)
+    klog_ring_push(klog_buffer);
 }
 
 /*
@@ -286,4 +318,48 @@ void klog_show_config(void) {
     klog_info(KLOG_SUBSYS_KERNEL, "  Timestamps: %s\n", klog_config.timestamps_enabled ? "ON" : "OFF");
     klog_info(KLOG_SUBSYS_KERNEL, "  Colors: %s\n", klog_config.colors_enabled ? "ON" : "OFF");
     klog_info(KLOG_SUBSYS_KERNEL, "  Subsystem Tags: %s\n", klog_config.subsystem_tags ? "ON" : "OFF");
+}
+
+// ---- Syscalls for user-space access ----
+// Simple interface:
+// 0xAC: KLOG_READ  a=char*buf, b=int maxlen  -> returns 1 if line copied, 0 if empty, -1 on error
+// 0xAD: KLOG_SET   a=level (min), b=target, c=timestamps(bool), d=colors(bool), e=subsys(bool) -> 0
+// 0xAE: KLOG_GET   a=struct klog_config_t* -> 0 on success
+
+#define SYSCALL_KLOG_READ 0xAC
+#define SYSCALL_KLOG_SET  0xAD
+#define SYSCALL_KLOG_GET  0xAE
+
+static DWORD sys_klog_read(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e){
+    (void)c;(void)d;(void)e;
+    char *buf = (char*)a; int maxlen = (int)b;
+    if(!buf || maxlen<=0) return (DWORD)-1;
+    char tmp[KLOG_LINE_MAX];
+    if(!klog_ring_pop(tmp, sizeof(tmp))) return 0;
+    int i=0; while(tmp[i] && i<maxlen-1){ buf[i]=tmp[i]; i++; }
+    buf[i]='\0';
+    return 1;
+}
+
+static DWORD sys_klog_set(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e){
+    klog_set_level((klog_level_t)a);
+    klog_set_target((klog_target_t)b);
+    klog_enable_timestamps(c?1:0);
+    klog_enable_colors(d?1:0);
+    klog_enable_subsystem_tags(e?1:0);
+    return 0;
+}
+
+static DWORD sys_klog_get(DWORD a, DWORD b, DWORD c, DWORD d, DWORD e){
+    (void)b;(void)c;(void)d;(void)e;
+    klog_config_t *out = (klog_config_t*)a;
+    if(!out) return (DWORD)-1;
+    *out = *klog_get_config();
+    return 0;
+}
+
+void klog_register_syscalls(void){
+    api_addsystemcall(SYSCALL_KLOG_READ, sys_klog_read, 0, 0);
+    api_addsystemcall(SYSCALL_KLOG_SET,  sys_klog_set,  0, 0);
+    api_addsystemcall(SYSCALL_KLOG_GET,  sys_klog_get,  0, 0);
 }
