@@ -169,6 +169,7 @@ void dex_init();
 #include "hardware/exceptions.c"
 #include "hardware/hardware.c"
 #include "hardware/chips/speaker.c"
+#include "hardware/chips/serial.c"
 #include "devmgr/dex32_devmgr.c"
 #include "devmgr/extension.c"
 #include "process/environment.c"
@@ -226,6 +227,9 @@ void main(){
    /* Enable the keyboard IRQ,Timer IRQ and the Floppy Disk IRQ.As more devices that uses IRQs get supported, we should OR more of them here*/
    //program8259(IRQ_TIMER | IRQ_KEYBOARD | IRQ_FDC | IRQ_MOUSE | IRQ_CASCADE); 
    program8259(IRQ_TIMER | IRQ_KEYBOARD | IRQ_FDC | IRQ_CASCADE); 
+
+   //initialize COM1 serial port for diagnostics
+   serial_init();
 
    //sets up the default interrupt handlers, like the PF handler,GPF handler
    setdefaulthandlers();   

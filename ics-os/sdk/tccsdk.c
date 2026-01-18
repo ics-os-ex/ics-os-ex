@@ -409,6 +409,8 @@ OK, I found my mistake. The math here is _always_ unsigned */
 /* disallow pad-left-with-zeroes for %s */
 				flags &= ~PR_LZ;
 				where = va_arg(args, unsigned char *);
+				if (!where)
+					where = (unsigned char*)"(null)";
 EMIT:
 				actual_wd = strlen((char*)where);
 				if(flags & PR_WS)
@@ -513,6 +515,8 @@ int do_sprintf(const char *fmt, va_list args, sfnptr_t fn, void **ptr){
 	unsigned state, flags, radix, actual_wd, count, given_wd;
 	unsigned char *where, buf[PR_BUFLEN];
 	long num;
+	if (!fmt)
+		return 0;
 
 	state = flags = count = given_wd = 0;
 /* begin scanning format specifier list */
@@ -685,6 +689,8 @@ OK, I found my mistake. The math here is _always_ unsigned */
 /* disallow pad-left-with-zeroes for %s */
 				flags &= ~PR_LZ;
 				where = va_arg(args, unsigned char *);
+				if (!where)
+					where = (unsigned char*)"(null)";
 EMIT:
 				actual_wd = strlen(where);
 				if(flags & PR_WS)
@@ -763,6 +769,12 @@ int vsprintf_help(unsigned c, void **ptr ){
  */ 
 int vsprintf(char *buffer, const char *fmt, va_list args){
         int ret_val;
+	if (!buffer)
+		return 0;
+	if (!fmt) {
+		buffer[0] = '\0';
+		return 0;
+	}
 
         //ret_val = do_sprintf(fmt, args, vsprintf_help,NULL,(void*)& buffer);
         ret_val=do_sprintf(fmt, args, vsprintf_help, (void*)& buffer);

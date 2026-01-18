@@ -15,7 +15,7 @@ obj: scheduler.o fat.o iso9660.o devfs.o iomgr.o devmgr_error.o kernel32.o \
 		startup.o asmlib.o irqwrap.o 
 	#strip --strip-debug *.o
 		
-kernel32.o: kernel32.c build.h
+kernel32.o: kernel32.c build.h console/dex_DDL.c
 	$(CC) $(CFLAGS) -o kernel32.o kernel32.c 
 	
 scheduler.o:

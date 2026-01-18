@@ -25,6 +25,8 @@
     Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA. 
 */
 
+#include "chips/serial.h"
+
 void GPFhandler(DWORD address)
   {
   char temp[255];
@@ -114,6 +116,20 @@ void exc_showdump(DWORD location,int type,DWORD pf_info)
    if (type == INVALID_TSS) strcat(fault_type,"Invalid Task State Segment");
       else
    strcat(fault_type,"unknown fault");   
+
+   serial_printf("\n%s\n", fault_type);
+   serial_printf("faulting process                       :%s\n", current_process->name);
+   serial_printf("Tried to access invalid memory location: 0x%x\n", location);
+   serial_printf("Address of faulting instruction is     : 0x%x\n", current_process->regs.EIP);
+   serial_printf("Kernel Page Directory : 0x%x  Process Page Directory: 0x%x\n",
+                 pagedir1, current_process->regs.CR3);
+   serial_printf("EAX=0x%x EBX=0x%x ECX=0x%x EDX=0x%x\n", current_process->regs.EAX,
+                 current_process->regs.EBX,current_process->regs.ECX,current_process->regs.EDX);
+   serial_printf("EBP=0x%x EDI=0x%x ESI=0x%x ESP=0x%x\n", current_process->regs.EBP,
+                 current_process->regs.EDI, current_process->regs.ESI, current_process->regs.ESP);
+   serial_printf("CS=0x%x DS=0x%x ES=0x%x SS=0x%x FS=0x%x GS=0x%x\n",
+                 current_process->regs.CS,current_process->regs.DS,current_process->regs.ES,
+                 current_process->regs.SS,current_process->regs.FS,current_process->regs.GS);
    
    #ifdef FULLSCREENERROR   
    direntry=getpagetablephys(location, current_process->pagedirloc);

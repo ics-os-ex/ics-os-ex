@@ -173,6 +173,57 @@ void Dex32NextLn(DEX32_DDL_INFO *dev){
       move_cursor(dev->cury,dev->curx);
 };
 
+static int ansi_parse_int(const char **s, int defval){
+   int val = 0;
+   int got = 0;
+   while (**s >= '0' && **s <= '9') {
+      val = val * 10 + (**s - '0');
+      (*s)++;
+      got = 1;
+   }
+   if (!got)
+      return defval;
+   return val;
+}
+
+static void ansi_apply_sgr(DEX32_DDL_INFO *dev, const char *params){
+   const char *p = params;
+   int any = 0;
+   while (*p) {
+      int v = ansi_parse_int(&p, 0);
+      any = 1;
+      if (v == 0) {
+         Dex32SetTextAttr(dev, 0x07);
+      } else if (v == 1) {
+         Dex32SetTextColor(dev, (dev->attb & 0x0F) | 0x08);
+      } else if (v >= 30 && v <= 37) {
+         Dex32SetTextColor(dev, v - 30);
+      } else if (v >= 40 && v <= 47) {
+         Dex32SetTextBackground(dev, v - 40);
+      } else if (v >= 90 && v <= 97) {
+         Dex32SetTextColor(dev, (v - 90) + 8);
+      } else if (v >= 100 && v <= 107) {
+         Dex32SetTextBackground(dev, (v - 100) + 8);
+      }
+      if (*p == ';')
+         p++;
+   }
+   if (!any)
+      Dex32SetTextAttr(dev, 0x07);
+}
+
+static void ansi_clear_to_eol(DEX32_DDL_INFO *dev){
+   int x;
+   for (x = dev->curx; x < 80; x++)
+      Dex32PutChar(dev, x, dev->cury, ' ', dev->attb);
+}
+
+static void ansi_clear_screen(DEX32_DDL_INFO *dev){
+   Dex32Clear(dev);
+   dev->curx = 0;
+   dev->cury = 0;
+}
+
 //update the cursor position
 void Dex32UpdateCursor(DEX32_DDL_INFO *dev, int y, int x){
    if (dev->active && !dev->bufmode) 
@@ -183,6 +234,113 @@ void Dex32UpdateCursor(DEX32_DDL_INFO *dev, int y, int x){
 
 //Emulates an ANSI compatible display subsystem
 void Dex32PutC(DEX32_DDL_INFO *dev, char c){
+   if (dev->ansi_command_ptr) {
+      if (dev->ansi_command_ptr == 1) {
+         if (c == '[') {
+            dev->ansi_command_ptr = 2;
+            dev->ansi_cmd[0] = 0;
+            return;
+         }
+         dev->ansi_command_ptr = 0;
+      } else {
+         int idx = dev->ansi_command_ptr - 2;
+         if ((c >= '0' && c <= '9') || c == ';' || c == '?' ) {
+            if (idx < (int)sizeof(dev->ansi_cmd) - 2) {
+               dev->ansi_cmd[idx] = c;
+               dev->ansi_cmd[idx + 1] = 0;
+               dev->ansi_command_ptr++;
+            }
+            return;
+         }
+
+         if (dev->ansi_cmd[0] == '?') {
+            dev->ansi_command_ptr = 0;
+            return;
+         }
+
+         switch (c) {
+            case 'm':
+               ansi_apply_sgr(dev, dev->ansi_cmd);
+               break;
+            case 'H':
+            case 'f': {
+               const char *p = dev->ansi_cmd;
+               int row = ansi_parse_int(&p, 1);
+               if (*p == ';') p++;
+               int col = ansi_parse_int(&p, 1);
+               if (row < 1) row = 1;
+               if (col < 1) col = 1;
+               if (row > 25) row = 25;
+               if (col > 80) col = 80;
+               dev->cury = row - 1;
+               dev->curx = col - 1;
+               Dex32UpdateCursor(dev, dev->cury, dev->curx);
+               break;
+            }
+            case 'A': {
+               const char *p = dev->ansi_cmd;
+               int n = ansi_parse_int(&p, 1);
+               dev->cury = (dev->cury >= (DWORD)n) ? (dev->cury - n) : 0;
+               Dex32UpdateCursor(dev, dev->cury, dev->curx);
+               break;
+            }
+            case 'B': {
+               const char *p = dev->ansi_cmd;
+               int n = ansi_parse_int(&p, 1);
+               dev->cury += n;
+               if (dev->cury > 24) dev->cury = 24;
+               Dex32UpdateCursor(dev, dev->cury, dev->curx);
+               break;
+            }
+            case 'C': {
+               const char *p = dev->ansi_cmd;
+               int n = ansi_parse_int(&p, 1);
+               dev->curx += n;
+               if (dev->curx > 79) dev->curx = 79;
+               Dex32UpdateCursor(dev, dev->cury, dev->curx);
+               break;
+            }
+            case 'D': {
+               const char *p = dev->ansi_cmd;
+               int n = ansi_parse_int(&p, 1);
+               dev->curx = (dev->curx >= (DWORD)n) ? (dev->curx - n) : 0;
+               Dex32UpdateCursor(dev, dev->cury, dev->curx);
+               break;
+            }
+            case 'J': {
+               const char *p = dev->ansi_cmd;
+               int n = ansi_parse_int(&p, 0);
+               if (n == 2 || n == 0)
+                  ansi_clear_screen(dev);
+               break;
+            }
+            case 'K': {
+               ansi_clear_to_eol(dev);
+               break;
+            }
+            case 's':
+               dev->ansi_x = dev->curx;
+               dev->ansi_y = dev->cury;
+               break;
+            case 'u':
+               dev->curx = dev->ansi_x;
+               dev->cury = dev->ansi_y;
+               Dex32UpdateCursor(dev, dev->cury, dev->curx);
+               break;
+            default:
+               break;
+         }
+
+         dev->ansi_command_ptr = 0;
+         return;
+      }
+   }
+
+   if (c == 27) {
+      dev->ansi_command_ptr = 1;
+      dev->ansi_cmd[0] = 0;
+      return;
+   }
    if (c=='\t'){
       int i;
       for (i=0;i<3;i++)

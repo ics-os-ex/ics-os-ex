@@ -49,7 +49,7 @@ usb: prep_image
 	sudo sh scripts/create-usb-image.sh
 
 boot-floppy:
-	qemu-system-i386 -net nic,model=rtl8139 -fda ics-os-floppy.img -boot a -m 64M 
+	qemu-system-i386 -net nic,model=rtl8139 -fda ics-os-floppy.img -boot a -m 64M -serial stdio
 
 boot-floppy-gdb:
 	qemu-system-i386 -net nic,model=rtl8139 -fda ics-os-floppy.img -boot a -m 64M -s -S
