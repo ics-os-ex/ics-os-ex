@@ -23,8 +23,8 @@ void serial_init()
 	outportb(SERIAL_COM1 + 1, 0x00);
 	/* Enable DLAB */
 	outportb(SERIAL_COM1 + 3, 0x80);
-	/* Set divisor to 3 (38400 baud) */
-	outportb(SERIAL_COM1 + 0, 0x03);
+	/* Set divisor to 1 (115200 baud) */
+	outportb(SERIAL_COM1 + 0, 0x01);
 	outportb(SERIAL_COM1 + 1, 0x00);
 	/* 8 bits, no parity, one stop bit */
 	outportb(SERIAL_COM1 + 3, 0x03);
@@ -42,6 +42,16 @@ void serial_putchar(char c)
 		return;
 	while (!serial_is_transmit_empty()) {}
 	outportb(SERIAL_COM1, (unsigned char)c);
+}
+
+int serial_putchar_nb(char c)
+{
+	if (!serial_ready)
+		return 0;
+	if (!serial_is_transmit_empty())
+		return 0;
+	outportb(SERIAL_COM1, (unsigned char)c);
+	return 1;
 }
 
 void serial_write(const char *s)

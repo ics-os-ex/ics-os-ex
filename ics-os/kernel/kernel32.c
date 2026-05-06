@@ -230,6 +230,7 @@ void main(){
 
    //initialize COM1 serial port for diagnostics
    serial_init();
+   serial_printf("serial online\n");
 
    //sets up the default interrupt handlers, like the PF handler,GPF handler
    setdefaulthandlers();   
@@ -496,7 +497,7 @@ void dex_init(){
    //create the IO manager thread which handles all I/O to and from
    //block devices like the hard disk, floppy, CD-ROM etc. see iosched.c
    printf("Initializing the disk manager...");
-   createkthread((void*)iomgr_diskmgr,"disk_mgr",200000);
+   iomgr_setpid(createkthread((void*)iomgr_diskmgr,"disk_mgr",200000));
    printf("[OK]\n");   
 
    

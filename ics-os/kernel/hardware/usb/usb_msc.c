@@ -180,7 +180,7 @@ static int usb_msc_read_block(int block, char *blockbuff, DWORD numblocks)
     DWORD remaining = numblocks;
     DWORD lba = block;
     BYTE *buf = (BYTE*)blockbuff;
-    DWORD max_blocks = 16;
+    DWORD max_blocks = 64;
     if (!msc) return 0;
     while (remaining)
     {
@@ -201,7 +201,7 @@ static int usb_msc_write_block(int block, char *blockbuff, DWORD numblocks)
     DWORD remaining = numblocks;
     DWORD lba = block;
     BYTE *buf = (BYTE*)blockbuff;
-    DWORD max_blocks = 16;
+    DWORD max_blocks = 64;
     if (!msc) return 0;
     while (remaining)
     {

@@ -1,6 +1,6 @@
 /*
   Name: sync.c
-  Copyright: 
+  Copyright:
   Author: Joseph Emmanuel DL Dayo
   Date: 18/01/04 06:27
   Description: Provides kernel synchornization functions
@@ -8,12 +8,12 @@
 #ifndef SYNC_H
 #define SYNC_H
 
-//a synchronized shared variable for 
-//synchronization
+// a synchronized shared variable for
+// synchronization
 typedef struct _sync_sharedvar {
-   int busy;
-   int ready;
-   int wait;
+  volatile int busy;
+  volatile int ready;
+  volatile int wait;
 } sync_sharedvar;
 
 void sync_entercrit(sync_sharedvar *var);

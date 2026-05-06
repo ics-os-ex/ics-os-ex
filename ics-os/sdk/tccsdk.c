@@ -1359,14 +1359,154 @@ int closefile(FILE* fhandle){
    return dexsdk_systemcall(5,(int)fhandle,0,0,0,0);
 };
 
+int open(const char *path, int flags, ...){
+	int mode = FILE_READ;
+	if (flags & 0x0002)
+		mode = FILE_READWRITE;
+	else if (flags & 0x0001)
+		mode = FILE_WRITE;
+	else if (flags & 0x0400)
+		mode = FILE_APPEND;
+	return (int)openfile(path, mode);
+}
+
+int close(int fd){
+	return closefile((FILE *)fd);
+}
+
+ssize_t read(int fd, void *buf, size_t count){
+	if (fd == 0){
+		size_t i;
+		unsigned char *p = (unsigned char *)buf;
+		for (i = 0; i < count; i++)
+			p[i] = (unsigned char)getch();
+		return (ssize_t)count;
+	}
+	return (ssize_t)fread((char *)buf, 1, (int)count, (FILE *)fd);
+}
+
+ssize_t write(int fd, const void *buf, size_t count){
+	FILE *out = (FILE *)fd;
+	if (fd == 1)
+		out = stdout;
+	else if (fd == 2)
+		out = stderr;
+	return (ssize_t)fwrite((char *)buf, 1, (int)count, out);
+}
+
+off_t lseek(int fd, off_t offset, int whence){
+	fseek((FILE *)fd, (long)offset, whence);
+	return (off_t)ftell((FILE *)fd);
+}
+
 int remove(char *filename){
    return dexsdk_systemcall(0x49,(int)filename,0,0,0,0);
 };
+
+int stat(const char *path, vfs_stat *statbuf){
+	return dexsdk_systemcall(36,(int)path,(int)statbuf,0,0,0);
+}
 
 char *strerror(int errnum)
 {
 	(void)errnum;
 	return "error";
+}
+
+size_t strnlen(const char *s, size_t maxlen){
+	size_t i = 0;
+	if (!s)
+		return 0;
+	while (i < maxlen && s[i])
+		i++;
+	return i;
+}
+
+void *memrchr(const void *s, int c, size_t n){
+	const unsigned char *p = (const unsigned char *)s;
+	size_t i;
+	for (i = n; i > 0; i--){
+		if (p[i - 1] == (unsigned char)c)
+			return (void *)(p + i - 1);
+	}
+	return 0;
+}
+
+char *strchrnul(const char *s, int c){
+	const char *p = s;
+	if (!p)
+		return 0;
+	while (*p && *p != c)
+		p++;
+	return (char *)p;
+}
+
+int strcasecmp(const char *s1, const char *s2){
+	int c1, c2;
+	if (!s1) s1 = "";
+	if (!s2) s2 = "";
+	while (*s1 || *s2){
+		c1 = (unsigned char)*s1++;
+		c2 = (unsigned char)*s2++;
+		if (c1 >= 'A' && c1 <= 'Z') c1 = c1 - 'A' + 'a';
+		if (c2 >= 'A' && c2 <= 'Z') c2 = c2 - 'A' + 'a';
+		if (c1 != c2)
+			return c1 - c2;
+	}
+	return 0;
+}
+
+char *strtok_r(char *str, const char *delim, char **saveptr){
+	char *token;
+	if (!delim || !saveptr)
+		return 0;
+	if (!str)
+		str = *saveptr;
+	if (!str)
+		return 0;
+	while (*str && strchr(delim, *str))
+		str++;
+	if (!*str){
+		*saveptr = 0;
+		return 0;
+	}
+	token = str;
+	while (*str && !strchr(delim, *str))
+		str++;
+	if (*str){
+		*str = '\0';
+		str++;
+	}
+	*saveptr = str;
+	return token;
+}
+
+int vsnprintf(char *buffer, size_t size, const char *fmt, va_list args){
+	char tmp[2048];
+	int len;
+	if (!buffer || size == 0)
+		return 0;
+	if (!fmt){
+		buffer[0] = '\0';
+		return 0;
+	}
+	len = vsprintf(tmp, fmt, args);
+	if (len < 0)
+		return len;
+	if ((size_t)len >= size)
+		len = (int)size - 1;
+	memcpy(buffer, tmp, len);
+	buffer[len] = '\0';
+	return len;
+}
+
+int snprintf(char *buffer, size_t size, const char *fmt, ...){
+	va_list args;
+	int ret;
+	va_start(args, fmt);
+	ret = vsnprintf(buffer, size, fmt, args);
+	va_end(args);
+	return ret;
 }
 
 int mkdir (const char *filename, mode_t mode){
@@ -1428,6 +1568,250 @@ int atoi(const char *str){
     return num;
 };
 
+long atol(const char *str){
+	long sign = 1;
+	long val = 0;
+
+	if (!str)
+		return 0;
+
+	while (*str && isspace((int)*str))
+		str++;
+
+	if (*str == '-') {
+		sign = -1;
+		str++;
+	} else if (*str == '+') {
+		str++;
+	}
+
+	while (*str && isdigit((int)*str)) {
+		val = (val * 10) + (long)(*str - '0');
+		str++;
+	}
+
+	return sign * val;
+}
+
+int abs(int x){
+	return (x < 0) ? -x : x;
+}
+
+void abort(void){
+	exit(1);
+}
+
+static void qsort_swap(char *a, char *b, size_t size){
+	while (size--) {
+		char t = *a;
+		*a++ = *b;
+		*b++ = t;
+	}
+}
+
+static void qsort_impl(char *base, int left, int right, size_t size,
+		int (*compar)(const void *, const void *)){
+	int i = left;
+	int j = right;
+	char *pivot;
+	char *pivot_buf;
+
+	if (left >= right)
+		return;
+
+	pivot = base + ((left + right) / 2) * size;
+	pivot_buf = (char *)malloc(size);
+	if (!pivot_buf)
+		return;
+	memcpy(pivot_buf, pivot, size);
+
+	while (i <= j) {
+		while (compar(base + (i * (int)size), pivot_buf) < 0)
+			i++;
+		while (compar(base + (j * (int)size), pivot_buf) > 0)
+			j--;
+		if (i <= j) {
+			qsort_swap(base + (i * (int)size), base + (j * (int)size), size);
+			i++;
+			j--;
+		}
+	}
+	free(pivot_buf);
+
+	if (left < j)
+		qsort_impl(base, left, j, size, compar);
+	if (i < right)
+		qsort_impl(base, i, right, size, compar);
+}
+
+void qsort(void *base, size_t nmemb, size_t size,
+		int (*compar)(const void *, const void *)){
+	if (!base || !compar || nmemb < 2 || size == 0)
+		return;
+	qsort_impl((char *)base, 0, (int)nmemb - 1, size, compar);
+}
+
+static int vsscanf_internal(const char *str, const char *fmt, va_list args){
+	int assigned = 0;
+
+	if (!str || !fmt)
+		return 0;
+
+	while (*fmt) {
+		if (isspace((int)*fmt)) {
+			while (isspace((int)*fmt))
+				fmt++;
+			while (*str && isspace((int)*str))
+				str++;
+			continue;
+		}
+		if (*fmt != '%') {
+			if (*str != *fmt)
+				break;
+			fmt++;
+			str++;
+			continue;
+		}
+
+		fmt++;
+		if (*fmt == '%') {
+			if (*str != '%')
+				break;
+			fmt++;
+			str++;
+			continue;
+		}
+
+		int width = 0;
+		int longflag = 0;
+		while (*fmt && isdigit((int)*fmt)) {
+			width = (width * 10) + (*fmt - '0');
+			fmt++;
+		}
+		if (*fmt == 'l') {
+			longflag = 1;
+			fmt++;
+		}
+
+		switch (*fmt) {
+		case 'd':
+		case 'i': {
+			long val = 0;
+			int sign = 1;
+			int digits = 0;
+
+			while (*str && isspace((int)*str))
+				str++;
+			if (*str == '-') {
+				sign = -1;
+				str++;
+				if (width)
+					width--;
+			} else if (*str == '+') {
+				str++;
+				if (width)
+					width--;
+			}
+			while (*str && isdigit((int)*str) && (!width || digits < width)) {
+				val = (val * 10) + (*str - '0');
+				str++;
+				digits++;
+			}
+			if (!digits)
+				return assigned;
+			val *= sign;
+			if (longflag) {
+				long *out = va_arg(args, long *);
+				*out = val;
+			} else {
+				int *out = va_arg(args, int *);
+				*out = (int)val;
+			}
+			assigned++;
+			break;
+		}
+		case 'u': {
+			unsigned long val = 0;
+			int digits = 0;
+			while (*str && isspace((int)*str))
+				str++;
+			while (*str && isdigit((int)*str) && (!width || digits < width)) {
+				val = (val * 10) + (unsigned long)(*str - '0');
+				str++;
+				digits++;
+			}
+			if (!digits)
+				return assigned;
+			if (longflag) {
+				unsigned long *out = va_arg(args, unsigned long *);
+				*out = val;
+			} else {
+				unsigned int *out = va_arg(args, unsigned int *);
+				*out = (unsigned int)val;
+			}
+			assigned++;
+			break;
+		}
+		case 'c': {
+			char *out = va_arg(args, char *);
+			int count = width ? width : 1;
+			if (!*str)
+				return assigned;
+			while (count-- && *str) {
+				*out++ = *str++;
+			}
+			assigned++;
+			break;
+		}
+		case 's': {
+			char *out = va_arg(args, char *);
+			int count = 0;
+			while (*str && isspace((int)*str))
+				str++;
+			while (*str && !isspace((int)*str) && (!width || count < width - 1)) {
+				*out++ = *str++;
+				count++;
+			}
+			*out = '\0';
+			if (count == 0)
+				return assigned;
+			assigned++;
+			break;
+		}
+		default:
+			return assigned;
+		}
+		fmt++;
+	}
+
+	return assigned;
+}
+
+int sscanf(const char *str, const char *fmt, ...){
+	va_list args;
+	int ret;
+	va_start(args, fmt);
+	ret = vsscanf_internal(str, fmt, args);
+	va_end(args);
+	return ret;
+}
+
+int fscanf(FILE *stream, const char *fmt, ...){
+	char buf[512];
+	va_list args;
+	int ret;
+
+	if (!stream || !fmt)
+		return EOF;
+	if (!fgets(buf, sizeof(buf), stream))
+		return EOF;
+
+	va_start(args, fmt);
+	ret = vsscanf_internal(buf, fmt, args);
+	va_end(args);
+	return ret;
+}
+
 
 //VGA system calls
 void set_graphics(int mode){
@@ -1458,15 +1842,134 @@ void write_palette(char r, char g, char b, char index){
 
 //------------------------time
 void delay(unsigned int ms){
-    dexsdk_systemcall(0x9B,ms,0,0,0,0);
+	dexsdk_systemcall(0x9B,ms,0,0,0,0);
 }
 
-int time(){
-    dexsdk_systemcall(0x55,0,0,0,0,0);
+time_t time(time_t *t){
+	time_t now = (time_t)dexsdk_systemcall(0x55,0,0,0,0,0);
+	if (t)
+		*t = now;
+	return now;
 }
 
 void get_date_time(dex32_datetime *datetime){ 
-    dexsdk_systemcall(0x53,(int)datetime,0,0,0,0);
+	dexsdk_systemcall(0x53,(int)datetime,0,0,0,0);
+}
+
+static struct tm g_tm;
+
+static void fill_tm_from_date(struct tm *out){
+	dex32_datetime dt;
+	get_date_time(&dt);
+	out->tm_sec = dt.sec;
+	out->tm_min = dt.min;
+	out->tm_hour = dt.hour;
+	out->tm_mday = dt.day;
+	out->tm_mon = dt.month > 0 ? dt.month - 1 : 0;
+	out->tm_year = dt.year > 1900 ? dt.year - 1900 : dt.year;
+	out->tm_wday = 0;
+	out->tm_yday = 0;
+	out->tm_isdst = 0;
+}
+
+struct tm *localtime(const time_t *t){
+	(void)t;
+	fill_tm_from_date(&g_tm);
+	return &g_tm;
+}
+
+struct tm *gmtime(const time_t *t){
+	(void)t;
+	fill_tm_from_date(&g_tm);
+	return &g_tm;
+}
+
+time_t mktime(struct tm *tm){
+	static const int days_in_month[] = {
+		31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+	};
+	long days = 0;
+	int year;
+	int month;
+	int leap;
+
+	if (!tm)
+		return (time_t)-1;
+
+	year = tm->tm_year + 1900;
+	for (int y = 1970; y < year; y++) {
+		leap = ((y % 4) == 0 && ((y % 100) != 0 || (y % 400) == 0));
+		days += leap ? 366 : 365;
+	}
+
+	month = tm->tm_mon;
+	if (month < 0)
+		month = 0;
+	if (month > 11)
+		month = 11;
+	for (int m = 0; m < month; m++) {
+		days += days_in_month[m];
+		if (m == 1) {
+			leap = ((year % 4) == 0 && ((year % 100) != 0 || (year % 400) == 0));
+			if (leap)
+				days++;
+		}
+	}
+
+	days += (tm->tm_mday > 0) ? (tm->tm_mday - 1) : 0;
+
+	return (time_t)(days * 86400L + tm->tm_hour * 3600L + tm->tm_min * 60L + tm->tm_sec);
+}
+
+uid_t getuid(void){
+	return 0;
+}
+
+int unlink(const char *path){
+	return remove((char *)path);
+}
+
+int rename(const char *oldpath, const char *newpath){
+	if (!oldpath || !newpath)
+		return -1;
+	if (copyfile(oldpath, newpath) != 0)
+		return -1;
+	return remove((char *)oldpath);
+}
+
+int creat(const char *path, int mode){
+	(void)mode;
+	return open(path, O_CREAT | O_TRUNC | O_WRONLY, 0);
+}
+
+void rewind(FILE *stream){
+	if (stream)
+		fseek(stream, 0, SEEK_SET);
+}
+
+static char g_cwd[256] = "/";
+
+char *getcwd(char *buf, size_t size){
+	if (!buf || size == 0)
+		return NULL;
+	strncpy(buf, g_cwd, size - 1);
+	buf[size - 1] = '\0';
+	return buf;
+}
+
+int chdir(const char *path){
+	if (!path)
+		return -1;
+	strncpy(g_cwd, path, sizeof(g_cwd) - 1);
+	g_cwd[sizeof(g_cwd) - 1] = '\0';
+	return 0;
+}
+
+void perror(const char *s){
+	if (s && *s)
+		printf("%s: error\n", s);
+	else
+		printf("error\n");
 }
 
 //keypressed

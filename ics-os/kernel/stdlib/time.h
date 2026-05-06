@@ -25,5 +25,7 @@ char *datetostr(dex32_datetime *d,char *str);
 void getdatetime(dex32_datetime*); //gets the date nd time
 void dex32_set_timer(DWORD rate);
 int time();
+DWORD time_gettime();
+DWORD getprecisetime();
 
 #endif

@@ -1,0 +1,182 @@
+serial online
+[0] Obtaining CPU information...
+[0] Manufacturer    : GenuineIntel
+[0] Product String  : QEMU Virtual CPU version 2.5+
+[0] CPU model       : Model 6, Family 6, Type 0, Stepping 3.
+[0] Features    :
+[0] * FPU
+[0] * Debugging Extensions
+[0] * Page Size Extensions
+[0] * Time stamp counter
+[0] * Model-specific registers
+[0] * Physical Address Extensions
+[0] * Machine Check Exceptions
+[0] * Compare and exchange 8-byte
+[0] * On-chip APIC
+[0] * iFSC
+[0] * PGE
+[0] * CMOV
+[0] * Page Attribute Table
+[0] * MMX
+[0] * Fast floating point save/restore
+[0] * Intel SSE
+[0] * Intel SSE2
+
+[0] Available memory: 130559 KB
+[0] Initializing the extension manager...[OK]
+[0] Initializing the device manager...[OK]
+[0] Registering the memory manager and the memory allocator...[OK]
+[0] Initializing ports...[OK]
+[0] Initializing PCI devices...[OK]
+[0] Initializing rtl8139 NIC...[OK]
+[0] Initializing kernel API...[OK]
+[0] Initializing keyboard and mouse drivers...MOUSE successfully installed!!![OK]
+[0] Initializing the process manager...extension: changing schedulers..
+[0] extension: calling attach()
+[0] extension: done!
+[0] process manager: done.
+[0] Starting process manager...
+[0] [OK]
+
+[0] ICS Operating System 1.0 (Build: devel)
+
+[1] Starting dex_init()...
+[1] Press space to skip autoexec.bat processing
+[1] dex_init address: 0x12513a
+[1]                                                                                
+[1] Getting date and time...[OK]
+[2] Installing floppy driver...taskswitcher: call time_handler
+[100] time_handler: ticks=100
+[149] taskswitcher: call time_handler
+[200] time_handler: ticks=200
+[249] taskswitcher: call time_handler
+[300] time_handler: ticks=300
+[349] taskswitcher: call time_handler
+[400] time_handler: ticks=400
+[449] taskswitcher: call time_handler
+[500] time_handler: ticks=500
+[549] taskswitcher: call time_handler
+[600] time_handler: ticks=600
+[649] taskswitcher: call time_handler
+[700] time_handler: ticks=700
+[749] taskswitcher: call time_handler
+[800] time_handler: ticks=800
+[849] taskswitcher: call time_handler
+[900] time_handler: ticks=900
+[949] taskswitcher: call time_handler
+[1000] time_handler: ticks=1000
+[1002] [OK]
+[1002] Initializing IDE drivers...
+[1049] taskswitcher: call time_handler
+[1100] time_handler: ticks=1100
+[1149] taskswitcher: call time_handler
+[1200] time_handler: ticks=1200
+[1249] taskswitcher: call time_handler
+[1300] time_handler: ticks=1300
+[1349] taskswitcher: call time_handler
+[1400] time_handler: ticks=1400
+[1449] taskswitcher: call time_handler
+[1500] time_handler: ticks=1500
+[1502] reg_pio_data_in: init
+[1502] sub_select: start dev=0 ints_enabled=1 ticks=1505
+[1502] sub_select: loop 1 start
+[1502] sub_select: loop 1 done
+[1502] sub_select: CHECK MAIN 2 (Ints=1 Ticks=1505)
+[1503] sub_select: CHECK MAIN 3
+[1503] sub_select: loop 2 start (dev type=2)
+[1503] sub_select: done
+[1503] reg_pio_data_in: sub_select done
+[1504] reg_pio_data_in: sending cmd ec
+[1514] reg_pio_data_in: loop start
+[1524] -----------------ATA Information --------------
+[1524] model number: QEMU HARDDISK       
+[1525] Serial: QM00001             
+[1525] Firmware revision: 2.5+    
+[1525] Cylinders   = 20,Heads       = 16,Spt         = 512,Buffer Size = 512
+[1526] ide_readsectors: start lba=0 sectors=1 base=1f0
+[1526] ide: read chunk total=1 lba=0
+[1527] reg_pio_data_in: init
+[1527] sub_select: start dev=0 ints_enabled=1 ticks=1555
+[1527] sub_select: loop 1 start
+[1528] sub_select: loop 1 done
+[1528] sub_select: CHECK MAIN 2 (Ints=1 Ticks=1557)
+[1529] sub_select: CHECK MAIN 3
+[1529] sub_select: loop 2 start (dev type=2)
+[1529] sub_select: done
+[1530] reg_pio_data_in: sub_select done
+[1530] reg_pio_data_in: sending cmd 20
+[1540] reg_pio_data_in: loop start
+[1549] taskswitcher: call time_handler
+[1600] time_handler: ticks=1600
+[1600] ide: chunk done
+[1600] ide_readsectors: done
+[1649] taskswitcher: call time_handler
+[1700] time_handler: ticks=1700
+[1749] taskswitcher: call time_handler
+[1800] time_handler: ticks=1800
+[1849] taskswitcher: call time_handler
+[1900] time_handler: ticks=1900
+[1949] taskswitcher: call time_handler
+[2000] time_handler: ticks=2000
+[2049] taskswitcher: call time_handler
+[2100] time_handler: ticks=2100
+[2100] reg_pio_data_in: init
+[2100] sub_select: start dev=0 ints_enabled=1 ticks=2101
+[2100] sub_select: loop 1 start
+[2100] sub_select: loop 1 done
+[2101] sub_select: CHECK MAIN 2 (Ints=1 Ticks=2103)
+[2101] sub_select: CHECK MAIN 3
+[2101] sub_select: loop 2 start (dev type=3)
+[2102] sub_select: done
+[2102] reg_pio_data_in: sub_select done
+[2102] reg_pio_data_in: sending cmd a1
+[2112] reg_pio_data_in: loop start
+[2122] -----------------ATA Information --------------
+[2122] model number: QEMU DVD-ROM        
+[2122] Serial: QM00003             
+[2122] Firmware revision: 2.5+    
+[2123] Cylinders   = 0,Heads       = 0,Spt         = 0,Buffer Size = 512
+[2123] [OK]
+[2123] Initializing USB 2.0...
+[2134] [OK]
+[2134] Loading VGA driver...[OK]
+IO perf profiling enabled
+[2134] floppy: Initializing the floppy disk driver..please wait
+[2149] taskswitcher: call time_handler
+[2200] time_handler: ticks=2200
+[2249] taskswitcher: call time_handler
+[2300] time_handler: ticks=2300
+[2349] taskswitcher: call time_handler
+[2400] time_handler: ticks=2400
+[2449] taskswitcher: call time_handler
+[2500] time_handler: ticks=2500
+[2549] taskswitcher: call time_handler
+[2600] time_handler: ticks=2600
+[2649] taskswitcher: call time_handler
+[2700] time_handler: ticks=2700
+[2749] floppy: enhanced controller found
+[2749] Initializing the Virtual File System...[OK]
+[2749] Initializing the task manager...[OK]
+[2749] Initializing the disk manager...taskswitcher: call time_handler
+[2800] time_handler: ticks=2800
+[2801] [OK]
+[2801] Initializng the null block device...[OK]
+[2801] Initializing the filesystem driver...[OK]
+[2801] Mounting boot device hdp0p0...reading primary volume descriptor..
+[2802] iomgr_diskmgr: started
+[2804] reqIO: dev=12 type=1 blk=16
+[2804] reqIO: queued
+[2804] iomgr: got job id=1324116 dev=12 type=1
+[2804] iomgr: calling read_block dev=12 blk=16
+[2804] ide_readsectors: start lba=16 sectors=1 base=1f0
+[2804] ide: read chunk total=1 lba=16
+[2804] reg_pio_data_in: init
+[2804] sub_select: start dev=0 ints_enabled=1 ticks=2808
+[2804] sub_select: loop 1 start
+[2804] sub_select: loop 1 done
+[2804] sub_select: CHECK MAIN 2 (Ints=1 Ticks=2808)
+[2804] sub_select: CHECK MAIN 3
+[2804] sub_select: loop 2 start (dev type=3)
+[2804] sub_select: done
+[2804] reg_pio_data_in: sub_select done
+[2804] reg_pio_data_in: sending cmd 20

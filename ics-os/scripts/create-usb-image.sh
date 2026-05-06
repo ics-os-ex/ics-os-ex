@@ -29,10 +29,11 @@ mount "${LOOP}p1" "$MNT"
 
 # copy system files
 cp vmdex "$MNT"/
+cp kernel/Kernel32.bin "$MNT"/
 cp -r base/* "$MNT"/
 mkdir -p "$MNT/apps" "$MNT/tcc1" "$MNT/lib1"
 cp apps/* "$MNT/apps/"
-cp sdk/* "$MNT/tcc1/"
+cp -r sdk/* "$MNT/tcc1/"
 cp lib/* "$MNT/lib1/"
 
 # install GRUB

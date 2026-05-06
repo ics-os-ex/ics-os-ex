@@ -25,13 +25,14 @@ prep_image: vmdex
 	rm -fr tmp
 	mkdir tmp
 	cp -r vmdex tmp
+	cp kernel/Kernel32.bin tmp
 	scripts/gen-help.sh
 	cp  base/* tmp
 	mkdir -p tmp/apps
 	mkdir -p tmp/tcc1
 	mkdir -p tmp/lib1
 	cp apps/* tmp/apps/
-	cp sdk/* tmp/tcc1/
+	cp -r sdk/* tmp/tcc1/
 	cp lib/* tmp/lib1/
 
 floppy: prep_image
@@ -65,4 +66,4 @@ boot-livecd:
 	qemu-system-i386 -cdrom ics-os-livecd.iso -boot cd -m 64M
 
 boot-usb:
-	qemu-system-i386 -drive file=ics-os-usb.img,format=raw,if=ide -boot c -m 64M
+	qemu-system-i386 -drive file=ics-os-usb.img,format=raw,if=ide -boot c -m 64M -serial stdio -monitor none

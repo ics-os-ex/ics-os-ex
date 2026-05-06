@@ -67,7 +67,8 @@ void dex32_tm_showhelp()
 
 void dex32_tm_updateinfo()
 {
-int refreshrate=100; //determines how long in milliseconds until the task manager refreshes its display
+ int refreshrate_active=100;  //ms refresh when task manager active
+ int refreshrate_idle=1000;   //ms sleep when inactive to reduce overhead
 int loop;
 
  taskmgrout = Dex32CreateDDL();
@@ -78,17 +79,21 @@ int loop;
  
 
  while(1)
-    {
-        dd_swaptomemory(taskmgrout);
-        clrscr();
-        textbackground(BLUE);
-        textcolor(WHITE);
-        printf("%-79s\n","Dex32- Realtime Monitor v 1.00");
-        textbackground(BLACK);
-        //Display processes in memory
-        if (dex32_tm_active)
-        show_process();
-        dd_swaptohardware(taskmgrout);
-        delay(refreshrate);
-    };
+  {
+    if (!dex32_tm_active) {
+      delay(refreshrate_idle);
+      continue;
+    }
+
+    dd_swaptomemory(taskmgrout);
+    clrscr();
+    textbackground(BLUE);
+    textcolor(WHITE);
+    printf("%-79s\n","Dex32- Realtime Monitor v 1.00");
+    textbackground(BLACK);
+    //Display processes in memory
+    show_process();
+    dd_swaptohardware(taskmgrout);
+    delay(refreshrate_active);
+  };
 };
