@@ -1,21 +1,22 @@
 ICS-OS Commands
 ---------------
-1205:   if (strcmp(u,"posixio") == 0){
-1210:   if (strcmp(u,"spawntest") == 0){
-1215:   if (strcmp(u,"forktest") == 0){
-1220:      if (strcmp(u,"forkoomtest") == 0){
-1227:     if (strcmp(u,"ext4test") == 0){
-1232:      if (strcmp(u,"termtest") == 0){
+1252:   if (strcmp(u,"posixio") == 0){
+1257:   if (strcmp(u,"spawntest") == 0){
+1262:   if (strcmp(u,"forktest") == 0){
+1267:      if (strcmp(u,"forkoomtest") == 0){
+1274:     if (strcmp(u,"ext4test") == 0){
+1279:      if (strcmp(u,"termtest") == 0){
 cc1test- Run host-built GCC cc1 to compile a trivial file in-OS.
 cc- Builds a C program (invokes tcc.exe). Args: <name.exe> <name.c>
 cd- Changes working directory. Args: <directory>
 cls- Clears the screen. 
 copy- Copy source to destination: Args: <source> <destination>
-cpuid- Displays CPU information. 
+cpuid- Displays CPU information.
 del- Deletes a files or directory. Args: <filename/dirname>
 demo_graphics- Runs the graphics demonstration.
 df- Shows free space on block devices.
 dkill- Dirty kill a user process/thread. No cleanup is done. Args: <pid>
+dmesg- Dump kernel log: -c | -n <0-7> | -l <0-7> (no arg = all)
 duptest- Run the dup(2) syscall self-test (tty fd clone + write).
 echo- Displays a string. Args: <string>  
 exectest- Run the host-built hello.exe (ELF loader smoke test).
@@ -70,7 +71,9 @@ tcckbuild- Optional TinyCC kernel-build experiment.
 time- Displays date and time.
 type- Displays the contents of a file. Args: <filename> [-p]
 umount- Unmounts a mounted device. Args: <mount point>
+uname- Kernel build info: -a -r -m -v (no arg = name+release)
 unload- Unloads a library. Args: <library name>
 use- Tells the extension manager to use the extension: Args: <extension>  
 ver- Shows version information.
+version- Full version banner.
 vimtest- Run FEAT_TINY vim --version (ELF TUI loader smoke test).

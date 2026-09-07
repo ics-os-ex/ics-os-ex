@@ -132,11 +132,17 @@ void putcEX(char x)
       the message severity is below the console log-level threshold. User-space
       output never sets klog_capturing, so it is neither captured nor gated. */
    if (klog_capturing_active()) {
-      klog_line_char(x);
-      if (klog_current_level() > (int)klog_console_max_get())
-         return;
-   }
-   if (x && x!='\t') serial_putc(x);
+       klog_line_char(x);
+       if (klog_current_level() > (int)klog_console_max_get())
+          return;
+    }
+    if (x && x!='\t') {
+       extern void serial2_putc(char c);
+       extern int serial2_mirror_get(void);
+       serial_putc(x);
+       if (serial2_mirror_get())
+          serial2_putc(x);
+    }
   #ifdef USE_CONSOLEDDL
   {
      DEX32_DDL_INFO *d;

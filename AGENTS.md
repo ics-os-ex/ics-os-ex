@@ -41,7 +41,9 @@ Useful individual targets (from `ics-os/`):
 | `test-iobench` | CD sequential map; 4KiB page cache hits; `IOBENCH_PASS` + `IOBENCH_CACHE_OK` |
 | `test-usb-storage` | UHCI USB root; guest write + SCSI cache sync + host readback |
 | `test-usb-uefi` | OVMF UEFI boot of the USB thumbdrive image via USB mass-storage; USB root + AP scheduling |
-| `test-usb-storage-xhci` | q35 xHCI USB root; guest write + SCSI cache sync + host readback |
+ | `test-ide-thumbdrive` | IDE/PATA thumbdrive image booted via GRUB; MBR parses (partition registered) + FAT root mount (signed-`char` MBR magic regression) |
+ | `test-dist` | BIOS+UEFI FAT thumb-drive image with the full in-OS GCC toolchain; `gccdrv` drives cc1/as/ld against a long-named ldscript and runs the resulting ELF (`GCC_DRIVER_OK` + `DIST_GCC_OK` + `GCC_DRV_RUN_OK`); regression for FAT long-name (LFN) padding that corrupted VFS node names |
+ | `test-usb-storage-xhci` | q35 xHCI USB root; guest write + SCSI cache sync + host readback |
 | `test-usb-storage-xhci-multi-controller` | Empty HCD 0 is skipped; HCD 1 delivers MSI-X and persists USB-root writes |
 | `test-usb-storage-xhci-sg` | Chained multi-segment xHCI bulk TDs with MSI-X and persistent write |
 | `test-usb-storage-xhci-bounce` | Bidirectional xHCI bounce DMA with MSI-X and persistent write |

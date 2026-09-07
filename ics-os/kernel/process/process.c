@@ -30,6 +30,13 @@
 
 extern unsigned int ticks;
 
+/* dexmem frame/PML4 post-mortem helpers (see dexmem.h).  Explicit decls keep
+   the 64-bit unsigned long return of freed_pml4_count() intact. */
+extern unsigned long freed_pml4_count(void);
+extern int freed_pml4_contains(u64 pml4);
+
+static void waitpid_notify_parent(PCB386 *parent);
+
 #define EVENT_WAIT_BUCKETS 32
 static wait_queue_t event_wait_queues[EVENT_WAIT_BUCKETS];
 
@@ -204,8 +211,31 @@ DWORD sigwait = 0; /*set this to the process ID of the process which is not
                    supposed to be interrupted*/
 DWORD sigshutdown = 0; //not implemented yet
 DWORD pfoccured = 0; /*set this to reset the pf_handler PCB, usually set by
-                     the pf handler when a page fault has occured so that
-                    its curent state does not get changed*/
+                      the pf handler when a page fault has occured so that
+                     its curent state does not get changed*/
+
+/* Guards the read-and-clear of the single sigterm mailbox so that two CPUs
+   reaping exits in schedule_from_timer()/taskswitcher() cannot both consume
+   (double-kill) the same pid. Only the check-and-clear is held; kill_process()
+   and the self-exit teardown run outside the lock. */
+static spinlock_t sigterm_lock;
+static PCB386 *zombie_free;
+static void self_exit_current(void);
+
+/* When set, newly created user processes (and their fork children) are not
+   pinned to the BSP so the scheduler may spread them across all online CPUs.
+   Only the parallel self-host closure sets this; normal boots keep the BSP pin
+   until waitpid/exit migration is fully hardened. */
+volatile int user_procs_smp = 0;
+
+/* 1 when booted for a stage-1 self-host closure: the serial "selfhost-stage1"
+   or the parallel "selfhost-stage1-parallel" kernel. Both run the cooperative
+   GCC closure and must park the APs before the BSP kexec. */
+int selfhost_stage1_cmdline(void) {
+   extern char kernel_cmdline[];
+   return strcmp(kernel_cmdline, "selfhost-stage1") == 0
+       || strcmp(kernel_cmdline, "selfhost-stage1-parallel") == 0;
+}
 
 DWORD sched_sysmes[3]={0,0,0}; //scheduler system messages [0] = pid, [1] = mes, [2] = data
 
@@ -298,7 +328,7 @@ DWORD createthread(void *ptr, void *stack, DWORD stacksize){
    temp->before=current_process;
    
    sprintf(temp->name,"%s.thread",current_process->name);
-   temp->processid   = nextprocessid++;
+   temp->processid   = __sync_fetch_and_add(&nextprocessid, 1);
    temp->accesslevel = ACCESS_USER;
    temp->status     |= PS_ATTB_THREAD;
    current_process->childwait++;
@@ -367,7 +397,7 @@ DWORD createuthread(void *ptr, void *stack, DWORD stacksize){
    temp->before=current_process;
    
    sprintf(temp->name,"%s.thread",current_process->name);
-   temp->processid   = nextprocessid++;
+   temp->processid   = __sync_fetch_and_add(&nextprocessid, 1);
    temp->accesslevel = ACCESS_USER;
    temp->status     |= PS_ATTB_THREAD;
    current_process->childwait++;
@@ -555,10 +585,10 @@ long user_fork_frame(u64 *frame)
    child->usercs=parent->usercs;
    child->dex32_signal=parent->dex32_signal;
    child->signaltable=parent->signaltable;
-   child->cpu_affinity=0;
-   child->on_cpu=-1;
+   child->cpu_affinity = user_procs_smp ? -1 : 0;
+    child->on_cpu=-1;
 
-   child->ctx.rip=(u64)(uintptr)fork_child_return;
+    child->ctx.rip=(u64)(uintptr)fork_child_return;
    child->ctx.rsp=(u64)(uintptr)frame;
    child->ctx.rflags=0x202;
    child->ctx.cs=SYS_CODE_SEL;
@@ -579,7 +609,7 @@ long user_fork_frame(u64 *frame)
 
    dex32_stopints(&flags);
    sync_entercrit(&processmgr_busy);
-   child->processid=nextprocessid++;
+   child->processid=__sync_fetch_and_add(&nextprocessid, 1);
    totalprocesses++;
    parent->childwait++;
    parent->nlive++;
@@ -626,7 +656,7 @@ DWORD forkprocess(PCB386 *parent){
    strcat(pcb->name,".fork");             //Add a 'fork' suffix to indicate that it was created by fork
    totalprocesses++;                      //Increase the total number of processes in the system
    pcb->size       = sizeof(PCB386);      //Save the size of the PCB
-   pcb->processid  = nextprocessid++;     //Set the process if of the new process
+   pcb->processid  = __sync_fetch_and_add(&nextprocessid, 1);     //Set the process if of the new process
    pcb->owner      = parent->processid;   //Set the parent to the process id of the parent
 
    /*Allocate a new page directory*/
@@ -711,7 +741,7 @@ DWORD createprocess(
    strcpy(temp->name,name);                           //set the name of the process
    totalprocesses++;                                  //increase the total number of processes in the system
    temp->size         = sizeof(PCB386);               //set the size to the size of the PCB
-   temp->processid    = nextprocessid++;              //set the process id of this process
+   temp->processid    = __sync_fetch_and_add(&nextprocessid, 1);              //set the process id of this process
    temp->accesslevel  = ACCESS_USER;                  //Indicates that the process is a USER process
    temp->meminfo      = pmem;                         //set the memory information
    temp->owner        = parent->processid;            //set the parent id
@@ -805,9 +835,10 @@ DWORD createprocess(
    //  temp->regs.ESP0=0x9FFFE;
    temp->regs.EFLAGS=0x202;
    temp->semhandle=0;
-   /* User processes stay on the BSP until waitpid/exit migration is fully hardened. */
-   temp->cpu_affinity = 0;
-   temp->on_cpu = -1;
+  /* User processes stay on the BSP until waitpid/exit migration is fully
+       hardened; the parallel self-host closure opts in via user_procs_smp. */
+    temp->cpu_affinity = user_procs_smp ? -1 : 0;
+    temp->on_cpu = -1;
 
 #ifndef __x86_64__
    //some functions that a character device uses
@@ -865,7 +896,7 @@ DWORD dex32_asyncproc(saveregs *r,void *entrypoint,char *name,DWORD stacksize){
    temp->before=current_process;
    strcpy(temp->name,name);
    totalprocesses++;
-   temp->processid=nextprocessid++;
+   temp->processid=__sync_fetch_and_add(&nextprocessid, 1);
    temp->accesslevel=ACCESS_SYS;
    temp->owner=1;
    temp->knext=knext;
@@ -1002,7 +1033,7 @@ DWORD createkthread_on_cpu(void *ptr,char *name,DWORD stacksize,int cpu){
    strcpy(temp->name,name);
    totalprocesses++;
    temp->size        = sizeof(PCB386);
-   temp->processid   = nextprocessid++;
+   temp->processid   = __sync_fetch_and_add(&nextprocessid, 1);
    temp->accesslevel = ACCESS_SYS;
    temp->owner       = getprocessid();
    temp->status      |= PS_ATTB_THREAD;
@@ -1162,9 +1193,16 @@ DWORD kill_process(DWORD processid){
 
       if (! (ptr->status & PS_ATTB_UNLOADABLE) ){
 
-         PCB386 *parent;
+          PCB386 *parent;
 
-         kill_children(processid);                             //kill children processes first
+          /* A blocked victim may still own crits it acquired before it
+             blocked. Release them before teardown so closeallfiles() and the
+             heap do not spin on a dead owner. Running victims cannot be safely
+             touched here; self_exit_current() handles that path. */
+          if (ptr->on_cpu < 0)
+             sync_release_process_crits(ptr, (ptr->processid & 0x007FFFFF) + 1);
+
+          kill_children(processid);                             //kill children processes first
 
          if (ptr->accesslevel == ACCESS_SYS){                  //a kernel process/thread
             dex32_killkthread(ptr);                            
@@ -1185,19 +1223,33 @@ DWORD kill_process(DWORD processid){
          //locate the parent process and decrement its waiting
          //status...important for the dex32_wait() function
          parent = ps_findprocess(ptr->owner);
-         if (parent != (PCB386 *)-1) {
-            parent->childwait = 0;
-            if (parent->nlive > 0)
-               parent->nlive--;
-            if (parent->waitq_n < WAITQ_MAX) {
-               parent->waitq_pid[parent->waitq_n] = (int)ptr->processid;
-               parent->waitq_st[parent->waitq_n] = ptr->exit_status;
-               parent->waitq_n++;
-            }
-         }
+           if (parent != (PCB386 *)-1) {
+              parent->childwait = 0;
+              if (parent->nlive > 0)
+                 parent->nlive--;
+              if (parent->waitq_n < WAITQ_MAX) {
+                 parent->waitq_pid[parent->waitq_n] = (int)ptr->processid;
+                 parent->waitq_st[parent->waitq_n] = ptr->exit_status;
+                 parent->waitq_n++;
+              }
+              if (parent != ptr)
+                 waitpid_notify_parent(parent);
+           }
 
-         if (ptr->accesslevel == ACCESS_SYS)                   //deallocate the stack pointer
-            free(ptr->stackptr);
+          /* Remove the victim from the ready queue before touching its tables
+             so no other CPU can reschedule it mid-teardown (remote-kill path
+             with user_procs_smp). Then flush any CPU still running with its
+             private PML4 so no stale TLB entries survive the free below. */
+          wait_queue_cancel(ptr);
+          ps_dequeue(ptr);
+ #ifdef __x86_64__
+          if (!(ptr->status & PS_ATTB_THREAD)
+              && userpd_is_private(ptr->pagedirloc))
+             (void)smp_tlb_shootdown((u64)(uintptr)ptr->pagedirloc);
+ #endif
+
+          if (ptr->accesslevel == ACCESS_SYS)                   //deallocate the stack pointer
+             free(ptr->stackptr);
             
          /* 
           * Perform memory garbage collection if necessary
@@ -1235,25 +1287,33 @@ DWORD kill_process(DWORD processid){
 #endif
          };
          
-         //free command line arguments 
-         if (ptr->parameters!=0) 
-            free(ptr->parameters);
+         {
+             unsigned long kf_ptr = (unsigned long)(uintptr)ptr;
+             int kf_pid = ptr->processid;
+             unsigned long kf_params = (unsigned long)(uintptr)ptr->parameters;
+             unsigned long kf_stdout = (unsigned long)(uintptr)ptr->stdout;
+             unsigned long kf_mem = (unsigned long)(uintptr)ptr->meminfo;
+             int kf_status = ptr->status;
+             //free command line arguments
+             if (ptr->parameters!=0)
+                free(ptr->parameters);
+             ptr->parameters = 0;
 
-         if (ptr->stdout!=0) {
-            free(ptr->stdout);
-         };
+             if (ptr->stdout!=0) {
+                free(ptr->stdout);
+             };
+             ptr->stdout = 0;
 
-         //Tell the scheduler to remove this process from the queue
-         wait_queue_cancel(ptr);
-         ps_dequeue(ptr);
+             //deallocate the PCB for the process
+             free(ptr);
 
-         //deallocate the PCB for the process
-         free(ptr);
+             sync_leavecrit(&processmgr_busy);
+             printf("KFREE ptr=0x%lx pid=%d params=0x%lx stdout=0x%lx mem=0x%lx status=0x%x\n",
+                    kf_ptr, kf_pid, kf_params, kf_stdout, kf_mem, kf_status);
+          }
 
-         sync_leavecrit(&processmgr_busy);
-
-         //process successfully killed
-         return 1;
+          //process successfully killed
+          return 1;
       };
    }; 
    sync_leavecrit(&processmgr_busy);
@@ -1312,32 +1372,14 @@ DWORD kill_children(DWORD processid){
 
 //called when a process wishes to terminate itself
 DWORD exit(DWORD val){
-   DWORD flags;
-   current_process->exit_status = (int)(val & 0xff);
-   //close all files the process has opened
-   posix_fd_close_all(current_process);
-   closeallfiles(current_process->processid);
-    
-   /* Tell the task switcher to kill this process by setting the
-      sigterm global variable to the current pid.
-
-      sigterm is a single one-slot "mailbox": if several processes or
-      threads exit at nearly the same time, a later writer can overwrite
-      a not-yet-processed value and the earlier kill request is LOST.
-      The losing process then spins here forever as a zombie, and any
-      thread_join()/wait on it never returns. This became easy to
-      trigger once user threads could exit concurrently.
-
-      The fix: re-assert our pid every time we are scheduled, until the
-      taskswitcher finally kills us (we simply stop running). Every
-      dying process does the same, and the taskswitcher consumes one
-      request per pass, so all pending exits are eventually served.*/
-   while (1){
-      sigterm = current_process->processid;
-      taskswitch();
-   };
-
-   return 0;
+    current_process->exit_status = (int)(val & 0xff);
+    /* Self-exit must be served by the CPU that is actually running this
+       process.  Publishing the pid in the global sigterm mailbox let a
+       different CPU consume the request and call kill_process() on a PCB
+       that was still live, leaving a stale zombie_free pointer behind and
+       double-freeing the PCB/metadata later. */
+    self_exit_current();
+    return 0;
 };
 
 /*
@@ -1756,9 +1798,132 @@ void ps_set_affinity(int pid, int cpu){
    the seeded entry point).  The guard is per-CPU so SMP is safe. */
 static volatile int ps_switchto_in_progress[MAX_CPUS];
 static volatile int voluntary_switch[MAX_CPUS];
-volatile int ctx_load_in_progress[MAX_CPUS];
-volatile int selfhost_cooperative_ready;
+ volatile int ctx_load_in_progress[MAX_CPUS];
+ volatile int selfhost_cooperative_ready;
 
+
+/* Safe page-presence walk for bounded context diagnostics.  The kernel
+   identity-maps the low physical ranges used for page tables, so the table
+   entries themselves can be read without switching CR3. */
+static int ctx_page_present(u64 cr3, u64 va)
+{
+   u64 *pt;
+   int level;
+
+   if (!cr3 || (cr3 & 0xffFULL) != 0)
+      return 0;
+   pt = (u64 *)cr3;
+   for (level = 3; level >= 0; level--) {
+      u64 idx = (va >> (12 + level * 9)) & 0x1ffULL;
+      u64 e = pt[idx];
+      if (!(e & 1ULL))
+         return 0;
+      if (e & 0x80ULL)
+         return level > 0;
+      if (level == 0)
+         return 1;
+      pt = (u64 *)(e & 0x000ffffffffff000ULL);
+      if (!pt)
+         return 0;
+   }
+   return 1;
+}
+
+/* Called from context_load after the destination CR3/RSP are active but before
+   any destination GPR is restored.  This is the only safe point to inspect the
+   destination stack: the CPU is already running on that stack and page table. */
+void ctx_load_check(cpu_context *ctx)
+{
+   u64 rip = ctx->rip;
+   u64 rbp = ctx->rbp;
+   char cb[256];
+   char nm[12];
+   int n;
+   const char *src;
+
+   /* Only user tasks resuming at the ps_switchto epilogue have a user-stack
+      frame whose return slot can be validated.  Kernel idle/thread frames are
+      left alone. */
+   if (rip < 0x100000ULL || rip >= 0x300000ULL)
+      return;
+   if (rbp < 0x3fff0000ULL || rbp >= 0x40000000ULL)
+      return;
+   if (!ctx_page_present(ctx->cr3, rbp) ||
+       !ctx_page_present(ctx->cr3, rbp + 8)) {
+      src = "ctx";
+      n = 0;
+      while (src[n] && n < 11) { nm[n] = src[n]; n++; }
+      nm[n] = 0;
+      sprintf(cb,
+              "CTXCANARY UNMAP %s rip=0x%llx rsp=0x%llx rbp=0x%llx cr3=0x%llx canary=0x%llx\n",
+              nm,
+              (unsigned long long)rip,
+              (unsigned long long)ctx->rsp,
+              (unsigned long long)rbp,
+              (unsigned long long)ctx->cr3,
+              (unsigned long long)ctx->retcanary);
+      serial_puts(cb);
+      for (;;) __asm__ __volatile__("hlt");
+   }
+
+   {
+       u64 actual = *(u64 *)(rbp + 8);
+       if (actual != ctx->retcanary) {
+          PCB386 *p = current_process;
+          u64 slotva = rbp + 8;
+          u64 phys;
+          char *rp;
+          int i;
+          src = (p && p->name) ? p->name : "?";
+          n = 0;
+          while (src[n] && n < 11) { nm[n] = src[n]; n++; }
+          nm[n] = 0;
+          /* Resolve the corrupted slot to its physical frame so we can tell a
+             direct write to a live frame from a freed-while-mapped frame. */
+          rp = userpd_resolve((u64 *)(uintptr)ctx->cr3, slotva);
+           phys = rp ? (((u64)(uintptr)rp) & 0x000FFFFFFFFF000ULL) : 0;
+           frame_diag_report("CTX", phys);
+           {
+              int wasfreed = freed_pml4_contains(ctx->cr3);
+              unsigned long fring = freed_pml4_count();
+              char cd[256];
+              sprintf(cd,
+                      "CTXDIAG p%d name=%.11s cr3=0x%llx pcbdir=0x%x cr3==pcbdir=%d oncpu=%d status=0x%x slotphys=0x%llx slotoff=0x%llx wasfreed=%d fring=%lu\n",
+                      (int)(p ? p->processid : 0), nm,
+                      (unsigned long long)ctx->cr3,
+                      (int)(p ? p->pagedirloc : 0),
+                      (int)(p && (u64)(uintptr)p->pagedirloc == ctx->cr3),
+                      (int)(p ? p->on_cpu : -1),
+                      (int)(p ? p->status : 0),
+                      (unsigned long long)phys,
+                      (unsigned long long)(slotva & 0xFFFULL),
+                      wasfreed, (unsigned long)fring);
+              serial_puts(cd);
+           }
+          /* Dump the 16 qwords of the frame to see the surrounding state. */
+          for (i = 0; i < 16; i++) {
+             char fw[64];
+             u64 v = *(u64 *)(rbp + (i << 3));
+             sprintf(fw, "CTXFRAME f[%d]=0x%llx\n", i, (unsigned long long)v);
+             serial_puts(fw);
+          }
+          sprintf(cb,
+                  "CTXCANARY %s p%d rip=0x%llx rsp=0x%llx rbp=0x%llx cr3=0x%llx expected=0x%llx actual=0x%llx status=0x%x oncpu=%d\n",
+                  nm,
+                  (int)(p ? p->processid : 0),
+                  (unsigned long long)rip,
+                  (unsigned long long)ctx->rsp,
+                  (unsigned long long)rbp,
+                  (unsigned long long)ctx->cr3,
+                  (unsigned long long)ctx->retcanary,
+                  (unsigned long long)actual,
+                  (int)(p ? p->status : 0),
+                  (int)(p ? p->on_cpu : -1));
+          serial_puts(cb);
+          for (;;) __asm__ __volatile__("hlt");
+       }
+    }
+}
 
 void ps_switchto(PCB386 *process){
    PCB386 *prev = current_process;
@@ -1853,11 +2018,114 @@ void ps_switchto(PCB386 *process){
       }
     }
 
-    if (prev && prev != process)
-      context_switch(&prev->ctx, &process->ctx, &prev->on_cpu);
-    else
-      context_load(&process->ctx);
+     {
+         static volatile unsigned long switch_user_count = 0;
+         if (process->accesslevel == ACCESS_USER && switch_user_count < 96) {
+           char swb[128];
+           switch_user_count++;
+           sprintf(swb, "SWITCH cpu=%d n=%lu prev=%s next=%s rip=0x%llx\n",
+                   me, (unsigned long)switch_user_count,
+                   prev ? prev->name : "?", process->name,
+                   (unsigned long long)process->ctx.rip);
+           serial_puts(swb);
+        }
+     }
+
+     if (prev && prev != process)
+       context_switch(&prev->ctx, &process->ctx, &prev->on_cpu);
+     else
+       context_load(&process->ctx);
 };
+
+
+/* Notify a parent that one of its children has reached the waitq.  Under
+   user_procs_smp the parent may be live on another CPU; do not load its
+   context here.  Wake it if it is blocked and let the owning CPU reschedule
+   it. */
+static void waitpid_notify_parent(PCB386 *parent)
+{
+   int me = smp_cpu_id();
+   extern int lapic_send_ipi(u32 apic_id, u32 vector);
+   if (parent == (PCB386 *)-1 || !parent)
+      return;
+   if (parent->status & PS_ATTB_BLOCKED)
+      sched_wake_process(parent);
+   if (parent->on_cpu >= 0 && parent->on_cpu != me) {
+      int other = parent->on_cpu;
+      if (other >= 0 && other < cpu_count && cpus[other].online)
+         lapic_send_ipi(cpus[other].apic_id, IPI_RESCHEDULE);
+   } else {
+      smp_reschedule_others();
+   }
+}
+
+static void self_exit_current(void)
+{
+   PCB386 *dying = current_process;
+   PCB386 *parent;
+   PCB386 *readyprocess;
+   devmgr_scheduler_extension *cursched;
+   int me = smp_cpu_id();
+
+   if (!dying)
+       return;
+
+  sync_entercrit(&processmgr_busy);
+    posix_fd_close_all(dying);
+    closeallfiles(dying->processid);
+
+   parent = ps_findprocess(dying->owner);
+   if (parent != (PCB386 *)-1 && parent != dying) {
+      parent->childwait = 0;
+      if (parent->nlive > 0)
+         parent->nlive--;
+      if (parent->waitq_n < WAITQ_MAX) {
+         parent->waitq_pid[parent->waitq_n] = (int)dying->processid;
+         parent->waitq_st[parent->waitq_n] = dying->exit_status;
+         parent->waitq_n++;
+      }
+      waitpid_notify_parent(parent);
+   }
+
+   if (parent != (PCB386 *)-1 && parent != dying &&
+        !(parent->status & PS_ATTB_BLOCKED) && !parent->waiting &&
+        (parent->on_cpu < 0 || parent->on_cpu == me) &&
+        (parent->cpu_affinity < 0 || parent->cpu_affinity == me))
+       readyprocess = parent;
+   else {
+      readyprocess = (PCB386*)smp_this_cpu()->idle;
+      if (!readyprocess) {
+         cursched = (devmgr_scheduler_extension*)extension_table[CURRENT_SCHEDULER].iface;
+         if (cursched && cursched->scheduler)
+            readyprocess = (PCB386*)bridges_link((devmgr_generic*)cursched,
+                                                 &cursched->scheduler,
+                                                 current_process,0,0,0,0,0);
+      }
+      if (!readyprocess || readyprocess == dying)
+         readyprocess = &sPCB;
+   }
+
+   dying->on_cpu = -1;
+      dying->status |= PS_ATTB_UNLOADABLE;
+      {
+        int se_pid = dying->processid;
+       unsigned long se_z = (unsigned long)(uintptr)dying;
+       unsigned long se_params = (unsigned long)(uintptr)dying->parameters;
+       unsigned long se_stdout = (unsigned long)(uintptr)dying->stdout;
+       int se_status = dying->status;
+       ps_dequeue(dying);
+        zombie_free = dying;
+        sync_leavecrit(&processmgr_busy);
+        sync_release_process_crits(dying, (dying->processid & 0x007FFFFF) + 1);
+        printf("SELFEXIT pid=%d z=0x%lx params=0x%lx stdout=0x%lx status=0x%x\n",
+               se_pid, se_z, se_params, se_stdout, se_status);
+    }
+   stopints();
+     current_process = readyprocess;
+     readyprocess->on_cpu = me;
+     fpu_restore(&readyprocess->fpu);
+     context_load(&readyprocess->ctx);
+  }
 
 /*Calls the scheduler voluntarily*/
 inline void taskswitch(){
@@ -1870,23 +2138,24 @@ inline void taskswitch(){
 /* Invoked from the timer IRQ wrapper after time_handler(). */
 
 void schedule_from_timer(void){
-   PCB386 *readyprocess;
-   devmgr_scheduler_extension *cursched;
-   static PCB386 *zombie_free;
+    PCB386 *readyprocess;
+    devmgr_scheduler_extension *cursched;
    int me=smp_cpu_id();
-   int voluntary = voluntary_switch[me];
-   voluntary_switch[me] = 0;
-
-   /* Long GCC cc1 runs expose a legacy timer-context race.  Stage-1
-      certification is intentionally uniprocessor and cooperatively
-      scheduled: spawned tools run to exit, then taskswitch() resumes make
-      or the console.  The generated kernel uses normal preemptive SMP. */
-   {
-      extern char kernel_cmdline[];
-        if (!voluntary && selfhost_cooperative_ready &&
-           strcmp(kernel_cmdline, "selfhost-stage1") == 0)
-         return;
-   }
+    int voluntary = voluntary_switch[me];
+    voluntary_switch[me] = 0;
+ 
+    /* Long GCC cc1 runs expose a legacy timer-context race.  Stage-1
+       certification (serial "selfhost-stage1" and parallel
+       "selfhost-stage1-parallel") is cooperatively scheduled: spawned tools
+       run to exit, then taskswitch() resumes make or the console.  In the
+       parallel boot user tools may run on any CPU, but timer preemption of a
+       running tool is still suppressed.  The generated kernel uses normal
+       preemptive SMP. */
+    {
+         if (!voluntary && selfhost_cooperative_ready &&
+            selfhost_stage1_cmdline())
+          return;
+    }
 
    /* If context_load is in progress, the new task's context has been
       fully loaded (RSP, GPRs, RFLAGS all restored) but the flag was
@@ -1922,72 +2191,55 @@ void schedule_from_timer(void){
          z->pagedirloc = pagedir1;
       }
 #endif
-      if (z->meminfo) {
-         process_mem *m = z->meminfo;
-         while (m) {
-            process_mem *n = m->next;
-            free(m);
-            m = n;
-         }
-         z->meminfo = 0;
-      }
-      if (z->parameters) free(z->parameters);
-      if (z->stdout) free(z->stdout);
-      free(z);
+      printf("ZFREE z=0x%lx pid=%d pagedir=0x%x params=0x%lx stdout=0x%lx mem=0x%lx status=0x%x oncpu=%d\n",
+               (unsigned long)(uintptr)z, z->processid,
+               z->pagedirloc,
+               (unsigned long)(uintptr)z->parameters,
+               (unsigned long)(uintptr)z->stdout,
+               (unsigned long)(uintptr)z->meminfo, z->status,
+               z->on_cpu);
+       if (z->meminfo) {
+          process_mem *m = z->meminfo;
+          while (m) {
+             process_mem *n = m->next;
+             free(m);
+             m = n;
+          }
+          z->meminfo = 0;
+       }
+       if (z->parameters) free(z->parameters);
+       z->parameters = 0;
+       if (z->stdout) free(z->stdout);
+       z->stdout = 0;
+       free(z);
    }
 
    cursched = (devmgr_scheduler_extension*)extension_table[CURRENT_SCHEDULER].iface;
    if (!cursched || !cursched->scheduler)
       return;
 
-   /* Reap exit/kill before choosing the next task. */
-   if (sigterm) {
-      DWORD victim = sigterm;
-      sigterm = 0;
-      if (current_process->processid == victim) {
-         PCB386 *dying = current_process;
-         PCB386 *parent;
-         /* Prefer resuming the parent (typical waitpid waiter). */
-         parent = ps_findprocess(dying->owner);
-         if (parent != (PCB386*)-1 && parent != dying
-             && (parent->cpu_affinity < 0 || parent->cpu_affinity == smp_cpu_id()))
-            readyprocess = parent;
-         else {
-            readyprocess = (PCB386*)smp_this_cpu()->idle;
-            if (!readyprocess)
-               readyprocess = (PCB386*)bridges_link((devmgr_generic*)cursched, &cursched->scheduler,
-                                                   current_process,0,0,0,0,0);
-            if (!readyprocess || readyprocess == dying)
-               readyprocess = &sPCB;
-         }
+   /* Reap exit/kill before choosing the next task. The read-and-clear is
+       atomic (sigterm_lock) so two CPUs cannot both consume the same pid. */
+    {
+       DWORD victim = 0;
+       spin_irq_flags_t sl_flags = spin_lock_irqsave(&sigterm_lock);
+       if (sigterm) {
+          victim = sigterm;
+          sigterm = 0;
+       }
+       spin_unlock_irqrestore(&sigterm_lock, sl_flags);
+      if (victim) {
+        if (current_process->processid == victim) {
+           self_exit_current();
+           return;
+        }
+       kill_process(victim);
+        if (!current_process)
+           return;
+        }
+     }
 
-         posix_fd_close_all(dying);
-         closeallfiles(dying->processid);
-         if (parent != (PCB386*)-1) {
-            parent->childwait = 0;
-            if (parent->nlive > 0)
-               parent->nlive--;
-            if (parent->waitq_n < WAITQ_MAX) {
-               parent->waitq_pid[parent->waitq_n] = (int)dying->processid;
-               parent->waitq_st[parent->waitq_n] = dying->exit_status;
-               parent->waitq_n++;
-            }
-         }
-         dying->on_cpu = -1;
-         ps_dequeue(dying);
-         zombie_free = dying; /* free after we leave this stack */
-         current_process = readyprocess;
-         readyprocess->on_cpu = smp_cpu_id();
-         fpu_restore(&readyprocess->fpu);
-         context_load(&readyprocess->ctx); /* does not return */
-         return;
-      }
-      kill_process(victim);
-      if (!current_process)
-         return;
-   }
-
-   readyprocess = (PCB386*)bridges_link((devmgr_generic*)cursched, &cursched->scheduler,
+    readyprocess = (PCB386*)bridges_link((devmgr_generic*)cursched, &cursched->scheduler,
                                           current_process,0,0,0,0,0);
    if (!readyprocess || readyprocess == current_process)
       return;
@@ -2077,12 +2329,20 @@ void taskswitcher(){
       //sigterm is usually set in the dex32_killkthread_name(),ps_user_kill(), and exit() functions.
       //do clean up for terminate process
       //a request to terminate a process is received, pid of process to end is the value of sigterm
-      if (sigterm && !flushing){
-         flushok = 0;
-         kill_process(sigterm);
-         flushok = 1;
-         sigterm = 0;      //reset the variable
-      };
+      {
+          DWORD victim = 0;
+          spin_irq_flags_t sl_flags = spin_lock_irqsave(&sigterm_lock);
+          if (sigterm) {
+             victim = sigterm;
+             sigterm = 0;   //atomic read-and-clear; the dying process re-asserts until served
+          }
+          spin_unlock_irqrestore(&sigterm_lock, sl_flags);
+          if (victim && !flushing){
+             flushok = 0;
+             kill_process(victim);
+             flushok = 1;
+          };
+       };
 
       if (sched_sysmes[0]){
          sendmessage(sched_sysmes[0],sched_sysmes[1],sched_sysmes[2]);

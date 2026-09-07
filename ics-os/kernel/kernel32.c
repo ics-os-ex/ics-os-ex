@@ -593,15 +593,21 @@ void dex32_startup(){
       storeflags(&flags);
       stopints();
       printf("Starting application processors...");
-      /* A stage-1 self-host kernel must leave APs in reset while BSP kexec
-         replaces the shared kernel image. The generated kernel receives the
-         normal "kexeced" command line and performs full SMP bring-up. */
-      if (strcmp(kernel_cmdline, "selfhost-stage1") == 0)
-         printf("deferred for self-host kexec");
-      else
-         smp_start_aps();
-      printf("[OK]\n");
-      restoreflags(flags);
+       /* A stage-1 self-host kernel must leave APs in reset while BSP kexec
+          replaces the shared kernel image. The generated kernel receives the
+          normal "kexeced" command line and performs full SMP bring-up.
+          The parallel self-host closure is the exception: it boots the APs so
+          make/gcc can spread across CPUs, then parks them again before kexec. */
+       if (strcmp(kernel_cmdline, "selfhost-stage1") == 0)
+          printf("deferred for self-host kexec");
+       else {
+          extern volatile int user_procs_smp;
+          if (strcmp(kernel_cmdline, "selfhost-stage1-parallel") == 0)
+             user_procs_smp = 1;
+          smp_start_aps();
+       }
+       printf("[OK]\n");
+       restoreflags(flags);
    }
 
    /* BSP keeps PIT/LAPIC timer for scheduling; enable after AP probe. */
@@ -941,9 +947,20 @@ void dex_init(){
     env_setenv("COLUMNS", "80", 1);
     env_setenv("LINES", "25", 1);
 
-    //Create a new console instance
+   //Create a new console instance
     consolepid = console_new();
-   ps_set_affinity(consolepid, 0);
+    ps_set_affinity(consolepid, 0);
+
+    /* COM2 (0x2F8) interactive terminal/shell: live commands + introspection
+       without a reboot. Attach via a second QEMU -serial chardev (telnet or
+       unix socket). Output is mirrored to COM2 only while shell2 is active. */
+    {
+       extern void serial2_init(void);
+       extern DWORD shell2_start(void);
+       serial2_init();
+       if (shell2_start())
+          serial_puts("shell2: COM2 interactive shell online (0x2F8)\n");
+    }
 
    /* After console exists, prove AP can run a pinned migratable kthread. */
    if (cpu_count > 1) {

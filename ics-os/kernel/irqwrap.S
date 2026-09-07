@@ -13,11 +13,13 @@
 .extern GPFhandler64
 .extern CPUint
 .extern nocoprocessor
+.extern wrapper_call_trap
 .extern divide_error
 .extern exc_invalidtss
 .extern irq_activate
 .extern schedule_from_timer
 .extern lapic_eoi
+.extern smp_cpu_id
 .extern smp_reschedule_ipi
 .extern smp_tlb_shootdown_ipi
 .extern virtio_blk_irq
@@ -25,6 +27,7 @@
 .extern user_fork_frame
 
 .macro PUSH_ALL
+    cld
     pushq %rax
     pushq %rbx
     pushq %rcx
@@ -121,6 +124,21 @@ CPUintwrapper:
 
 .globl fdcwrapper
 fdcwrapper:
+    movw 8(%rsp), %ax
+    cmpw $0x8, %ax
+    je .Lfdc_exception
+    cmpw $0x20, %ax
+    je .Lfdc_exception
+    cmpw $0x2b, %ax
+    je .Lfdc_exception
+    cmpw $0x23, %ax
+    je .Lfdc_exception
+    movq 0(%rsp), %rdi
+    movq %rax, %rsi
+    movq 16(%rsp), %rdx
+    call wrapper_call_trap
+    ret
+.Lfdc_exception:
     cli
     PUSH_ALL
     call fdchandler
@@ -129,6 +147,21 @@ fdcwrapper:
 
 .globl copwrapper
 copwrapper:
+    movw 8(%rsp), %ax
+    cmpw $0x8, %ax
+    je .Lcop_exception
+    cmpw $0x20, %ax
+    je .Lcop_exception
+    cmpw $0x2b, %ax
+    je .Lcop_exception
+    cmpw $0x23, %ax
+    je .Lcop_exception
+    movq 0(%rsp), %rdi
+    movq %rax, %rsi
+    movq 16(%rsp), %rdx
+    call wrapper_call_trap
+    ret
+.Lcop_exception:
     cli
     PUSH_ALL
     call nocoprocessor
@@ -139,75 +172,80 @@ copwrapper:
 timerwrapper:
     cli
     PUSH_ALL
-    /* Selfhost spin watchdog diagnostics: save the pre-PUSH_ALL RSP (RSP_entry,
-       pointing at the CPU-pushed RIP) so the C watchdog can walk the kernel C
-       stack; r10/rax are already saved by PUSH_ALL and restored by POP_ALL, so
-       clobbering them here is safe. */
-    leaq 120(%rsp), %r10
-    mov %r10, wd_krsp(%rip)
+    /* Per-CPU selfhost spin watchdog diagnostics: save the pre-PUSH_ALL RSP
+       (RSP_entry, pointing at the CPU-pushed RIP) so the C watchdog can walk
+       the kernel C stack; r10/rax are already saved by PUSH_ALL and restored
+       by POP_ALL, so clobbering them here is safe. */
+    call smp_cpu_id
+    movl %eax, %r10d
+    leaq wd_krsp_cpu(,%r10,8), %r11
+    leaq 120(%rsp), %r12
+    mov %r12, (%r11)
+    imull $248, %r10d, %r10d
+    leaq wd_frame_cpu(%r10), %r11
     /* Dump a wide interrupt-frame window ([rsp+0..240]) to locate the live RIP. */
     movq 0(%rsp), %rax
-    movq %rax, wd_frame+0(%rip)
+    movq %rax, 0(%r11)
     movq 8(%rsp), %rax
-    movq %rax, wd_frame+8(%rip)
+    movq %rax, 8(%r11)
     movq 16(%rsp), %rax
-    movq %rax, wd_frame+16(%rip)
+    movq %rax, 16(%r11)
     movq 24(%rsp), %rax
-    movq %rax, wd_frame+24(%rip)
+    movq %rax, 24(%r11)
     movq 32(%rsp), %rax
-    movq %rax, wd_frame+32(%rip)
+    movq %rax, 32(%r11)
     movq 40(%rsp), %rax
-    movq %rax, wd_frame+40(%rip)
+    movq %rax, 40(%r11)
     movq 48(%rsp), %rax
-    movq %rax, wd_frame+48(%rip)
+    movq %rax, 48(%r11)
     movq 56(%rsp), %rax
-    movq %rax, wd_frame+56(%rip)
+    movq %rax, 56(%r11)
     movq 64(%rsp), %rax
-    movq %rax, wd_frame+64(%rip)
+    movq %rax, 64(%r11)
     movq 72(%rsp), %rax
-    movq %rax, wd_frame+72(%rip)
+    movq %rax, 72(%r11)
     movq 80(%rsp), %rax
-    movq %rax, wd_frame+80(%rip)
+    movq %rax, 80(%r11)
     movq 88(%rsp), %rax
-    movq %rax, wd_frame+88(%rip)
+    movq %rax, 88(%r11)
     movq 96(%rsp), %rax
-    movq %rax, wd_frame+96(%rip)
+    movq %rax, 96(%r11)
     movq 104(%rsp), %rax
-    movq %rax, wd_frame+104(%rip)
+    movq %rax, 104(%r11)
     movq 112(%rsp), %rax
-    movq %rax, wd_frame+112(%rip)
+    movq %rax, 112(%r11)
     movq 120(%rsp), %rax
-    movq %rax, wd_frame+120(%rip)
+    movq %rax, 120(%r11)
     movq 128(%rsp), %rax
-    movq %rax, wd_frame+128(%rip)
+    movq %rax, 128(%r11)
     movq 136(%rsp), %rax
-    movq %rax, wd_frame+136(%rip)
+    movq %rax, 136(%r11)
     movq 144(%rsp), %rax
-    movq %rax, wd_frame+144(%rip)
+    movq %rax, 144(%r11)
     movq 152(%rsp), %rax
-    movq %rax, wd_frame+152(%rip)
+    movq %rax, 152(%r11)
     movq 160(%rsp), %rax
-    movq %rax, wd_frame+160(%rip)
+    movq %rax, 160(%r11)
     movq 168(%rsp), %rax
-    movq %rax, wd_frame+168(%rip)
+    movq %rax, 168(%r11)
     movq 176(%rsp), %rax
-    movq %rax, wd_frame+176(%rip)
+    movq %rax, 176(%r11)
     movq 184(%rsp), %rax
-    movq %rax, wd_frame+184(%rip)
+    movq %rax, 184(%r11)
     movq 192(%rsp), %rax
-    movq %rax, wd_frame+192(%rip)
+    movq %rax, 192(%r11)
     movq 200(%rsp), %rax
-    movq %rax, wd_frame+200(%rip)
+    movq %rax, 200(%r11)
     movq 208(%rsp), %rax
-    movq %rax, wd_frame+208(%rip)
+    movq %rax, 208(%r11)
     movq 216(%rsp), %rax
-    movq %rax, wd_frame+216(%rip)
+    movq %rax, 216(%r11)
     movq 224(%rsp), %rax
-    movq %rax, wd_frame+224(%rip)
+    movq %rax, 224(%r11)
     movq 232(%rsp), %rax
-    movq %rax, wd_frame+232(%rip)
+    movq %rax, 232(%r11)
     movq 240(%rsp), %rax
-    movq %rax, wd_frame+240(%rip)
+    movq %rax, 240(%r11)
     call time_handler
     call schedule_from_timer
     POP_ALL
@@ -259,10 +297,10 @@ gpfwrapper:
     movl 184(%rsp), %eax        /* error code (120 + 64) */
     movl %eax, 16(%rsp)
     movw 200(%rsp), %ax         /* cs (136 + 64) -> field cs @20 */
-    movw %ax, 20(%rsp)
+    movl %eax, 20(%rsp)
     movw %ss, %ax
-    movw %ax, 24(%rsp)
-    movq 216(%rsp), %rax        /* user RSP from iret frame */
+    movl %eax, 24(%rsp)
+    leaq 216(%rsp), %rax        /* active RSP at fault (CPL0 frame) */
     movq %rax, 32(%rsp)
     movq %cr3, %rax
     movq %rax, 40(%rsp)

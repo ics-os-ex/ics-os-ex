@@ -59,5 +59,6 @@ int dex32_registerloader(void *funcptr);
 int dex32_unregisterloader(void *funcptr);
 void dex32_initloader();
 int dex32_loader(char *name,char *image,char *loadaddress,int mode,char *p,char *workdir,PCB386 *parent);
+int elf64_stream_load(char *name,int mode,char *p,char *workdir,PCB386 *parent);
 
 #endif

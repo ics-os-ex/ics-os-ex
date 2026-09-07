@@ -12,6 +12,9 @@ Description: Priority-aware round-robin scheduler with a locked ready walk
 #include "../cpu/spinlock.h"
 #include "../cpu/smp.h"
 
+extern void serial_puts(const char *s);
+extern int sprintf(char *str, const char *fmt, ...);
+
 PCB386 *sched_phead;
 int ps_schedid;
 devmgr_scheduler_extension ps_scheduler;
@@ -46,10 +49,10 @@ static int sched_runnable_here(PCB386 *ptr) {
    if (ptr->status & PS_ATTB_BLOCKED)
       return 0;
    /* Claimed by another CPU */
-   if (ptr->on_cpu >= 0 && ptr->on_cpu != me)
-      return 0;
-   if (ptr->cpu_affinity >= 0 && ptr->cpu_affinity != me)
-      return 0;
+     if (ptr->on_cpu >= 0 && ptr->on_cpu != me)
+        return 0;
+     if (ptr->cpu_affinity >= 0 && ptr->cpu_affinity != me)
+       return 0;
    /* Only the owning CPU may select its idle thread. */
    if ((ptr->processid & 0xFFFF0000u) == 0xFFFF0000u
        && ptr != (PCB386 *)smp_this_cpu()->idle)
@@ -99,24 +102,38 @@ PCB386 *scheduler(PCB386 *lastprocess){
    } while (ptr != start);
 
    /* Pass 2: among that priority, pick the next after lastprocess (RR). */
-   if (best) {
-      ptr = lastprocess->next;
-      do {
-         if (sched_runnable_here(ptr)
-             && (int)ptr->priority == best_prio) {
-            best = ptr;
-            break;
-         }
-         ptr = ptr->next;
-      } while (ptr != lastprocess->next);
-      /* Claim before unlock so another CPU cannot pick the same task. */
-      best->on_cpu = me;
-   }
+    if (best) {
+       ptr = lastprocess->next;
+       do {
+          if (sched_runnable_here(ptr)
+              && (int)ptr->priority == best_prio) {
+             best = ptr;
+             break;
+          }
+          ptr = ptr->next;
+       } while (ptr != lastprocess->next);
+       /* Claim before unlock so another CPU cannot pick the same task. */
+       best->on_cpu = me;
+    }
 
-   spin_unlock(&ready_lock);
-   restoreflags(fl); }
-   return best ? best : lastprocess;
+    spin_unlock(&ready_lock);
+    restoreflags(fl); }
+
+    if (best && best != lastprocess) {
+       static volatile unsigned long schedsel_user_count = 0;
+       if (best->accesslevel == ACCESS_USER && schedsel_user_count < 96) {
+          char sb[128];
+          schedsel_user_count++;
+          sprintf(sb, "SCHEDSEL cpu=%d n=%lu last=%s best=%s prio=%d on=%d\n",
+                  me, (unsigned long)schedsel_user_count,
+                  lastprocess ? lastprocess->name : "?",
+                  best->name, (int)best->priority, (int)best->on_cpu);
+          serial_puts(sb);
+       }
+    }
+    return best ? best : lastprocess;
 };
+
 
 
 //This is called when the extension manager is ready to make the current

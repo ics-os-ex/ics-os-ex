@@ -57,5 +57,21 @@ s = s.replace(
 open(p,'w').write(s)
 print('patched job.c for ICSOS posix_spawn')
 PY
+python3 - "$DEST" << 'PY'
+import sys, os
+root = sys.argv[1]
+needle = b'printf ("MAKE_DBG'
+repl = b'if (0) printf ("MAKE_DBG'
+for dirpath, dirnames, filenames in os.walk(root):
+    for fn in filenames:
+        if not fn.endswith('.c'):
+            continue
+        p = os.path.join(dirpath, fn)
+        with open(p, 'rb') as f:
+            data = f.read()
+        if needle in data:
+            with open(p, 'wb') as f:
+                f.write(data.replace(needle, repl))
+PY
 
 echo "staged GNU make 3.82 under $DEST"

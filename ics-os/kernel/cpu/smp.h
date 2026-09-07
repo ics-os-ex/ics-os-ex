@@ -25,7 +25,8 @@ extern int cpu_count;
 extern spinlock_t sched_lock;
 
 void smp_init(void);
-void smp_start_aps(void);
+ void smp_start_aps(void);
+ void smp_park_aps(void);
 int  smp_cpu_id(void);
 cpu_local *smp_this_cpu(void);
 void smp_cpu_idle(void);

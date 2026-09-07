@@ -472,7 +472,7 @@ void setdefaulthandlers(){
                        doublefaultwrapper,SYS_CODE_SEL);
 
    setinterruptvector(6,dex_idtbase,0x8E,
-                        fdcwrapper,SYS_CODE_SEL);
+                         copwrapper,SYS_CODE_SEL);
 
    setinterruptvector(3,dex_idtbase,0x8E,
                         breakpoint,SYS_CODE_SEL);

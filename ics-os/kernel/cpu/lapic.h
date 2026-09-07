@@ -31,5 +31,6 @@ int  lapic_send_init(u32 apic_id);
 int  lapic_send_sipi(u32 apic_id, u32 vector);
 
 extern volatile u32 *lapic_mmio;
+extern volatile u64 lapic_expected_base;
 
 #endif

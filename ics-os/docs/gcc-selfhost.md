@@ -255,8 +255,25 @@ FS issue.
 3. **host-seeded in-OS kernel build** — **done**: `test-kbuild` uses the in-OS GCC driver,
    cc1, GAS, and GNU ld to compile/link ICS-OS, then kexecs the resulting
    kernel (`GKBUILD_TEST_PASS` + `KEXEC_BOOT_OK`).
-4. **compiler closure** — **pending**: rebuild GCC/cc1 inside ICS-OS, rebuild
-  the kernel with that compiler, and run post-kexec capability regressions.
+4. **compiler closure** — **in progress**: `test-selfhost-cert` rebuilds
+   ~441 objects (349 cc1 + libcpp/libiberty/libdec/zlib/runtime) inside ICS-OS
+   via `contrib/gcc/Selfhost.mk`, uses the rebuilt cc1 to build a new `gcc.exe`,
+   compiles `loop.o` with it, rebuilds make, then rebuilds + kexecs the kernel
+   with provenance `in-os-rebuilt`; post-kexec must pass SMP, ELF exec, and
+   GCC/binutils capability checks. Bounded baseline (2026-09-04, 12-min run):
+   boot clean, 22/349 cc1 objects compiled with no blocker, ~31 s/object on the
+   heavy `c-family` units, ~2.5–3 h full build. The closure is **serial and
+   uniprocessor by design** (stage-1 leaves APs in reset for the kexec);
+   `GKBUILD_TIME` phase marks report the compile-time profile, and
+    `CERT_TIMEOUT` bounds diagnostic runs.
+
+    **`as` heap OOM (fixed 2026-09-04):** the first full run died assembling
+    `insn-attrtab.o` (`sbrk DENIED ... limit=0x3fd00000`). The SDK `malloc`
+    did one `sbrk()` per fresh block and `dex32_sbrk` rounds each to a 4 KiB
+    page, so ~250k GAS symbol/frag blocks each burned a whole page (~1 GiB)
+    for a few-MB object, hitting the 1 GiB user-VA cap. New blocks are now
+    carved from a shared page-aligned slab (≥ 64 KiB) in `sdk/tccsdk.c`, so
+    small blocks share pages; `test-bintools`/`test-fork`/`test-exec` re-validated.
 
 ## Tests
 
@@ -269,6 +286,7 @@ make test-cc1            # CC1_TEST_PASS (in-OS cc1: C -> assembly)
 make test-gcc            # GCC_E2E_OK + GCC_E2E_RUN_OK (cc1 -> as -> ld -> exec)
 make test-gccdriver      # GCC_DRIVER_OK (in-OS gcc driver: x.c -> x -> exec)
 make test-kbuild         # supported GCC kernel self-host + kexec
+make test-selfhost-cert  # Round-4 compiler closure (~3 h; CERT_TIMEOUT to bound)
 make test-tcc-kbuild     # optional TinyCC kernel experiment
 make test-spawn          # SPAWN_PASS + WORK_DISK_PASS
 make test-posixio        # still green (unformatted vblk → no /work)

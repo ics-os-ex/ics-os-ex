@@ -93,11 +93,17 @@ void smp_cpu_idle(void) {
     }
 }
 
-/* IPI handler: nudge this CPU to pick up runnable work. */
+/* IPI handler: nudge this CPU to pick up runnable work.
+    Use the voluntary-switch path (taskswitch) so a spawned user task is
+    scheduled even while the selfhost-stage1 cooperative gate suppresses
+    periodic timer preemption.  The gate exists only to stop the periodic
+    LAPIC/PIT tick from preempting a running tool; an explicit reschedule
+    IPI is an event and must still run the scheduler. */
 void smp_reschedule_ipi(void) {
     lapic_eoi();
-    if (smp_sched_enabled)
-        schedule_from_timer();
+    if (!smp_sched_enabled)
+        return;
+    taskswitch();
 }
 
 void smp_tlb_shootdown_ipi(void)
@@ -425,4 +431,45 @@ void smp_start_aps(void) {
     }
     printf("SMP: %d CPUs online\n", cpu_count);
     restoreflags(flags);
+}
+
+/* Reset every online AP with an INIT pulse so it sits in the reset state
+   (waiting for SIPI at 0x46000). The kexec trampoline overwrites the running
+   kernel image in place and does NOT reset secondary cores, so any AP still
+   executing old-kernel code would fault on the clobbered text/data. After the
+   INIT the AP runs nothing until the NEW kernel re-STARTs it, so parking here
+   is safe and required before a self-host kexec. */
+void smp_park_aps(void) {
+    int me = smp_cpu_id();
+    int i;
+    unsigned int flags;
+
+    if (cpu_count < 2 || !lapic_mmio)
+        return;
+
+    storeflags(&flags);
+    stopints();
+
+    for (i = 1; i < cpu_count; i++) {
+        if (!cpus[i].online || i == me)
+            continue;
+        (void)lapic_send_init((u32)cpus[i].apic_id);
+    }
+
+    /* Give the INIT pulses time to land before dropping the AP state. */
+    {
+        volatile u32 t;
+        for (t = 0; t < 1000000; t++)
+            __asm__ __volatile__("pause");
+    }
+
+    for (i = 1; i < cpu_count; i++) {
+        cpus[i].online = 0;
+        cpus[i].current = 0;
+    }
+    smp_sched_enabled = 0;
+    cpu_count = 1;
+
+    restoreflags(flags);
+    serial_puts("SMP_RESULT park_aps=ok\n");
 }

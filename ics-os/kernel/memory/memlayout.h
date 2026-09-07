@@ -23,11 +23,9 @@
  *  +------------------+ 0x01800000  MEM_KEXEC_STAGE
  *  | kexec staging    |          8MiB, not in mempop (kernel image < 4MiB)
  *  +------------------+ 0x02000000  MEM_KHEAP_BASE
- *  | kernel heap      |          sbrk/dlmalloc; identity; 48MiB cap
- *  +------------------+ 0x05000000
+ *  | kernel heap      |          sbrk/dlmalloc; identity; 64MiB cap
+ *  +------------------+ 0x06000000
  *  | mempop frames    |          anonymous 4KiB pages (PF, legacy PT)
- *  +------------------+ 0x06000000  MEM_USERPD_BASE
- *  | userpd pool      |          private user frames (bitmap allocator)
  *  +------------------+ 0x08000000  MEM_USER_WIN_BASE
  *  | linux_userspace  |
  *  | sharedmem        |
@@ -83,16 +81,16 @@
 #define MEM_KEXEC_STAGE_END    (MEM_KEXEC_STAGE + MEM_KEXEC_STAGE_SIZE)
 
 #define MEM_KHEAP_BASE         0x02000000UL
-#define MEM_KHEAP_SIZE         0x03000000UL   /* 48MiB: absorbs retired kmode slot */
+#define MEM_KHEAP_SIZE         0x04000000UL   /* 64MiB: absorbs retired kmode slot */
 #define MEM_KHEAP_END          (MEM_KHEAP_BASE + MEM_KHEAP_SIZE)
 
 /* Former 16MiB kmode slot is now part of the kernel heap.  MEM_KMODE_*
    marks the anonymous mempop-frame gap that follows the heap; it is NOT a
    reserved range, so mempop() still seeds pages from it. */
-#define MEM_KMODE_BASE         0x05000000UL
-#define MEM_KMODE_END          0x06000000UL
+#define MEM_KMODE_BASE         0x06000000UL
+#define MEM_KMODE_END          0x08000000UL
 
-#define MEM_USERPD_BASE        0x06000000UL
+#define MEM_USERPD_BASE        0x08000000UL
 #define MEM_USERPD_END         0x08000000UL
 
 #define MEM_SHARED_BASE        0x08000000UL

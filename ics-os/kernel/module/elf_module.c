@@ -731,19 +731,214 @@ int elf_loadmodule(char *module_name,char *elf_image,
         
 
      if (mode == ELF_USERO || mode == ELF_SYSO || elfheader->e_type == ET_EXEC)
+         {
+          DWORD flags;
+          dex32_stopints(&flags);
+ #ifdef DEBUG_USER_PROCESS
+          printf("executing entrypoint at (0x%x)..\n", (DWORD) entrypoint);
+ #endif
+          ret = createprocess(entrypoint,module_name,pagedir,memptr,stackloc,
+                                  1000,SYSCALL_STACK,0,p,workdir,parent);
+          dex32_freeuserpagetable(pagedir1);
+          dex32_restoreints(flags);
+         };    
+         
+         return ret;
+     };
+   return 0;
+ ;};
+
+/*
+  Stream an ELF64 executable directly from VFS into the child's private PML4.
+  This avoids allocating the whole image (e.g. an 18 MiB cc1.exe) in the kernel
+  heap.  It returns a process id on success, or 0 if the file is not an
+  ELF64 executable or the stream load fails.
+*/
+int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
+                      PCB386 *parent)
+{
+  file_PCB *f;
+  vfs_stat st;
+  unsigned long long fsize, need, phend;
+  char hdr[8192];
+  Elf64_Ehdr *eh64;
+  Elf64_Phdr *ph64;
+  void (*entrypoint)(int, char **) = 0;
+  u64 *upml4;
+  DWORD *pagedir;
+  process_mem *memptr = 0;
+  DWORD *stackloc = 0;
+  DWORD pages = 0;
+  int phi, segi, mapok = 1;
+  unsigned long long v, fsz, msz, off, va, x, dstoff, len, avail;
+  unsigned long long fileoff;
+  char pagebuf[4096];
+  unsigned long pgdone = 0;
+  int ret = 0;
+
+  f = openfilex(module_name, FILE_READ);
+  if (!f) {
+     printf("elf64-stream: open fail %s\n", module_name);
+     return 0;
+  }
+  fstat(f, &st);
+  fsize = (unsigned long long)st.st_size;
+  if (fsize < 64) {
+     printf("elf64-stream: tiny %s size=%llu\n", module_name, fsize);
+     fclose(f);
+     return 0;
+  }
+  need = fsize < sizeof(hdr) ? fsize : sizeof(hdr);
+  if (fread(hdr, (int)need, 1, f) != (int)need) {
+     printf("elf64-stream: hdr read fail %s need=%llu\n", module_name, need);
+     fclose(f);
+     return 0;
+  }
+  eh64 = (Elf64_Ehdr *)hdr;
+  if (eh64->e_ident[0] != ELFMAG0 || eh64->e_ident[1] != ELFMAG1 ||
+      eh64->e_ident[2] != ELFMAG2 || eh64->e_ident[3] != ELFMAG3 ||
+      eh64->e_ident[4] != ELFCLASS64 || eh64->e_machine != EM_X86_64) {
+     printf("elf64-stream: not elf64 %s id4=%d mach=%d\n",
+            module_name, eh64->e_ident[4], (int)eh64->e_machine);
+     fclose(f);
+     return 0;
+  }
+  phend = eh64->e_phoff +
+          (unsigned long long)eh64->e_phnum * (unsigned long long)eh64->e_phentsize;
+  if (phend > need || eh64->e_phnum == 0) {
+     printf("elf64-stream: phdr overflow %s phend=%llu need=%llu phnum=%d\n",
+            module_name, phend, need, (int)eh64->e_phnum);
+     fclose(f);
+     return 0;
+  }
+  ph64 = (Elf64_Phdr *)(hdr + eh64->e_phoff);
+  entrypoint = (void (*)(int, char **))(uintptr)eh64->e_entry;
+
+  for (phi = 0; phi < (int)eh64->e_phnum; phi++) {
+     if (ph64[phi].p_type == PT_LOAD && ph64[phi].p_memsz > 0) {
+        v = ph64[phi].p_vaddr;
+        if (v + ph64[phi].p_memsz > (unsigned long long)MEM_USER_ELF_END) {
+           printf("elf64-stream: PT_LOAD overflow %s\n", module_name);
+           fclose(f);
+           return 0;
+        }
+     }
+  }
+
+  if (!(mode == ELF_USERO || mode == ELF_SYSO || eh64->e_type == ET_EXEC)) {
+     printf("elf64-stream: mode/type %s mode=%d type=%d\n",
+            module_name, mode, (int)eh64->e_type);
+     fclose(f);
+     return 0;
+  }
+
+  upml4 = userpd_create();
+  if (!upml4) {
+     printf("elf64-stream: no userpd %s\n", module_name);
+     fclose(f);
+     return 0;
+  }
+  pagedir = (DWORD *)(uintptr)upml4;
+
+  for (segi = 0; mapok && segi < (int)eh64->e_phnum; segi++) {
+     if (ph64[segi].p_type == PT_LOAD && ph64[segi].p_memsz > 0) {
+        v = ph64[segi].p_vaddr;
+        msz = ph64[segi].p_memsz;
         {
-         DWORD flags;
-         dex32_stopints(&flags);
-#ifdef DEBUG_USER_PROCESS
-         printf("executing entrypoint at (0x%x)..\n", (DWORD) entrypoint);
-#endif
-         ret = createprocess(entrypoint,module_name,pagedir,memptr,stackloc,
-                                 1000,SYSCALL_STACK,0,p,workdir,parent);
-         dex32_freeuserpagetable(pagedir1);
-         dex32_restoreints(flags);
-        };    
-        
-        return ret;
-    };
-  return 0;
-;};
+           unsigned long long lo = v & ~0xFFFULL;
+           unsigned long long sz = (v - lo) + msz;
+           unsigned long map_flags = PG_USER;
+           if (ph64[segi].p_flags & 2)
+              map_flags |= PG_WR;
+           mapok = userpd_map_region(upml4, lo, sz, map_flags);
+        }
+     }
+  }
+  if (mapok)
+     mapok = userpd_map_region(upml4, (unsigned long long)(uintptr)syscallstack,
+                    USER_SYSCALL_STACK, (unsigned long)PG_WR);
+  if (mapok)
+     mapok = userpd_map_region(upml4, (unsigned long long)(uintptr)userheap,
+                    ELF_HEAP_COMMIT,
+                    (unsigned long)(PG_WR | PG_USER));
+  if (mapok)
+     mapok = userpd_map_region(upml4,
+                    (unsigned long long)(uintptr)(userstackloc - ELF_STACK_COMMIT),
+                    ELF_STACK_COMMIT,
+                    (unsigned long)(PG_WR | PG_USER));
+  if (!mapok) {
+      printf("elf64-stream: map fail %s\n", module_name);
+      userpd_free(upml4);
+      fclose(f);
+      return 0;
+   }
+
+   stackloc = (DWORD *)dex32_commitblock((DWORD)(uintptr)userstackloc - ELF_STACK_COMMIT,
+                      ELF_STACK_COMMIT, &pages, pagedir, PG_WR | PG_USER);
+   addmemusage(&memptr, stackloc, pages);
+   stackloc = (DWORD *)((uintptr)userstackloc - 8);
+   dex32_commitblock((DWORD)(uintptr)userheap, ELF_HEAP_COMMIT, &pages,
+                      pagedir, PG_WR | PG_USER);
+   addmemusage(&memptr, userheap, pages);
+
+   for (phi = 0; mapok && phi < (int)eh64->e_phnum; phi++) {
+      if (ph64[phi].p_type == PT_LOAD && ph64[phi].p_memsz > 0) {
+         v = ph64[phi].p_vaddr;
+         fsz = ph64[phi].p_filesz;
+         msz = ph64[phi].p_memsz;
+         off = ph64[phi].p_offset;
+         for (va = v & ~0xFFFULL; va < v + msz; va += 0x1000) {
+            u64 *fr = userpd_map_page((u64 *)(uintptr)pagedir, va,
+                                      (unsigned long)(PG_WR | PG_USER));
+            if (!fr) {
+               printf("elf64-stream: map page fail %s va=0x%llx\n",
+                      module_name, va);
+               mapok = 0;
+               break;
+            }
+            x = (va > v) ? va : v;
+            if (x >= v + fsz)
+               continue;
+            dstoff = x & 0xFFF;
+            len = 0x1000 - dstoff;
+            avail = (v + fsz) - x;
+            if (len > avail)
+               len = avail;
+            fileoff = off + (x - v);
+            if (fseek(f, (long)fileoff, SEEK_SET) != 0) {
+               printf("elf64-stream: fseek fail %s off=%llu\n",
+                      module_name, fileoff);
+               mapok = 0;
+               break;
+            }
+            if (fread(pagebuf, (int)len, 1, f) != (int)len) {
+               printf("elf64-stream: fread fail %s off=%llu len=%llu\n",
+                      module_name, fileoff, len);
+               mapok = 0;
+               break;
+            }
+            memcpy((char *)KDIRECT((u64)(uintptr)fr) + dstoff, pagebuf,
+                   (unsigned long)len);
+            if ((++pgdone & 0x7FUL) == 0)
+               taskswitch();
+         }
+      }
+   }
+   if (!mapok) {
+      printf("elf64-stream: copy fail %s\n", module_name);
+      userpd_free(upml4);
+      fclose(f);
+      return 0;
+   }
+
+   printf("elf64-stream: loaded %s entry=0x%X free=%llu/%llu\n",
+          module_name, (DWORD)(uintptr)entrypoint,
+          (unsigned long long)frame_free_count(),
+          (unsigned long long)frame_total_count());
+   ret = createprocess(entrypoint, module_name, pagedir, memptr, stackloc,
+                       ELF_STACK_COMMIT, USER_SYSCALL_STACK, 0, p, workdir, parent);
+   if (!ret)
+      printf("elf64-stream: createprocess fail %s\n", module_name);
+   fclose(f);
+   return ret;
+}

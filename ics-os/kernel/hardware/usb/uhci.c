@@ -926,23 +926,16 @@ static void usb_register_gpt(int deviceid, u64 total_blocks)
     partdev_format_guid(gpt.disk_guid, guidbuf, sizeof(guidbuf));
     printf("GPT_DETECT usb0 entries=%d diskguid=%s%s\n",
            gpt.entry_count, guidbuf, gpt.used_backup ? " (backup)" : "");
-    for (i = 0; i < gpt.entry_count; i++) {
+   for (i = 0; i < gpt.entry_count; i++) {
         char name[20];
         const gpt_entry *e = &gpt.entries[i];
         sprintf(name, "usb0p%d", e->index);
-       if (partdev_register(deviceid,
-                              name,
-                              e->type_name,
-                              (int)usb_drive.block_size,
-                              e->first_lba,
-                              e->last_lba + 1,
-                              usb_part_raw_read,
-                              usb_part_raw_write,
-                              0,
-                              e->type_name,
-                              e->index,
-                              (u64)e->attributes,
-                              e->name) < 0) {
+        if (partdev_register(deviceid, name, e->type_name,
+                             (int)usb_drive.block_size,
+                             e->first_lba, e->last_lba + 1,
+                             usb_part_raw_read, usb_part_raw_write, 0,
+                             e->type_name, e->index,
+                             (u64)e->attributes, e->name) < 0) {
             printf("GPT_WARN usb0 partition %d not registered (cap reached)\n",
                    e->index);
             continue;

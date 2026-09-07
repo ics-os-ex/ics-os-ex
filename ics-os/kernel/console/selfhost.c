@@ -504,6 +504,27 @@ static int kbuild_run(const char *cc)
      return missing;
   }
 
+  /* In-OS build phase timing. time_count is whole seconds since boot
+      (200 Hz LAPIC tick folded by aux_time2). gkb_tinit() anchors a build;
+      gkb_mark() reports the phase delta and the cumulative build time so the
+      serial log yields a per-phase compile-time profile for self-host runs. */
+   static DWORD gkb_start, gkb_prev, gkb_active;
+   static void gkb_tinit(void)
+   {
+      gkb_start = gkb_prev = time_count;
+      gkb_active = 1;
+   }
+   static void gkb_mark(const char *phase)
+   {
+      DWORD now;
+      if (!gkb_active)
+         return;
+      now = time_count;
+      printf("GKBUILD_TIME %-26s phase=%3u s  cum=%4u s\n",
+             phase, (unsigned)(now - gkb_prev), (unsigned)(now - gkb_start));
+      gkb_prev = now;
+   }
+
    static int gkbuild_run_with(const char *cc, const char *ccprefix,
                                              const char *provenance)
   {
@@ -721,6 +742,8 @@ static int gmake_kbuild_run(const char *make, const char *root, const char *cc,
    extern volatile int selfhost_cooperative_ready;
 
    selfhost_cooperative_ready = 1;
+   if (!gkb_active)
+      gkb_tinit();
 
    printf("gmake-kbuild: extracting kernel sources to %s\n", root);
    mkdir(root);
@@ -735,6 +758,7 @@ static int gmake_kbuild_run(const char *make, const char *root, const char *cc,
       return 0;
    }
    free(tar);
+   gkb_mark("kbuild-extract");
 
    sprintf(cmd,
           "%s -C %s -f Makefile bzImage INOS=1 "
@@ -747,6 +771,7 @@ static int gmake_kbuild_run(const char *make, const char *root, const char *cc,
       printf("GKBUILD_TEST_FAIL make spawn\n");
       return 0;
    }
+   gkb_mark("kbuild-make(bzImage)");
 
    sprintf(out, "%s/Kernel64.bin", root);
    elf = (char *)vfs_mapfile(out, &elfsz);
@@ -756,15 +781,22 @@ static int gmake_kbuild_run(const char *make, const char *root, const char *cc,
       if (elf) free(elf);
       return 0;
    }
-   free(elf);
-   printf("GKBUILD_LINK_OK\n");
-   printf("GKBUILD_TEST_PASS\n");
-   printf("gmake-kbuild: kexec %s\n", out);
-   if (kexec_load(out) != 0) {
-      printf("GKBUILD_TEST_FAIL kexec_load\n");
-      return 0;
-   }
-   kexec_reboot();
+ free(elf);
+    printf("GKBUILD_LINK_OK\n");
+    printf("GKBUILD_TEST_PASS\n");
+    printf("gmake-kbuild: kexec %s\n", out);
+    /* The kexec trampoline overwrites the running image in place and does not
+       reset secondary cores. Park any online APs (INIT pulse -> reset state)
+       so none executes clobbered old-kernel code during the handoff. */
+    {
+       extern void smp_park_aps(void);
+       smp_park_aps();
+    }
+    if (kexec_load(out) != 0) {
+       printf("GKBUILD_TEST_FAIL kexec_load\n");
+       return 0;
+    }
+    kexec_reboot();
    return 1;
 }
 
@@ -814,14 +846,29 @@ static int gccselfhost_run(void)
    file_PCB *f;
    extern volatile int selfhost_cooperative_ready;
    selfhost_cooperative_ready = 1;
+   gkb_tinit();
    printf("gccself: rebuilding GCC with GNU Make inside ICS-OS\n");
    printf("GCC_SELF_BEGIN\n");
    printf("GCC_SELF_ORCHESTRATOR GNU_MAKE_3_82\n");
-   if (!user_execp("/icsos/apps/make.exe", 0,
-                   "/icsos/apps/make.exe -f /icsos/gccsrc/Selfhost.mk all")) {
-      printf("GCC_SELF_CERT_FAIL make bootstrap\n");
-      return 0;
-   }
+  /* Parallel self-host: fan the 349 cc1 objects out across the online CPUs.
+       Serial stage-1 keeps -j1 (only the BSP runs user tools there). */
+    {
+       extern volatile int user_procs_smp;
+       extern int cpu_count;
+       int jobs = user_procs_smp ? cpu_count : 1;
+       char gcmd[192];
+       if (jobs < 1) jobs = 1;
+       if (jobs > 8) jobs = 8;
+       sprintf(gcmd,
+                "/icsos/apps/make.exe -f /icsos/gccsrc/Selfhost.mk -j%d all",
+                jobs);
+       printf("GCC_SELF_JOBS %d\n", jobs);
+       if (!user_execp("/icsos/apps/make.exe", 0, gcmd)) {
+          printf("GCC_SELF_CERT_FAIL make bootstrap\n");
+          return 0;
+       }
+    }
+   gkb_mark("gcc-rebuild(Selfhost.mk all)");
    f = openfilex("/work/gcc.exe", FILE_READ);
    if (!f) {
       printf("GCC_SELF_CERT_FAIL no rebuilt gcc\n");
@@ -847,6 +894,7 @@ static int gccselfhost_run(void)
    printf("GCC_SELF_CERT_COMPILER_OK\n");
    if (!gmake_self_rebuild())
       return 0;
+   gkb_mark("make-rebuild");
    return gmake_kbuild_run("/work/make.exe", "/work/kernel", "/work/gcc.exe",
                            "/work/ld.exe", "-B/work", "in-os-rebuilt");
 }

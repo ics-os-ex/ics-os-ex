@@ -74,7 +74,7 @@ typedef struct __attribute__((packed)) _partition_table {
 typedef struct __attribute__((packed)) _partition_mbr {
     char program[446];
     partition_table tables[4];
-    char magic_value[2];
+    BYTE magic_value[2];
 } partition_mbr;
 
 
@@ -213,7 +213,8 @@ int ide_readsectors(int interface,int dev,DWORD lba,DWORD sectors, char *buffer)
     int base;
     int i,ofs=0;
     int total_sectors = 0, block_ofs = 0;
- 
+    int r;
+
  if (interface == 0) base = 0x1f0;
                         else base = 0x170;
     pio_set_iobase_addr(base, base + 0x200 );    
@@ -230,9 +231,15 @@ int ide_readsectors(int interface,int dev,DWORD lba,DWORD sectors, char *buffer)
             sectors = 0;
         };
     
-        reg_pio_data_in_lba(dev, CMD_READ_SECTORS, 0, total_sectors,
+        r = reg_pio_data_in_lba(dev, CMD_READ_SECTORS, 0, total_sectors,
                 lba +block_ofs,SYS_DATA_SEL,buffer + ofs,total_sectors,0);
-        
+        if (r) {
+           printf("IDE read LBA %u failed: ec=%d st2=%02x as2=%02x\n",
+                  (unsigned)(lba+block_ofs), reg_cmd_info.ec,
+                  reg_cmd_info.st2, reg_cmd_info.as2);
+           return 0;
+        }
+
         ofs+=0xF0 * 512;
         block_ofs+=0xF0;
                 

@@ -31,7 +31,11 @@ extern void stopints(void);
 extern unsigned int ticks;
 
 #define VBLK_DESCS_PER_REQ 3
-#define VBLK_BOUNCE        4096
+/* Bounce buffer size per in-flight slot. Kept large enough (64 KiB) that a
+ * page-cache read-merge run (PC_MAX_IO) is served in at most a couple of
+ * virtio descriptors instead of dozens of 4 KiB round-trips. nslots <=
+ * VIRTIO_QUEUE_MAX/3 = 42, so the total bounce ring stays ~2.75 MiB. */
+#define VBLK_BOUNCE        65536
 #define VBLK_TIMEOUT_TICKS 500
 #define VBLK_EIO           (-5)
 #define VBLK_EINVAL        (-22)

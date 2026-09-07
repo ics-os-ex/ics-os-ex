@@ -385,12 +385,14 @@ void fg_set_state(int state){
 #define KEY_UP    151
 #define KEY_DOWN  152
 
+extern volatile int selfhost_cooperative_ready;
+
 //
 void fg_updateinfo(){
-   int refreshrate=100; //determines how long in milliseconds until the task manager refreshes its display
-   int loop;
-   int choice = 0;
-   
+    int refreshrate=100; //determines how long in milliseconds until the task manager refreshes its display
+    int loop;
+    int choice = 0;
+    
    //Create a screen buffer that we can use   
    fg_out = Dex32CreateDDL();
  
@@ -440,8 +442,15 @@ void fg_updateinfo(){
                      fg_setforeground(choice);
             };      
         };
-      } else
-         cpu_idle();
-   };
+      } else {
+          /* In cooperative self-host mode a bare hlt never yields; if a
+             higher-priority user tool was just enqueued on this CPU it would
+             remain stuck behind the foreground kernel thread. */
+          if (selfhost_cooperative_ready)
+             taskswitch();
+          cpu_idle();
+       }
+    };
 };
+
 

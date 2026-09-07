@@ -245,6 +245,78 @@ void frame_release(u64 phys)
    restoreflags(flags);
 }
 
+/* Diagnostic: report the allocation state of a physical frame.  Used by the
+   CTXCANARY path to decide whether a corrupted user-stack frame is still
+   allocated (direct write to a live frame) or has been freed (freed-while-
+   mapped lifecycle bug). */
+void frame_diag_report(const char *tag, u64 phys)
+{
+   u64 idx;
+   char buf[160];
+
+   if (!frame_ready) {
+      serial_puts("FRDIAG !ready\n");
+      return;
+   }
+   if (phys == 0 || (phys & 0xFFFULL)) {
+      sprintf(buf, "FRDIAG %s phys=0x%llx UNMAP\n", tag,
+              (unsigned long long)phys);
+      serial_puts(buf);
+      return;
+   }
+   idx = phys >> 12;
+   if (idx >= sizeof(frame_refs)) {
+      sprintf(buf, "FRDIAG %s phys=0x%llx OOB idx=%llu\n", tag,
+              (unsigned long long)phys, (unsigned long long)idx);
+      serial_puts(buf);
+      return;
+   }
+   {
+      int alloc = (frame_allocmap[idx >> 3] & (1u << (idx & 7))) ? 1 : 0;
+      int inhead = (frame_head == phys) ? 1 : 0;
+      sprintf(buf,
+              "FRDIAG %s phys=0x%llx idx=%llu refs=%u alloc=%d ishead=%d free=%llu total=%llu\n",
+              tag, (unsigned long long)phys, (unsigned long long)idx,
+              (unsigned)frame_refs[idx], alloc, inhead,
+              (unsigned long long)frame_free,
+              (unsigned long long)frame_total);
+      serial_puts(buf);
+   }
+}
+
+/* Cheap, lock-free ring of recently freed PML4s for post-mortem correlation.
+   userpd_free() runs in several lock contexts (kill_process holds
+   processmgr_busy; frame releases run IRQ-off), so we must NOT do serial
+   I/O there.  Record the page-aligned PML4 and let a safe context (the
+   CTXCANARY handler) inspect the ring later. */
+#define FREED_PML4_RING_N 128u
+static u64 freed_pml4_ring[FREED_PML4_RING_N];
+static volatile unsigned long freed_pml4_head;
+
+static void freed_pml4_record(u64 pml4)
+{
+    unsigned long idx = __sync_fetch_and_add(&freed_pml4_head, 1);
+    freed_pml4_ring[idx & (FREED_PML4_RING_N - 1u)] = pml4;
+}
+
+unsigned long freed_pml4_count(void)
+{
+    unsigned long n = freed_pml4_head;
+    return (n < FREED_PML4_RING_N) ? n : FREED_PML4_RING_N;
+}
+
+int freed_pml4_contains(u64 pml4)
+{
+    unsigned long n = freed_pml4_head;
+    unsigned long lim = (n < FREED_PML4_RING_N) ? n : FREED_PML4_RING_N;
+    unsigned long i;
+    u64 want = pml4 & 0x000FFFFFFFFF000ULL;
+    for (i = 0; i < lim; i++)
+        if (freed_pml4_ring[i] == want)
+            return 1;
+    return 0;
+}
+
 u64 frame_free_count(void) { return frame_free; }
 u64 frame_total_count(void) { return frame_total; }
 
@@ -1021,36 +1093,53 @@ void *commitb(DWORD virtualaddr,int amt,DWORD *pagecount)
      return ret;
    };
 
+extern int smp_cpu_id(void);
+volatile unsigned int sbrk_diag_calls[8];
+volatile long sbrk_diag_last_amt[8];
+volatile long sbrk_diag_last_ret[8];
+volatile unsigned long sbrk_diag_knext[8];
+static void sbrk_diag(long amt, unsigned long ret, unsigned long kn, int fail)
+    {
+     int me = smp_cpu_id();
+     if (me < 0 || me >= 8) return;
+     sbrk_diag_calls[me]++;
+     sbrk_diag_last_amt[me] = amt;
+     sbrk_diag_last_ret[me] = fail ? -1 : (long)ret;
+     sbrk_diag_knext[me] = kn;
+    };
+
 void *sbrk(int amt)
-   {
-     int pages=(amt/4096)+1;
-     char *ret=0;
-     
-     if (amt<0) return (void*)-1;
-     
-     if (amt==0) return knext-1;
-     
-     if (amt%4096==0) pages=amt/4096;
+    {
+      int pages=(amt/4096)+1;
+      char *ret=0;
+
+      if (amt<0) { sbrk_diag(amt, -1, (unsigned long)(uintptr)knext, 1); return (void*)-1; }
+
+      if (amt==0) { sbrk_diag(0, (unsigned long)(uintptr)(knext-1), (unsigned long)(uintptr)knext, 0); return knext-1; }
+
+      if (amt%4096==0) pages=amt/4096;
 
 #ifdef __x86_64__
-     /* Identity map already covers the kernel heap.  Do not mempop() —
-        that drained unrelated frames and let knext walk into the old
-        4MiB hole. */
-     {
-        unsigned long next = (unsigned long)(uintptr)knext +
-                             (unsigned long)pages * 4096UL;
-        if (next > MEM_KHEAP_END)
-           return (void*)-1;
-        ret = knext;
-        knext = (char *)next;
-        return (void*)ret;
-     }
+      /* Identity map already covers the kernel heap.  Do not mempop() —
+         that drained unrelated frames and let knext walk into the old
+         4MiB hole. */
+      {
+         unsigned long next = (unsigned long)(uintptr)knext +
+                              (unsigned long)pages * 4096UL;
+         if (next > MEM_KHEAP_END)
+            { sbrk_diag(amt, -1, (unsigned long)(uintptr)knext, 1); return (void*)-1; }
+         ret = knext;
+         knext = (char *)next;
+         sbrk_diag(amt, (unsigned long)(uintptr)ret, (unsigned long)(uintptr)knext, 0);
+         return (void*)ret;
+      }
 #else
-     ret=commit((DWORD)knext,pages);
-     knext+=(pages)*4096;
-     return (void*)ret;
+      ret=commit((DWORD)knext,pages);
+      knext+=(pages)*4096;
+      sbrk_diag(amt, (unsigned long)(uintptr)ret, (unsigned long)(uintptr)knext, 0);
+      return (void*)ret;
 #endif
-   };
+    };
 
 
 
@@ -1059,15 +1148,22 @@ void *sbrk(int amt)
 void *dex32_sbrk(unsigned int amt)
    {
      DWORD pages=(amt/4096)+1;
-     DWORD flags;
-     char *ret=current_process->knext;
-     dex32_stopints(&flags);
-     if (amt==0)
-        {
-        dex32_restoreints(flags);
-        return ((void*)current_process->knext);
-        };
+      DWORD flags;
+      char *ret=current_process->knext;
+      DWORD span_pages=pages;
+      dex32_stopints(&flags);
+      if (amt==0)
+         {
+         dex32_restoreints(flags);
+         return ((void*)current_process->knext);
+         };
   if (amt%4096==0) pages=amt/4096;
+      /* knext starts at userheap+16 (the 16-byte parameter block) and is not
+         page-aligned, so [ret, ret+pages*4096) can span one extra page.
+         Commit every page the range touches; otherwise the page holding the
+         new break is left uncommitted and the first write to it faults as a
+         committed-heap not-present (cc1 self-host regression). */
+      span_pages = pages + ((((unsigned long)(uintptr)ret) & 0xFFFUL) != 0);
 
    /* Phase 1: user private VA space is limited to the private PD0 (0-1GiB).
        Growing the heap beyond MEM_USER_VA_END would require splitting the
@@ -1078,20 +1174,20 @@ void *dex32_sbrk(unsigned int amt)
        unsigned long long mmap_lim = current_process->mmap_brk
           ? (unsigned long long)(uintptr)current_process->mmap_brk
           : (unsigned long long)MEM_USER_HEAP_LIMIT;
-       if ((unsigned long long)ret + (unsigned long long)pages * 4096ULL > mmap_lim)
-       {
-       printf("sbrk DENIED %s: ret=0x%llx pages=%u limit=0x%llx\n",
-              current_process->name, (unsigned long long)ret, pages,
-              mmap_lim);
+       if (((unsigned long long)ret & ~0xFFFULL) + (unsigned long long)span_pages * 4096ULL > mmap_lim)
+        {
+        printf("sbrk DENIED %s: ret=0x%llx pages=%u span=%u limit=0x%llx\n",
+               current_process->name, (unsigned long long)ret, pages, span_pages,
+               mmap_lim);
        dex32_restoreints(flags);
        return (void*)-1;
        };
     }
 
    /* Commit pages into the process page directory so malloc/sbrk
-       used by the in-OS compiler can grow beyond the initial heap. */
-    if (!dex32_commit((DWORD)ret, pages,
-                        (DWORD*)current_process->pagedirloc, PG_USER | PG_WR))
+        used by the in-OS compiler can grow beyond the initial heap. */
+     if (!dex32_commit((DWORD)ret, span_pages,
+                         (DWORD*)current_process->pagedirloc, PG_USER | PG_WR))
          {
          unsigned long heapbytes =
             (unsigned long)(uintptr)current_process->knext -
@@ -1124,21 +1220,21 @@ void *dex32_sbrk(unsigned int amt)
         would hit the shared identity physical page instead of the
         private frame. Drop the 2MiB TLB via invlpg on each new page. */
      {
-        DWORD pi;
-        for (pi = 0; pi < pages; pi++) {
-           unsigned long va = (unsigned long)(uintptr)ret + (unsigned long)pi * 0x1000UL;
-           __asm__ __volatile__("invlpg (%0)" :: "r"(va) : "memory");
-        }
-     }
+         DWORD pi;
+         for (pi = 0; pi < span_pages; pi++) {
+            unsigned long va = (unsigned long)(uintptr)ret + (unsigned long)pi * 0x1000UL;
+            __asm__ __volatile__("invlpg (%0)" :: "r"(va) : "memory");
+         }
+      }
 #else
      /* Zero the newly committed user memory before handing it out. */
      memset(ret, 0, (size_t)(pages * 4096));
 #endif
 
-     current_process->knext+=pages*4096;
-     dex32_restoreints(flags);
-     return (void*)ret;
-   };
+      current_process->knext+=pages*4096;
+      dex32_restoreints(flags);
+      return (void*)ret;
+    };
 
 /* Anonymous mmap: grow down from mmap_brk so GGC pages are not in the
    sbrk/malloc arena.  File-backed maps stay in the SDK. */
@@ -1884,31 +1980,80 @@ u64 *userpd_map_page(u64 *pml4, unsigned long long vaddr, unsigned long attb)
     }
     pte = (u64 *)KDIRECT(pd[bi] & 0x000FFFFFFFFF000ULL);
 
-    {
-       u64 e = pte[gi];
-       if (e & 1) return (u64 *)(e & 0x000FFFFFFFFF000ULL); /* already mapped */
-        fr = upop();
-         if (!fr) {
-            static int up_page_empty_log = 0;
-            if (up_page_empty_log < 8) {
-               up_page_empty_log++;
-               printf("userpd: POOL EMPTY (4KiB page) va=0x%llx free=%llu/%llu\n",
-                      vaddr,
-                      (unsigned long long)frame_free_count(),
-                      (unsigned long long)frame_total_count());
-            }
-            return 0;   /* pool empty (4KiB page) */
-         }
-         memset(KDIRECT((u64)(uintptr)fr), 0, 0x1000);
-        /* A mapped leaf page MUST be present: force PG_PRESENT. Callers pass
-          only the additional attributes (PG_WR|PG_USER|...), so OR in the
-          Present bit here or the page would be invisible to the CPU. */
-       pte[gi] = (u64)(uintptr)fr | (attb | PG_PRESENT);
-       return fr;
-    }
- }
+   {
+         u64 e = pte[gi];
+         if (e & 1)
+             return (u64 *)(e & 0x000FFFFFFFFF000ULL); /* already mapped */
+          fr = upop();
+          if (!fr) {
+             static int up_page_empty_log = 0;
+             if (up_page_empty_log < 8) {
+                up_page_empty_log++;
+                printf("userpd: POOL EMPTY (4KiB page) va=0x%llx free=%llu/%llu\n",
+                       vaddr,
+                       (unsigned long long)frame_free_count(),
+                       (unsigned long long)frame_total_count());
+             }
+             return 0;   /* pool empty (4KiB page) */
+          }
+          memset(KDIRECT((u64)(uintptr)fr), 0, 0x1000);
+         /* A mapped leaf page MUST be present: force PG_PRESENT. Callers pass
+           only the additional attributes (PG_WR|PG_USER|...), so OR in the
+           Present bit here or the page would be invisible to the CPU. */
+        pte[gi] = (u64)(uintptr)fr | (attb | PG_PRESENT);
+          return fr;
+      }
+  }
 
-/* Unmap one private 4KiB leaf.  Returns 1 if the PTE was absent or released,
+/* Map one absent PD0 VA to its identity physical frame.  Used only for
+   kernel-code faults under a user PML4: userpd_create() zeroes most 2MiB
+   identity blocks in PD0, but kernel code running with the user CR3 may still
+   reference low identity addresses.  Mapping a fresh zero frame here would
+   silently corrupt the kernel, so restore the identity translation. */
+int userpd_map_identity_page(u64 *pml4, unsigned long long vaddr, unsigned long attb)
+  {
+     int pmi = (int)((vaddr >> 39) & 0x1FF);
+     int pi  = (int)((vaddr >> 30) & 0x1FF);
+     int bi  = (int)((vaddr >> 21) & 0x1FF);
+     int gi  = (int)((vaddr >> 12) & 0x1FF);
+     u64 pe, de, be;
+     u64 *pdpt, *pd, *pte, *pml4v;
+
+     if (!pml4 || vaddr >= 0x40000000ULL || pmi != 0 || pi != 0)
+        return 0;
+     if (memamount && vaddr >= (unsigned long long)memamount)
+        return 0;
+
+     pml4v = (u64 *)KDIRECT((u64)(uintptr)pml4 & 0x000FFFFFFFFF000ULL);
+     pe = pml4v[pmi];
+     if (!(pe & 1) || (pe & 0x80)) return 0;
+     pdpt = (u64 *)KDIRECT(pe & 0x000FFFFFFFFF000ULL);
+
+     de = pdpt[pi];
+     if (!(de & 1) || (de & 0x80)) return 0;
+     pd = (u64 *)KDIRECT(de & 0x000FFFFFFFFF000ULL);
+
+     be = pd[bi];
+     if (!(be & 1) || (be & 0x80)) {
+        u64 *t = upop();
+        if (!t)
+           return 0;
+        memset(KDIRECT((u64)(uintptr)t), 0, 0x1000);
+        pd[bi] = (u64)(uintptr)t | 0x03ULL;
+        {
+           unsigned long long block = vaddr & ~0x1FFFFFULL;
+           __asm__ __volatile__("invlpg (%0)" :: "r"((unsigned long)block) : "memory");
+        }
+     }
+     pte = (u64 *)KDIRECT(pd[bi] & 0x000FFFFFFFFF000ULL);
+     if (pte[gi] & 1)
+        return 1;
+     pte[gi] = (vaddr & 0x000FFFFFFFFF000ULL) | (attb | PG_PRESENT);
+     __asm__ __volatile__("invlpg (%0)" :: "r"((unsigned long)vaddr) : "memory");
+     return 1;
+  }
+
+ /* Unmap one private 4KiB leaf.  Returns 1 if the PTE was absent or released,
    0 if the walk failed (shared 2MiB page, bad PML4, VA out of PD0). */
 int userpd_unmap_page(u64 *pml4, unsigned long long vaddr)
  {
@@ -2361,7 +2506,10 @@ void userpd_free(u64 *pml4)
     if (!pml4)
        return;
 
-    pml4v = (u64 *)KDIRECT((u64)(uintptr)pml4 & 0x000FFFFFFFFF000ULL);
+   pml4v = (u64 *)KDIRECT((u64)(uintptr)pml4 & 0x000FFFFFFFFF000ULL);
+
+    /* Record for post-mortem correlation WITHOUT serial I/O (see ring note). */
+    freed_pml4_record((u64)(uintptr)pml4 & 0x000FFFFFFFFF000ULL);
 
     /* Never free tables that are still installed as CR3. */
     __asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));

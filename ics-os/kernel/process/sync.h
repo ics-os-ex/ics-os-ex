@@ -20,5 +20,8 @@ void sync_entercrit(sync_sharedvar *var);
 void sync_leavecrit(sync_sharedvar *var);
 unsigned long sync_entercrit_irqsave(sync_sharedvar *var);
 void sync_leavecrit_irqrestore(sync_sharedvar *var,unsigned long flags);
+void sync_release_process_crits(void *pcb, int owner);
+
+extern sync_sharedvar elf_map_crit;
 
 #endif

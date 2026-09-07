@@ -4,6 +4,7 @@
 extern int printf(const char *fmt, ...);
 
 volatile u32 *lapic_mmio = 0;
+volatile u64 lapic_expected_base = 0;
 
 static u64 rdmsr(u32 msr) {
     u32 lo, hi;
@@ -47,6 +48,7 @@ void lapic_init(void) {
     }
 
     lapic_mmio = (volatile u32 *)(uintptr)base;
+    lapic_expected_base = base;
 
     /* Spurious interrupt vector + enable */
     lapic_write(LAPIC_SVR, LAPIC_SVR_ENABLE | 0xFF);

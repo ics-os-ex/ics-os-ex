@@ -204,13 +204,14 @@ the remote shootdown path is infrastructure for later process migration.
 
 **virtio-blk** (`hardware/virtio/virtio_blk.c`) is the VM production path:
 modern virtio-pci caps, one request queue with a 3-descriptor slot pool,
-MSI-X vector **0x42**, 512-byte LBAs, registered as block device `vblk` and
+one dynamically allocated MSI-X device vector, 512-byte LBAs, registered as block device `vblk` and
 as `/dev/vblk`. Completions harvest the used ring in the IRQ (hlt wait, not
 pause-spin). ATA PIO remains the bare-metal fallback. PCI MMIO BARs are mapped
 through `mmio_map()`: low 4 GiB BARs use the identity-map UC path, while BARs
 above 4 GiB use the bounded `KMMIO_BASE` kernel window with PCD|PWT and SMP
 TLB shootdown.
-`make test-virtio` greps `VIRTIO_BLK_OK` and `VIRTIO_IRQ_OK`.
+`make test-virtio` greps the allocated-vector marker, `VIRTIO_BLK_OK`, and
+`VIRTIO_IRQ_OK`.
 If sector 0 looks like FAT, the kernel mounts `vblk` at `/work` and prints
 `work: mounted` (skipped on a zeroed disk).
 

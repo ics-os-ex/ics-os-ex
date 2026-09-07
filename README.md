@@ -60,6 +60,23 @@ $ make test-exec          # host-built hello.exe (ELF64 CRT)
 $ make test-kbuild        # in-OS GCC builds ICS-OS and kexecs the result
 $ make test-usb-storage   # QEMU UHCI USB root + durable FAT write/readback
 $ make test-usb-storage-xhci # QEMU q35 xHCI USB root + durable readback
+$ make test-usb-storage-xhci-msix # MSI-X delivery + IRQ-assisted waits
+$ make test-usb-storage-xhci-msix-recovery # IRQ release/reclaim across reset
+$ make test-usb-storage-xhci-vector-reservation # reserved-vector exclusion
+$ make test-usb-storage-xhci-poll # forced polling fallback + durable readback
+$ make test-usb-storage-xhci-high-bar # xHCI BAR above 4 GiB
+$ make test-usb-storage-xhci-recovery # timeout/reset/re-enumeration recovery
+$ make test-usb-storage-xhci-stall-recovery # BOT/endpoint stall recovery
+$ make test-usb-storage-xhci-disconnect # QMP unplug during active I/O
+$ make test-usb-storage-xhci-mounted-disconnect # cache invalidation + device quarantine
+$ make test-usb-storage-xhci-mounted-reconnect # replacement generation isolation
+$ make test-usb-storage-xhci-mounted-remount # controlled non-root namespace recovery
+$ make test-usb-storage-xhci-hotplug # two automatic remove/add cycles
+$ make test-usb-storage-xhci-hotplug-identity-mismatch # reject and latch changed media
+$ make test-usb-storage-xhci-late-attach # first device attached after boot
+$ make test-usb-storage-xhci-reconnect # QMP remove/add + raw I/O recovery
+$ make test-usb-storage-xhci-reconnect-mismatch # reject changed geometry
+$ make test-usb-storage-xhci-reconnect-identity-mismatch # reject changed volume ID
 $ make test-usb-storage-xhci-no-device # clean xHCI no-device failure path
 $ make test-vbox-usb-image      # BIOS USB image + persistent FAT write/readback
 $ make test-vbox-usb-image-efi  # UEFI USB image + persistent FAT write/readback
@@ -90,7 +107,7 @@ $ sudo dd if=ics-os-usb.img of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 
 For Intel N150 hardware, capacity sizing, safe flashing, emulator evidence, and
-the xHCI blocker, see [Intel N150 USB boot and working-storage readiness](ics-os/docs/intel-n150-usb-readiness.md).
+the remaining xHCI blockers, see [Intel N150 USB boot and working-storage readiness](ics-os/docs/intel-n150-usb-readiness.md).
 
 For a firmware-bootable hybrid image that works like `dd` of a live USB (BIOS and UEFI):
 

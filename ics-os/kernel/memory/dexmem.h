@@ -198,6 +198,9 @@ extern unsigned frame_refcount(u64 phys);
 extern void frame_release(u64 phys);
 extern u64 frame_free_count(void);
 extern u64 frame_total_count(void);
+extern void frame_diag_report(const char *tag, u64 phys);
+extern unsigned long freed_pml4_count(void);
+extern int freed_pml4_contains(u64 pml4);
 #ifdef __x86_64__
 extern void gpf_probe_store(unsigned long va, unsigned long cr3, unsigned long rip);
 #endif
@@ -253,6 +256,7 @@ extern u64 *userpd_create(void);
 int userpd_map_region(u64 *pml4, unsigned long long base,
                       unsigned long long size, unsigned long attb);
 u64 *userpd_map_page(u64 *pml4, unsigned long long vaddr, unsigned long attb);
+int userpd_map_identity_page(u64 *pml4, unsigned long long vaddr, unsigned long attb);
 int userpd_unmap_page(u64 *pml4, unsigned long long vaddr);
 void *userpd_resolve(u64 *pml4, unsigned long long vaddr);
 u64 *userpd_clone_eager(const u64 *parent);

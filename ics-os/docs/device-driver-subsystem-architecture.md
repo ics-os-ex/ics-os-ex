@@ -14,6 +14,35 @@ These are migration foundations; topology objects, managed resources, IRQ
 synchronization, DMA mappings/IOMMU, driver binding, and hotplug remain target
 architecture rather than completed capability.
 
+The first DMA contract increments are now present: `hardware/dma.h` validates
+identity-mapped ranges against device masks, alignment, and overflow and records
+owned regions with checked subrange translation. Its identity-coherent allocator
+provides aligned, zeroed storage, retains the underlying heap allocation for
+release, validates the complete device-mask range, and unwinds rejected mappings.
+xHCI dynamically allocates command, event, and endpoint rings, contexts, ERST,
+DCBAA, and scratchpads through this contract. Its coherent ring path uses ordering
+barriers instead of whole-cache `wbinvd`. Bulk and control data stages use
+operation-scoped streaming mappings with explicit to-device/from-device direction,
+active-state checking, and one unmap on success, timeout, stall, or disconnect.
+Event completion uses MSI-X table entry 0 on a dynamically allocated device
+vector targeting the BSP when available;
+the hard IRQ acknowledges interrupter 0 and waiters consume the event ring in
+process context. Waits combine sparse `hlt` wakeups with polling so lost-device
+timeouts retain their bounded spin budget. Interrupt-disabled boot paths and
+setup failures use polling alone.
+The shared IRQ lifecycle registry rejects duplicate vector owners, blocks
+handler entry during release, counts active handlers, and releases a vector only
+after the driver masks its source and the active count drains. xHCI exercises
+release and reclaim across reset and hotplug; virtio-blk uses the same ownership
+and handler-entry contract. Both drivers use the device domain to compose and
+validate xAPIC MSI address/data messages instead of encoding LAPIC destinations
+directly.
+Streaming DMA now maps up to 32 scatter/gather segments transactionally, and
+xHCI submits bounded chained bulk TDs. Device-scoped bounce mappings provide
+non-identity streaming buffers with directional copies and DMA-mask enforcement.
+This does not yet provide translated IOVAs, segment merging, non-coherent
+architecture cache maintenance, or IOMMU isolation.
+
 ## 1. Purpose
 
 This document defines the target device-driver subsystem for ICS-OS. It covers
@@ -696,12 +725,21 @@ The generic IOMMU layer supports identity, translated, and blocked domains. Defa
 policy for DMA-capable hotplug or user-mode-driven devices is a private translated
 domain. Mapping permissions are least privilege and limited to active request buffers.
 
+The initial `hardware/iommu.h` control plane provides one-requester private
+domains, a bounded 64-entry mapping table, page-aligned first-fit IOVA allocation,
+exact owner/range unmap, detach-after-drain, blocked-domain denial, and a latched
+fault gate. `hardware/vtd.c` adds checksum- and bounds-validated ACPI RSDP, XSDT/
+RSDT, DMAR, DRHD, and device-scope discovery. It reports the available remapping
+hardware but deliberately leaves translation disabled. Root/context/page tables,
+queued or register invalidation, translation enable ordering, and fault records do
+not exist yet, so translated entries must not be programmed into a device.
+
 IOMMU fault handling records device, requester ID, IOVA, access, queue/request when
 known, and recovery state. Repeated or unsafe faults close the operation gate, block
 DMA, and escalate recovery. The architecture permits Intel VT-d/AMD IOMMU on x86 and
 SMMU on ARM64 behind one API.
 
-Until an IOMMU driver exists, the kernel must report reduced isolation and use
+Until the IOMMU backend can safely enable translation, the kernel must report reduced isolation and use
 carefully bounded bounce mappings for untrusted/user-mode drivers; direct unrestricted
 DMA is not described as contained.
 
@@ -834,12 +872,25 @@ Core concepts:
 - USB disconnect closes interface gates before URB cancellation and waits for all
   completions before freeing endpoints.
 
-UHCI and the first xHCI bring-up backend now share the legacy polling MSC/BOT
-layer. The xHCI path covers one directly attached mass-storage device in QEMU,
-including command/event/transfer rings and cache synchronization. It remains a
-transition implementation: replace polling/global state with HCD-owned objects,
-URBs, managed DMA, interrupts, hubs, hotplug, cancellation, and recovery before
-claiming a production USB stack.
+UHCI and the first xHCI bring-up backend share the legacy MSC/BOT layer. The xHCI
+path covers one directly attached mass-storage device in QEMU, including
+command/event/transfer rings, cache synchronization, MSI-X event notification,
+and polling fallback. It remains a transition implementation: replace global
+state access with explicit per-controller HCD parameters, URBs, hubs, and general
+cancellation before claiming a production USB stack. Controller registers,
+rings, DMA regions, device state, recovery state, and IRQ resources have an
+explicit `xhci_hcd` owner. PCI discovery creates up to eight stable HCD records,
+and MSI-X setup binds each active HCD to a dedicated assembly dispatch route
+before unmasking the vector. Teardown removes that route only after active
+handlers drain and the vector is released. The shared legacy USB frontend probes
+the discovered HCDs in order, fully stops failed candidates, and retains the HCD
+that enumerates its mass-storage device. It still owns only one active device and
+HCD at a time; concurrent per-controller USB device ownership is not implemented.
+The initial managed IRQ lifecycle does not yet
+provide shared IRQs, affinity migration, storm handling, firmware reservation
+discovery, x2APIC/remapped MSI, or general bus interrupt-specifier translation.
+It does provide a bounded software device domain with dynamic allocation,
+owner-checked reservations, and xAPIC MSI message composition.
 
 ### 17.2 Networking
 
@@ -1158,7 +1209,8 @@ open-handle, queued-work, and inflight-request cycles with no leaks or stale cal
 1. Introduce IRQ descriptors/domains, action references, affinity, detach, and
    `synchronize_irq()`.
 2. Add threaded IRQ and poll scheduling, storm detection, and per-vector metrics.
-3. Implement IOAPIC/LAPIC routing and centralized MSI/MSI-X vector allocation.
+3. Complete IOAPIC/LAPIC routing and extend centralized MSI/MSI-X allocation
+  with platform reservations and interrupt domains.
 4. Convert keyboard/mouse and one virtual device; then convert virtio-blk.
 
 Gate: shared IRQ, cross-CPU affinity/migration, handler removal while firing, storms,
@@ -1171,8 +1223,8 @@ threaded handling, and multi-vector tests pass without callbacks after detach.
 2. Add DMA debug ownership tracking and non-coherent cache-operation hooks.
 3. Convert virtio-blk and UHCI away from pointer casts/static transfer buffers/
    `wbinvd`.
-4. Implement an IOMMU-neutral domain API and a blocked-domain fallback; add a real
-   x86 IOMMU backend as a separate milestone.
+4. Extend validated VT-d DMAR/DRHD discovery with root/context/page tables,
+   invalidation, translation enable/disable ordering, and fault reporting.
 
 Gate: SG boundary/mask/error tests, delayed DMA, unmap misuse, reset with mappings,
 IOMMU fault injection, and ARM64 non-coherent model tests pass.

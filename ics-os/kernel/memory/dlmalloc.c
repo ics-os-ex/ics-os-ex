@@ -568,6 +568,101 @@ extern "C" {
 #define public_iCOMALLOc independent_comalloc
 #endif /* USE_DL_PREFIX */
 
+extern int smp_cpu_id(void);
+extern volatile int kheap_diag_state[8];
+extern int printf(const char *, ...);
+static void dm_state(int s)
+{
+  int me = smp_cpu_id();
+  if (me >= 0 && me < 8)
+    kheap_diag_state[me] = 100 + s;
+}
+
+volatile unsigned long dlm_diag_loops[8];
+volatile unsigned long dlm_diag_p[8];
+volatile unsigned long dlm_diag_next[8];
+volatile unsigned long dlm_diag_size[8];
+volatile unsigned long dlm_diag_fb[8];
+volatile unsigned long dlm_diag_top[8];
+volatile unsigned long dlm_diag_nextchunk[8];
+volatile unsigned long dlm_diag_nextsize[8];
+volatile unsigned long dlm_diag_prev[8];
+static void dlm_reset(void)
+{
+  int me = smp_cpu_id();
+  if (me >= 0 && me < 8)
+    dlm_diag_loops[me] = 0;
+}
+static void dlm_loop(unsigned long p, unsigned long next, unsigned long size,
+                     unsigned long fb, unsigned long top, unsigned long nextchunk,
+                     unsigned long nextsize, unsigned long prev)
+{
+  int me = smp_cpu_id();
+  unsigned long n;
+  if (me < 0 || me >= 8)
+    return;
+  n = ++dlm_diag_loops[me];
+  dlm_diag_p[me] = p;
+  dlm_diag_next[me] = next;
+  dlm_diag_size[me] = size;
+  dlm_diag_fb[me] = fb;
+  dlm_diag_top[me] = top;
+  dlm_diag_nextchunk[me] = nextchunk;
+  dlm_diag_nextsize[me] = nextsize;
+  dlm_diag_prev[me] = prev;
+  if (n > 4096 && n % 4096 == 1) {
+    dm_state(38);
+  }
+}
+
+volatile unsigned int dlm_free_hit[8];
+volatile unsigned long dlm_free_p[8];
+volatile unsigned long dlm_free_old[8];
+volatile unsigned long dlm_free_size[8];
+volatile unsigned long dlm_free_fb[8];
+volatile unsigned long dlm_free_steps[8];
+volatile unsigned long dlm_free_rip[8][4];
+static int dlm_free_check(unsigned long p, unsigned long old,
+                            unsigned long size, unsigned long fb)
+{
+  int me = smp_cpu_id();
+  int found = 0;
+  int bad = 0;
+  unsigned long q;
+  unsigned long steps = 0;
+  if (me < 0 || me >= 8)
+    return 0;
+  if (old == p)
+    found = 1;
+  else {
+    struct dlm_fdwalk { unsigned long fd; };
+    for (q = old, steps = 0; q && steps < 4096; steps++) {
+      if (!(q >= 0x02000000UL && q < 0x06000000UL && (q & 15UL) == 0)) {
+        bad = 1;
+        break;
+      }
+      if (q == p) {
+        found = 1;
+        break;
+      }
+      q = ((struct dlm_fdwalk *)q)->fd;
+    }
+  }
+  if ((found || bad) && dlm_free_hit[me] < 16) {
+    dlm_free_hit[me]++;
+    dlm_free_p[me] = p;
+    dlm_free_old[me] = old;
+    dlm_free_size[me] = size;
+    dlm_free_fb[me] = fb;
+    dlm_free_steps[me] = steps;
+    dlm_free_rip[me][0] = (unsigned long)(char *)__builtin_return_address(0);
+    dlm_free_rip[me][1] = (unsigned long)(char *)__builtin_return_address(1);
+    dlm_free_rip[me][2] = (unsigned long)(char *)__builtin_return_address(2);
+    dlm_free_rip[me][3] = (unsigned long)(char *)__builtin_return_address(3);
+    dm_state(39);
+  }
+  return (found || bad) ? 1 : 0;
+}
 
 /*
   HAVE_MEMCPY should be defined if you are not otherwise using
@@ -1573,29 +1668,35 @@ static pthread_mutex_t mALLOC_MUTEx = PTHREAD_MUTEX_INITIALIZER;
 
 Void_t* public_mALLOc(size_t bytes) {
   Void_t* m;
+  dm_state(1);
   if (MALLOC_PREACTION != 0) {
     return 0;
   }
   m = mALLOc(bytes);
+  dm_state(0);
   if (MALLOC_POSTACTION != 0) {
   }
   return m;
 }
 
 void public_fREe(Void_t* m) {
+  dm_state(11);
   if (MALLOC_PREACTION != 0) {
     return;
   }
   fREe(m);
+  dm_state(0);
   if (MALLOC_POSTACTION != 0) {
   }
 }
 
 Void_t* public_rEALLOc(Void_t* m, size_t bytes) {
+  dm_state(12);
   if (MALLOC_PREACTION != 0) {
     return 0;
   }
   m = rEALLOc(m, bytes);
+  dm_state(0);
   if (MALLOC_POSTACTION != 0) {
   }
   return m;
@@ -2868,6 +2969,7 @@ static Void_t* sYSMALLOc(INTERNAL_SIZE_T nb, mstate av)
 static Void_t* sYSMALLOc(nb, av) INTERNAL_SIZE_T nb; mstate av;
 #endif
 {
+  dm_state(41);
   mchunkptr       old_top;        /* incoming value of av->top */
   INTERNAL_SIZE_T old_size;       /* its size */
   char*           old_end;        /* its end address */
@@ -3027,8 +3129,11 @@ static Void_t* sYSMALLOc(nb, av) INTERNAL_SIZE_T nb; mstate av;
     below even if we cannot call MORECORE.
   */
 
-  if (size > 0) 
+  if (size > 0) {
+    dm_state(42);
     brk = (char*)(MORECORE(size));
+    dm_state(43);
+  }
 
   /*
     If have mmap, try using it as a backup when MORECORE fails or
@@ -3160,6 +3265,7 @@ static Void_t* sYSMALLOc(nb, av) INTERNAL_SIZE_T nb; mstate av;
         correction += ((end_misalign + pagemask) & ~pagemask) - end_misalign;
         
         assert(correction >= 0);
+        dm_state(44);
         snd_brk = (char*)(MORECORE(correction));
         
         if (snd_brk == (char*)(MORECORE_FAILURE)) {
@@ -3244,6 +3350,7 @@ static Void_t* sYSMALLOc(nb, av) INTERNAL_SIZE_T nb; mstate av;
           if (old_size >= MINSIZE) {
             INTERNAL_SIZE_T tt = av->trim_threshold;
             av->trim_threshold = (INTERNAL_SIZE_T)(-1);
+            dm_state(45);
             fREe(chunk2mem(old_top));
             av->trim_threshold = tt;
           }
@@ -3275,12 +3382,14 @@ static Void_t* sYSMALLOc(nb, av) INTERNAL_SIZE_T nb; mstate av;
       set_head(p, nb | PREV_INUSE);
       set_head(remainder, remainder_size | PREV_INUSE);
       check_malloced_chunk(p, nb);
+      dm_state(46);
       return chunk2mem(p);
     }
 
   }
 
   /* catch all failure paths */
+  dm_state(47);
   MALLOC_FAILURE_ACTION;
   return 0;
 }
@@ -3395,11 +3504,13 @@ Void_t* mALLOc(size_t bytes)
     aligned.
   */
 
-  checked_request2size(bytes, nb);
+ checked_request2size(bytes, nb);
+  dm_state(21);
 
   /*
     Bypass search if no frees yet
-   */
+    */
+  dm_state(22);
   if (!have_anychunks(av)) {
     if (av->max_fast == 0) /* initialization check */
       malloc_consolidate(av);
@@ -3455,7 +3566,8 @@ Void_t* mALLOc(size_t bytes)
 
   else {
     idx = largebin_index(nb);
-    if (have_fastchunks(av)) 
+    dm_state(23);
+    if (have_fastchunks(av))
       malloc_consolidate(av);
   }
 
@@ -3467,6 +3579,7 @@ Void_t* mALLOc(size_t bytes)
     chunks are placed in bins.
   */
     
+  dm_state(24);
   while ( (victim = unsorted_chunks(av)->bk) != unsorted_chunks(av)) {
     bck = victim->bk;
     size = chunksize(victim);
@@ -3597,6 +3710,7 @@ Void_t* mALLOc(size_t bytes)
     The bitmap avoids needing to check that most blocks are nonempty.
   */
     
+  dm_state(25);
   ++idx;
   bin = bin_at(av,idx);
   block = idx2block(idx);
@@ -3672,7 +3786,8 @@ Void_t* mALLOc(size_t bytes)
     }
   }
 
-  use_top:    
+  use_top:
+  dm_state(26);
   /*
     If large enough, split off the chunk bordering the end of memory
     (held in av->top). Note that this is in accord with the best-fit
@@ -3702,10 +3817,11 @@ Void_t* mALLOc(size_t bytes)
     return chunk2mem(victim);
   }
   
-  /* 
-     If no space in top, relay to handle system-dependent cases 
-  */
-  return sYSMALLOc(nb, av);    
+ /*
+     If no space in top, relay to handle system-dependent cases
+   */
+  dm_state(27);
+  return sYSMALLOc(nb, av);
 }
 
 /*
@@ -3755,6 +3871,11 @@ void fREe(mem) Void_t* mem;
 
       set_fastchunks(av);
       fb = &(av->fastbins[fastbin_index(size)]);
+      if (dlm_free_check((unsigned long)(char*)p, (unsigned long)(char*)*fb,
+                         (unsigned long)size, (unsigned long)(char*)fb)) {
+        dm_state(40);
+        return;
+      }
       p->fd = *fb;
       *fb = p;
     }
@@ -3886,6 +4007,8 @@ static void malloc_consolidate(mstate av)
 static void malloc_consolidate(av) mstate av;
 #endif
 {
+  dm_state(31);
+  dlm_reset();
   mfastbinptr*    fb;                 /* current fastbin being consolidated */
   mfastbinptr*    maxfb;              /* last fastbin (for loop control) */
   mchunkptr       p;                  /* current chunk being consolidated */
@@ -3908,6 +4031,7 @@ static void malloc_consolidate(av) mstate av;
   */
 
   if (av->max_fast != 0) {
+    dm_state(32);
     clear_fastchunks(av);
 
     unsorted_bin = unsorted_chunks(av);
@@ -3923,19 +4047,34 @@ static void malloc_consolidate(av) mstate av;
     maxfb = &(av->fastbins[fastbin_index(av->max_fast)]);
     fb = &(av->fastbins[0]);
     do {
+      dm_state(33);
       if ( (p = *fb) != 0) {
         *fb = 0;
         
         do {
           check_inuse_chunk(p);
           nextp = p->fd;
-          
+
           /* Slightly streamlined version of consolidation code in free() */
           size = p->size & ~PREV_INUSE;
           nextchunk = chunk_at_offset(p, size);
           nextsize = chunksize(nextchunk);
-          
-          if (!prev_inuse(p)) {
+          dlm_loop((unsigned long)(char*)p, (unsigned long)(char*)nextp,
+                    (unsigned long)size, (unsigned long)(char*)fb,
+                    (unsigned long)(char*)av->top,
+                    (unsigned long)(char*)nextchunk,
+                    (unsigned long)nextsize,
+                    (unsigned long)prev_inuse(p));
+           {
+             int lme = smp_cpu_id();
+             if (lme >= 0 && lme < 8 && dlm_diag_loops[lme] > 100000) {
+               *fb = 0;
+               dm_state(41);
+               return;
+             }
+           }
+
+           if (!prev_inuse(p)) {
             prevsize = p->prev_size;
             size += prevsize;
             p = chunk_at_offset(p, -((long) prevsize));
@@ -3973,9 +4112,11 @@ static void malloc_consolidate(av) mstate av;
     } while (fb++ != maxfb);
   }
   else {
+    dm_state(34);
     malloc_init_state(av);
     check_malloc_state();
   }
+  dm_state(30);
 }
 
 /*

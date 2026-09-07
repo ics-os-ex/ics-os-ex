@@ -56,7 +56,9 @@ int dex_exit(int val){
 };
 
 void exit (int status){
-   dex_exit(status);
+    printf ("SDK_EXIT enter status=%d\n", status);
+    dex_exit(status);
+    printf ("SDK_EXIT returned status=%d\n", status);
 };
 
 void getparameters(char *buf){
@@ -839,6 +841,11 @@ void *sbrk(int amt){
 
 char *buckets[32] = {0};
 size_t bucket2size[32] = {0};
+/* New blocks are carved from a shared page-aligned slab so many small blocks
+   share pages instead of each taking its own sbrk page.  The previous
+   one-page-per-block scheme ballooned the user heap past the 1 GiB VA cap on
+   large GAS files (e.g. insn-attrtab, ~250k symbol/frag blocks). */
+static char *slab_cur = 0, *slab_end = 0;
 
 static int size2bucket(size_t size){
     int b;
@@ -935,12 +942,28 @@ void *malloc(size_t size){
        return (char *)h + MALLOC_HDR;
     }
 
-    size = bucket2size[b] + MALLOC_HDR;
+   size = bucket2size[b] + MALLOC_HDR;
     if (size > 0x7fffffff)
-       return 0;
-    rv = (char *)sbrk((int)size);
-    if (rv == 0 || rv == (char *)-1)
-       return 0;
+        return 0;
+    if (size <= 0x100000) {
+        /* Carve from a shared slab (>= 64 KiB) so small blocks share pages. */
+        if ((unsigned long)(slab_end - slab_cur) < (unsigned long)size) {
+            unsigned long slab = (size > 0x10000) ? size : 0x10000;
+            slab = (slab + 0xfff) & ~(unsigned long)0xfff;
+            slab_cur = (char *)sbrk((int)slab);
+            if (slab_cur == 0 || slab_cur == (char *)-1)
+                return 0;
+            slab_end = slab_cur + slab;
+        }
+        rv = slab_cur;
+        slab_cur += size;
+    } else {
+        /* Large block: its own page-aligned sbrk region. */
+        size = (size + 0xfff) & ~(unsigned)0xfff;
+        rv = (char *)sbrk((int)size);
+        if (rv == 0 || rv == (char *)-1)
+            return 0;
+    }
 
     h = (struct malloc_hdr *)rv;
     h->bucket = b;

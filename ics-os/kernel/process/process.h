@@ -312,8 +312,14 @@ typedef struct _PCB386 {
    void *signaltable;              //Reserved for the signal table *NOT YET IMPLEMENTED*
 
    /* SMP: -1 = any CPU / not running; else cpu id. */
-   int cpu_affinity;
-   volatile int on_cpu;
+    int cpu_affinity;
+    volatile int on_cpu;
+
+    /* Critical sections currently held by this process. A faulting or
+       exiting process must not leave its owner token in a crit, or every
+       later acquire spins forever. */
+    sync_sharedvar *held_crits[16];
+    int held_crit_n;
 
 }PCB386;
 

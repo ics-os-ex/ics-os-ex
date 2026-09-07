@@ -1,17 +1,36 @@
 /*
-  Minimal 16550 UART driver for COM1.
+  Minimal 16550 UART driver for COM1 and COM2.
 
   Used so ICS-OS can be tested on modern PCs and in QEMU without a VGA
   window (qemu -display none -serial stdio).
+
+  COM1 (0x3F8) is the headless oracle console (serial_* API).
+  COM2 (0x2F8) is an optional interactive terminal / shell (serial2_* API)
+  used for live command execution and introspection without a reboot.
 */
 
 #include "../../cpu/spinlock.h"
 
 #define SERIAL_COM1 0x3F8
+#define SERIAL_COM2 0x2F8
 
-static int serial_ready = 0;
-static spinlock_t serial_lock;
-static volatile int serial_owner = -1;
+typedef struct uart_dev {
+    unsigned int base;
+    volatile int ready;
+    spinlock_t lock;
+    volatile int owner;
+} uart_dev;
+
+static uart_dev uart1;
+static uart_dev uart2;
+
+/* When set, console putcEX() also mirrors output to COM2 so the shell2
+   terminal shows command results. Off by default to avoid serial overhead
+   in headless runs; the shell2 thread turns it on. */
+static volatile int com2_mirror = 0;
+
+void serial2_mirror_set(int on) { com2_mirror = on; }
+int  serial2_mirror_get(void)   { return com2_mirror; }
 
 typedef struct serial_guard {
     spin_irq_flags_t flags;
@@ -21,7 +40,7 @@ typedef struct serial_guard {
 extern unsigned int lapic_get_id(void);
 extern volatile unsigned int *lapic_mmio;
 
-static serial_guard serial_guard_acquire(void)
+static serial_guard uart_guard_acquire(uart_dev *u)
 {
     serial_guard guard;
     int cpu = lapic_mmio ? (int)lapic_get_id() : 0;
@@ -30,65 +49,81 @@ static serial_guard serial_guard_acquire(void)
     __asm__ __volatile__("pushfq; popq %0; cli"
                          : "=r"(guard.flags) : : "memory");
     guard.locked = 0;
-    if (serial_lock.locked && serial_owner == cpu)
+    if (u->lock.locked && u->owner == cpu)
         return guard;
-    while (!__sync_bool_compare_and_swap(&serial_lock.locked, 0, 1)) {
+    while (!__sync_bool_compare_and_swap(&u->lock.locked, 0, 1)) {
         if (++spins > 100000)
             return guard;
         __asm__ __volatile__("pause");
     }
-    serial_owner = cpu;
+    u->owner = cpu;
     guard.locked = 1;
     return guard;
 }
 
-static void serial_guard_release(serial_guard guard)
+static void uart_guard_release(uart_dev *u, serial_guard guard)
 {
     if (guard.locked) {
-        serial_owner = -1;
-        spin_unlock(&serial_lock);
+        u->owner = -1;
+        spin_unlock(&u->lock);
     }
     if (guard.flags & (1ULL << 9))
         __asm__ __volatile__("sti" : : : "memory");
 }
 
-static void serial_putc_raw(char c)
+static void uart_putc_raw(uart_dev *u, char c)
 {
     int spins = 0;
 
-    while ((inportb(SERIAL_COM1 + 5) & 0x20) == 0) {
+    while ((inportb(u->base + 5) & 0x20) == 0) {
         if (++spins > 100000)
             return;
     }
-    outportb(SERIAL_COM1, (unsigned char)c);
+    outportb(u->base, (unsigned char)c);
+}
+
+static int uart_getc_raw(uart_dev *u)
+{
+    if (!u->ready)
+        return -1;
+    if ((inportb(u->base + 5) & 1) == 0)
+        return -1;
+    return (int)inportb(u->base);
+}
+
+static void uart_hw_init(uart_dev *u, unsigned int base)
+{
+    u->base = base;
+    u->ready = 0;
+    u->owner = -1;
+    spin_init(&u->lock);
+    outportb(base + 1, 0x00);    /* disable UART interrupts */
+    outportb(base + 3, 0x80);    /* enable DLAB */
+    outportb(base + 0, 0x01);    /* 115200 baud */
+    outportb(base + 1, 0x00);
+    outportb(base + 3, 0x03);    /* 8N1 */
+    outportb(base + 2, 0xC7);    /* enable FIFO */
+    outportb(base + 4, 0x0B);    /* IRQs enabled, RTS/DSR set */
+    u->ready = 1;
 }
 
 void serial_init(void)
 {
-    spin_init(&serial_lock);
-    serial_owner = -1;
-    outportb(SERIAL_COM1 + 1, 0x00);    /* disable UART interrupts */
-    outportb(SERIAL_COM1 + 3, 0x80);    /* enable DLAB */
-    outportb(SERIAL_COM1 + 0, 0x01);    /* 115200 baud */
-    outportb(SERIAL_COM1 + 1, 0x00);
-    outportb(SERIAL_COM1 + 3, 0x03);    /* 8N1 */
-    outportb(SERIAL_COM1 + 2, 0xC7);    /* enable FIFO */
-    outportb(SERIAL_COM1 + 4, 0x0B);    /* IRQs enabled, RTS/DSR set */
-    serial_ready = 1;
+    uart_hw_init(&uart1, SERIAL_COM1);
 };
 
 void serial_putc(char c)
 {
     serial_guard guard;
 
-    if (!serial_ready)
+    if (!uart1.ready)
         return;
 
-    guard = serial_guard_acquire();
+    guard = uart_guard_acquire(&uart1);
     if (c == '\n')
-        serial_putc_raw('\r');
-    serial_putc_raw(c);
-    serial_guard_release(guard);
+        uart_putc_raw(&uart1, '\r');
+    uart_putc_raw(&uart1, c);
+    uart_guard_release(&uart1, guard);
 };
 
 void serial_puts(const char *s)
@@ -97,22 +132,59 @@ void serial_puts(const char *s)
 
     if (s == 0)
         return;
-    if (!serial_ready)
+    if (!uart1.ready)
         return;
-    guard = serial_guard_acquire();
+    guard = uart_guard_acquire(&uart1);
     while (*s) {
         if (*s == '\n')
-            serial_putc_raw('\r');
-        serial_putc_raw(*s++);
+            uart_putc_raw(&uart1, '\r');
+        uart_putc_raw(&uart1, *s++);
     }
-    serial_guard_release(guard);
+    uart_guard_release(&uart1, guard);
 };
 
 int serial_getc(void)
 {
-    if (!serial_ready)
-        return -1;
-    if ((inportb(SERIAL_COM1 + 5) & 1) == 0)
-        return -1;
-    return (int)inportb(SERIAL_COM1);
+    return uart_getc_raw(&uart1);
+};
+
+void serial2_init(void)
+{
+    uart_hw_init(&uart2, SERIAL_COM2);
+};
+
+void serial2_putc(char c)
+{
+    serial_guard guard;
+
+    if (!uart2.ready)
+        return;
+
+    guard = uart_guard_acquire(&uart2);
+    if (c == '\n')
+        uart_putc_raw(&uart2, '\r');
+    uart_putc_raw(&uart2, c);
+    uart_guard_release(&uart2, guard);
+};
+
+void serial2_puts(const char *s)
+{
+    serial_guard guard;
+
+    if (s == 0)
+        return;
+    if (!uart2.ready)
+        return;
+    guard = uart_guard_acquire(&uart2);
+    while (*s) {
+        if (*s == '\n')
+            uart_putc_raw(&uart2, '\r');
+        uart_putc_raw(&uart2, *s++);
+    }
+    uart_guard_release(&uart2, guard);
+};
+
+int serial2_getc(void)
+{
+    return uart_getc_raw(&uart2);
 };

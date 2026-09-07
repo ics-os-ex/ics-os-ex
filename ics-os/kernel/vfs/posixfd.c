@@ -9,6 +9,7 @@
  */
 #include "../dextypes.h"
 #include "../process/process.h"
+#include "../process/scheduler.h"
 #include "../console/tty.h"
 #include "../iomgr/blkcache.h"
 #include "../iomgr/iosched.h"
@@ -31,6 +32,8 @@ extern char *userspace;
 extern char *showpath(char *s);
 extern int dex32_loader(char *name, char *image, char *loadaddress, int mode,
                         char *p, char *workdir, PCB386 *parent);
+extern int elf64_stream_load(char *name, int mode, char *p, char *workdir,
+                             PCB386 *parent);
 extern void dex32_stopints(DWORD *flags);
 extern void dex32_restoreints(DWORD flags);
 extern unsigned int strlen(const char *s);
@@ -1457,16 +1460,34 @@ static int spawn_load(const char *path, const char *params)
       cmd[i] = 0;
    }
 
-   buf = (char *)vfs_mapfile(name, &size);
-   if (!buf)
-      return -ENOENT;
+   /* ELF64 executables are streamed page-by-page from VFS into the child's
+       private frames.  This avoids allocating an 18 MiB cc1.exe image in the
+       kernel heap and removes the need to hold a spin crit while the loader
+       copies the image.  Non-ELF images still use the old eager map+load path,
+       serialized by elf_map_crit to bound kernel-heap pressure. */
+    id = (DWORD)elf64_stream_load(name, 0, cmd,
+                                  showpath(temp), current_process);
+    if (id && (int)id != -1)
+       return (int)id;
 
-   id = dex32_loader(name, buf, userspace, 0, cmd, showpath(temp),
-                     current_process);
-   free(buf);
-   if (!id || (int)id == -1)
-      return -ENOEXEC;
-   return (int)id;
+    printf("ELFCRIT enter %s pid=%d\n", name, (int)getprocessid());
+    sync_entercrit(&elf_map_crit);
+    printf("ELFCRIT held %s pid=%d\n", name, (int)getprocessid());
+    buf = (char *)vfs_mapfile(name, &size);
+    if (!buf) {
+       printf("ELFCRIT leave-nobuf %s pid=%d\n", name, (int)getprocessid());
+       sync_leavecrit(&elf_map_crit);
+       return -ENOENT;
+    }
+
+    id = dex32_loader(name, buf, userspace, 0, cmd, showpath(temp),
+                      current_process);
+    free(buf);
+    printf("ELFCRIT leave %s pid=%d id=%d\n", name, (int)getprocessid(), (int)id);
+    sync_leavecrit(&elf_map_crit);
+    if (!id || (int)id == -1)
+       return -ENOEXEC;
+    return (int)id;
 }
 
 long sys_spawn(const char *path, const char *params)
@@ -1495,57 +1516,59 @@ static PCB386 *waitpid_live_child(PCB386 *parent)
 
 long sys_waitpid(int pid, int *status, int options)
 {
-   PCB386 *me = current_process;
-   int i, wpid, wst;
+    PCB386 *me = current_process;
+    int i, wpid, wst;
 
-   if (!me)
-      return -EINVAL;
+    if (!me)
+       return -EINVAL;
 
-   for (;;) {
-      if (pid < -1)
-         return -EINVAL;
-      for (i = 0; i < me->waitq_n; i++) {
-         if (pid == -1 || me->waitq_pid[i] == pid) {
-            wpid = me->waitq_pid[i];
-            wst = me->waitq_st[i];
-            me->waitq_n--;
-            for (; i < me->waitq_n; i++) {
-               me->waitq_pid[i] = me->waitq_pid[i + 1];
-               me->waitq_st[i] = me->waitq_st[i + 1];
-            }
-            if (status)
-               *status = wst;
-            return wpid;
+    for (;;) {
+       if (pid < -1)
+          return -EINVAL;
+       for (i = 0; i < me->waitq_n; i++) {
+          if (pid == -1 || me->waitq_pid[i] == pid) {
+             wpid = me->waitq_pid[i];
+             wst = me->waitq_st[i];
+             me->waitq_n--;
+             for (; i < me->waitq_n; i++) {
+                me->waitq_pid[i] = me->waitq_pid[i + 1];
+                me->waitq_st[i] = me->waitq_st[i + 1];
+             }
+             if (status)
+                *status = wst;
+             return wpid;
+           }
+       }
+       if (pid == 0)
+          return -EINVAL;
+       if (pid > 0) {
+          PCB386 *p = ps_findprocess((DWORD)pid);
+          if (p == (PCB386 *)-1 || p->owner != me->processid
+              || (p->status & PS_ATTB_THREAD)) {
+             if (options & WNOHANG)
+                return -ECHILD;
+             return -ECHILD;
           }
-      }
-      if (pid == 0)
-         return -EINVAL;
-      if (pid > 0) {
-         PCB386 *p = ps_findprocess((DWORD)pid);
-         if (p == (PCB386 *)-1 || p->owner != me->processid
-             || (p->status & PS_ATTB_THREAD)) {
-            if (options & WNOHANG)
-               return -ECHILD;
-            return -ECHILD;
-         }
-         if (options & WNOHANG)
-            return 0;
-         dex32_waitpid(pid, 0);
-         continue;
-      }
-      /* pid == -1 */
-      if (me->nlive <= 0 && me->waitq_n == 0)
-         return -ECHILD;
-      if (options & WNOHANG)
-         return 0;
-      {
-         PCB386 *ch = waitpid_live_child(me);
-         if (ch != (PCB386 *)-1)
-            dex32_waitpid((int)ch->processid, 0);
-         else
-            taskswitch();
-      }
-   }
+          if (options & WNOHANG) {
+             taskswitch();
+             return 0;
+          }
+          sched_block_process(me, ticks + 20);
+          taskswitch();
+          sched_wake_process(me);
+          continue;
+       }
+       /* pid == -1 */
+       if (me->nlive <= 0 && me->waitq_n == 0)
+          return -ECHILD;
+       if (options & WNOHANG) {
+          taskswitch();
+          return 0;
+       }
+       sched_block_process(me, ticks + 20);
+       taskswitch();
+       sched_wake_process(me);
+    }
 }
 
 long sys_getdents(const char *path, char *ubuf, int ubuflen)

@@ -303,29 +303,38 @@ int devfs_mountroot(vfs_node *mountpoint,int device_id)
     mountpoint->fsid = devfs_myid;
     mountpoint->memid = device_id;
     
-    //wait until the device manager is ready
-    sync_entercrit(&devmgr_busy);
+   {
+       int ids[MAXDEVICES];
+       int count=0;
 
-    for (i=0;i<MAXDEVICES;i++)
-      {
-            if (devmgr_devlist[i]!=0)
-            {
-            char typestr[10];
+       //wait until the device manager is ready
+       sync_entercrit(&devmgr_busy);
+       for (i=0;i<MAXDEVICES;i++)
+         if (devmgr_devlist[i]!=0)
+            ids[count++]=i;
+       sync_leavecrit(&devmgr_busy);
+
+       for (i=0;i<count;i++)
+       {
+            devmgr_generic *dev = devmgr_getdevice_ref(ids[i]);
             vfs_node *node;
-            
+
+            if (dev==(devmgr_generic*)-1 || dev==0)
+               continue;
+
             //allocate a new vfs_node
             node=(vfs_node*)malloc(sizeof(vfs_node));
             memset(node,0,sizeof(vfs_node));
             vfs_createnode(node,mountpoint);
-            
+
             node->memid     = device_id;
             node->fsid      = devfs_myid;
             node->attb      = FILE_OREAD | FILE_OWRITE;
-            node->misc_flag = devmgr_devlist[i]->id;
-            
-            if (devmgr_devlist[i]->type == DEVMGR_BLOCK)
+            node->misc_flag = dev->id;
+
+            if (dev->type == DEVMGR_BLOCK)
             {
-                devmgr_block_desc *blockdev = (devmgr_block_desc*)devmgr_devlist[i];
+                devmgr_block_desc *blockdev = (devmgr_block_desc*)dev;
                 if (blockdev->total_blocks!=0 &&
                     blockdev->get_block_size!=0)
                     {
@@ -333,18 +342,18 @@ int devfs_mountroot(vfs_node *mountpoint,int device_id)
                          4 TiB/512B show a truncated size in directory
                          listings until the VFS size field is widened. */
                       node->size = (DWORD)(bridges_call64(blockdev,&blockdev->total_blocks) *
-                                   bridges_call(blockdev,&blockdev->get_block_size));
+                               bridges_call(blockdev,&blockdev->get_block_size));
                     };
             }
-              else 
+              else
             node->size = 0;
-            
-            strcpy(node->name,devmgr_devlist[i]->name);
-            
-            };
-      };
-   sync_leavecrit(&devmgr_busy);
-   return 1;
+
+            strcpy(node->name,dev->name);
+
+            devmgr_putdevice(dev);
+       };
+    }
+    return 1;
 
 };
 

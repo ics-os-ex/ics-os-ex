@@ -1230,6 +1230,7 @@ int fseek(file_PCB *fhandle, long offset, int whence)
             if (pos < 0)
                 return -1;
             fhandle->ptrlow = (DWORD)pos;
+            return 0;
         };
     return -1;
 };
@@ -1283,6 +1284,10 @@ char *getfullpath(vfs_node *node,char *s);
    This is the mmap path used for executable loading — one contiguous
    mapping populated via the optimized FAT coalesced reader + block cache.
    Caller must free() the returned pointer. */
+extern char *knext;
+extern unsigned long long frame_free_count(void);
+extern unsigned long long frame_total_count(void);
+
 void *vfs_mapfile(const char *path, DWORD *out_size)
 {
     file_PCB *f;
@@ -1301,7 +1306,11 @@ void *vfs_mapfile(const char *path, DWORD *out_size)
     }
     buf = (char*)malloc(size + 511);
     if (!buf) {
-        printf("mapfile: malloc(%lu) failed\n", (unsigned long)size);
+        printf("mapfile: malloc(%lu) failed knext=0x%llx frames=%llu/%llu\n",
+               (unsigned long)size,
+               (unsigned long long)(unsigned long)(void*)knext,
+               (unsigned long long)frame_free_count(),
+               (unsigned long long)frame_total_count());
         fclose(f);
         return 0;
     }

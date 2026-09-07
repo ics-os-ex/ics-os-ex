@@ -1,7 +1,9 @@
 # Shared host/in-ICS-OS recipe for rebuilding the GCC 4.7.4 C frontend.
 # The staging script normalizes each cc1 source to units/<object-stem>.c so
 # GNU Make can use a deterministic pattern rule without shell source lookup.
-.NOTPARALLEL:
+# The recipe is parallel-safe: every object is compiled to its own output and
+# the output directories are created once by the `prepare` target before any
+# concurrent job runs.
 
 ROOT ?= /icsos/gccsrc
 OUT ?= /work
@@ -114,8 +116,21 @@ CC1_ARCHIVES := $(OUT)/cc1-1.a $(OUT)/cc1-2.a $(OUT)/cc1-3.a \
 	$(OUT)/cc1-12.a $(OUT)/cc1-13.a $(OUT)/cc1-14.a $(OUT)/cc1-15.a \
 	$(OUT)/cc1-16.a $(OUT)/cc1-17.a $(OUT)/cc1-18.a
 
-.PHONY: all frontend
-all: $(OUT)/loop.o $(OUT)/as.exe $(OUT)/ld.exe
+.PHONY: all frontend prepare
+# Create every output directory once, up front. This is what makes `make -jN`
+# safe: the per-object rules still call `mkdir -p` (idempotent), but by the
+# time concurrent jobs start, the directories already exist, so no two jobs
+# race on the same first-time directory creation.
+prepare:
+	$(MKDIR) -p $(OUT)
+	$(MKDIR) -p $(OBJ)
+	$(MKDIR) -p $(OBJ)/libcpp
+	$(MKDIR) -p $(OBJ)/libib
+	$(MKDIR) -p $(OBJ)/dec
+	$(MKDIR) -p $(OBJ)/dec/bid
+	$(MKDIR) -p $(OBJ)/z
+	$(MKDIR) -p $(OBJ)/cc1
+all: prepare $(OUT)/loop.o $(OUT)/as.exe $(OUT)/ld.exe
 frontend: $(OUT)/cc1.exe
 
 $(LIBCPP_OBJS): $(OBJ)/libcpp/%.o: $(ROOT)/up/libcpp/%.c

@@ -57,8 +57,12 @@
 #define CC1      TOOLDIR "/cc1.exe"
 #define AS       TOOLDIR "/as.exe"
 #define LD       TOOLDIR "/ld.exe"
-#define T_S      RTDIR "/.gccdrv.s"
-#define T_O      RTDIR "/.gccdrv.o"
+/* Intermediate temps are named per-process: the driver is invoked concurrently
+   by `make -jN`, so a fixed shared path would let parallel jobs clobber each
+   other's cc1/as scratch files. The concrete names are built in main() from
+   getpid(). */
+#define T_S_FMT  RTDIR "/.gccdrv.%d.s"
+#define T_O_FMT  RTDIR "/.gccdrv.%d.o"
 
 /* The SDK runtime ("libc") linked in automatically when linking (no -c). */
 static const char *sdkrt[] = {
@@ -200,12 +204,15 @@ int main(int argc, char **argv)
    static char inc[256];
    static char objsrc[256];      /* object fed to ld (temp) or the -c output */
    static char cc1path[256] = CC1;
-   static char aspath[256] = AS;
-   static char ldpath[256] = LD;
-   static char *cc1argv[192];
-   static char *asargv[16];
-   static char *ldargv[96];
-   int i, j, k;
+    static char aspath[256] = AS;
+    static char ldpath[256] = LD;
+    static char ts_name[160];     /* per-pid cc1 assembly temp */
+    static char to_name[160];     /* per-pid as object temp (link mode) */
+    static char *cc1argv[192];
+    static char *asargv[16];
+    static char *ldargv[96];
+    int i, j, k;
+    int mypid;
    int compile_only = 0;
    int nostdlib = 0;
    int have_in = 0;
@@ -289,9 +296,15 @@ int main(int argc, char **argv)
          continue;
       }
       /* unknown driver flag: drop (e.g. -Wall, -w, -m64) */
-   }
+    }
 
-   if (!have_in) die("parse: no input file");
+    /* Per-pid scratch paths so concurrent `make -jN` driver invocations never
+       share (and clobber) the same cc1/as intermediate files. */
+    mypid = getpid();
+    sprintf(ts_name, T_S_FMT, mypid);
+    sprintf(to_name, T_O_FMT, mypid);
+
+    if (!have_in) die("parse: no input file");
 
    /* default output name */
    if (!have_out) {
@@ -301,27 +314,27 @@ int main(int argc, char **argv)
 
    /* object file: for -c it IS the output; otherwise a temp fed to ld */
    if (compile_only)
-      strcpy(objsrc, out);
-   else
-      strcpy(objsrc, T_O);
+       strcpy(objsrc, out);
+    else
+       strcpy(objsrc, to_name);
 
    /* ---- phase 1: cc1 (C frontend) emits assembly -- only for .c input ---- */
-   if (!is_s) {
-      unlink(T_S);
-      k = 0;
-      cc1argv[k++] = cc1path;
+  if (!is_s) {
+       unlink(ts_name);
+       k = 0;
+       cc1argv[k++] = cc1path;
       /* The upstream GCC driver always supplies -quiet. Without it cc1
          prints every parsed/generated symbol and timing details; on the
          serial console that creates roughly a million syscalls per unit. */
       cc1argv[k++] = "-quiet";
       for (i = 0; i < cc1nopts; i++) cc1argv[k++] = cc1optargv[i];
-      cc1argv[k++] = inc;
-      cc1argv[k++] = "-o";
-      cc1argv[k++] = T_S;
-      cc1argv[k] = 0;
-      if (run_tool(cc1path, cc1argv)) die("cc1 spawn");
-      if (check_out(T_S, 0) < 0) die("cc1: no asm");
-      if (check_asm(T_S) < 0) die("cc1: incomplete asm");
+     cc1argv[k++] = inc;
+       cc1argv[k++] = "-o";
+       cc1argv[k++] = ts_name;
+       cc1argv[k] = 0;
+       if (run_tool(cc1path, cc1argv)) die("cc1 spawn");
+       if (check_out(ts_name, 0) < 0) die("cc1: no asm");
+       if (check_asm(ts_name) < 0) die("cc1: incomplete asm");
       printf("gccdriver: cc1 ok\n");
    }
 
@@ -329,7 +342,7 @@ int main(int argc, char **argv)
    unlink(objsrc);
    asargv[0] = aspath;
    asargv[1] = "--64";
-   asargv[2] = is_s ? inc : T_S;
+   asargv[2] = is_s ? inc : ts_name;
    asargv[3] = "-o";
    asargv[4] = objsrc;
    asargv[5] = 0;

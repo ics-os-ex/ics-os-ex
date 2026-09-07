@@ -340,10 +340,104 @@ void loadfat(BPB *bpbblock,void *fat,int id)
       };
 
 
+/*
+ * Per-device FAT cache. The FAT is re-read on every data read/write
+ * (loadfile12EX2 / writefile12EX2) even though data I/O never modifies it;
+ * for a 1 MiB file that is ~256 full FAT reloads (each the whole 2 MiB FAT).
+ * Cache the FAT per device in RAM and invalidate only when the on-disk FAT
+ * changes (update_fats) so the next access reloads it.
+ */
+#define FATCACHE_MAXDEVS 4
+typedef struct {
+   int   id;
+   int   valid;
+   int   dirty;
+   DWORD fat_sectors;
+   DWORD device_generation;
+   BYTE  *fat;
+} fatcache_ent;
+
+static fatcache_ent fatcache[FATCACHE_MAXDEVS];
+
+void fat_cache_invalidate(int id)
+{
+   int i;
+   for (i = 0; i < FATCACHE_MAXDEVS; i++)
+      if (fatcache[i].valid && fatcache[i].id == id)
+         fatcache[i].dirty = 1;
+}
+
+void fat_cache_freeall(void)
+{
+   int i;
+   for (i = 0; i < FATCACHE_MAXDEVS; i++) {
+      if (fatcache[i].valid && fatcache[i].fat)
+         free(fatcache[i].fat);
+      fatcache[i].fat = 0;
+      fatcache[i].valid = 0;
+      fatcache[i].dirty = 0;
+      fatcache[i].id = -1;
+      fatcache[i].fat_sectors = 0;
+   }
+}
+
+BYTE *fat_cache_get(BPB *bpbblock, int id)
+{
+   int i;
+   DWORD fat_sectors = fat_sectors_per_fat(bpbblock);
+   fatcache_ent *e = 0;
+
+   if (!bpbblock || !fat_sectors)
+      return 0;
+
+   {
+      DWORD gen = devmgr_get_generation(id);
+      for (i = 0; i < FATCACHE_MAXDEVS; i++) {
+         if (fatcache[i].valid && fatcache[i].id == id &&
+             fatcache[i].device_generation == gen) {
+            e = &fatcache[i];
+            break;
+         }
+      }
+   }
+   if (!e) {
+      for (i = 0; i < FATCACHE_MAXDEVS; i++) {
+         if (!fatcache[i].valid) {
+            e = &fatcache[i];
+            break;
+         }
+      }
+   }
+   if (!e)
+      return 0; /* cache full; caller falls back to a temporary load */
+
+   if (e->fat_sectors != fat_sectors) {
+      if (e->fat)
+         free(e->fat);
+      e->fat = (BYTE *)malloc(fat_sectors * 512);
+      if (!e->fat) {
+         e->valid = 0;
+         e->fat_sectors = 0;
+         return 0;
+      }
+      e->fat_sectors = fat_sectors;
+      e->dirty = 1;
+   }
+   if (e->valid && e->id == id && !e->dirty)
+      return e->fat;
+
+   loadfat(bpbblock, e->fat, id);
+   e->id = id;
+   e->device_generation = devmgr_get_generation(id);
+   e->valid = 1;
+   e->dirty = 0;
+   return e->fat;
+}
+
 int loaddirectory(fatdirentry *dir, char **buf,int id)
 {
-  DWORD start_cluster = (dir->st_clust_msw << 16) | dir->st_clust;
-  return fat_loaddirectoryfromcluster(start_cluster,buf,id);
+   DWORD start_cluster = (dir->st_clust_msw << 16) | dir->st_clust;
+   return fat_loaddirectoryfromcluster(start_cluster,buf,id);
 };
 
 void debug_printbuf(char *buf)
@@ -934,14 +1028,17 @@ DWORD update_fats(BPB *bpbblock,BYTE *fat,int id)
          DWORD count = total_fat_clusters-i2 > 0xF0 ? 0xF0 :
                        total_fat_clusters-i2;
             DWORD handle=dex32_requestIO(id,IO_WRITE,fat_start_sector+i2,
-                       count,(void*)(fat+i2*512));
-         fat_wait_io(handle);
-         dex32_closeIO(handle);
+                        count,(void*)(fat+i2*512));
+          fat_wait_io(handle);
+          dex32_closeIO(handle);
       };
-   
-      fat_start_sector+=fat_sectors_per_fat(bpbblock);
-   };
-      
+
+       fat_start_sector+=fat_sectors_per_fat(bpbblock);
+    };
+
+    //The on-disk FAT just changed; invalidate the RAM cache so the next
+    //access reloads the new chain.
+    fat_cache_invalidate(id);
 };
 
 DWORD update_dirs_fats(BPB *bpbblock,BYTE *fat,vfs_node *tdir,int id)
@@ -1531,13 +1628,17 @@ int fat_mount_root(vfs_node *mountpoint,int id)
 
 char *unicodetoascii(WORD *unicodestr,char *targ,int length)
 {
-   int i;
-   
-   for (i=0;unicodestr[i]&&( (length!=0&&i<length) || length==0)  ;i++)
-      targ[i]=(char)unicodestr[i];
-   targ[i]=0;
-   return targ;
-   
+    int i;
+
+    /* Stop at the 0x0000 null terminator AND the 0xFFFF end-of-long-name
+       marker. Some FAT writers (e.g. mformat/mtools) pad the unused tail of
+       a long-name sub-component with 0x0020 (space) and terminate the name
+       with 0xFFFF; consuming those bytes corrupts the reconstructed name. */
+    for (i=0;unicodestr[i]&&unicodestr[i]!=0xFFFF&&( (length!=0&&i<length) || length==0)  ;i++)
+       targ[i]=(char)unicodestr[i];
+    targ[i]=0;
+    return targ;
+
 };
 
 /******************************************************************************
@@ -1650,13 +1751,23 @@ int fat_mount(vfs_node *mountpoint,fatdirentry *buf2,BPB *bpb,int id)
 #ifdef FAT12_LFNSUPPORT
             if (strcmp(lfn_buffer,"")!=0) //A long filename was detected before this entry, so use it
             {
-               strcpy(node->name,lfn_buffer);
+               int lfl=(int)strlen(lfn_buffer);
+               /* Trim trailing space (0x20) and null padding that some FAT
+                  writers (e.g. mformat/mtools) leave in the last long-name
+                  sub-component; without this the reconstructed name carries
+                  garbage bytes and exact-name VFS lookups fail. */
+               while (lfl>0 && (lfn_buffer[lfl-1]==' '||lfn_buffer[lfl-1]==0))
+                  lfn_buffer[--lfl]=0;
+               if (lfl>0)
+                  strcpy(node->name,lfn_buffer);
+               else
+                  strcpy(node->name,filename);
                strcpy(lfn_buffer,"");
             }
             else
 #endif
             strcpy(node->name,filename);
-            
+
             //tell the VFS that this node is accessed using fat
             node->fsid=fat_deviceid;
             node->memid = id;
@@ -1826,29 +1937,35 @@ int writefile12EX2(fatdirentry *dir,BPB *bpbblock,char *buf,int se,int start,int
          DWORD startadj =  start % bytes_per_cluster ;
          DWORD startlength= bytes_per_cluster - startadj;
          DWORD sectors_per_cluster = bpbblock->sectors_per_cluster;
-         BYTE *fat = 0;
-         int fat_type;
-         void *temp_buffer;
-         
-         
-         DWORD total_requests = endblock-startblock + 1;
-         
-         fat_type = fat_get_fat_type(id,bpbblock);         
+          BYTE *fat = 0;
+          int fat_type;
+          int fat_own = 0;
+          void *temp_buffer;
+
+
+          DWORD total_requests = endblock-startblock + 1;
+
+          fat_type = fat_get_fat_type(id,bpbblock);
 
          cluster=dir->st_clust;
          
          if (cluster==0) return 0;
          
          if (fat_type!=FAT12_FAT32)
-         {
-         fat=(BYTE*)malloc(bpbblock->sectors_per_fat*512);//allocate memory for FAT
-         loadfat(bpbblock,fat,id);
-         };
-         
-         ofs = 0;
-         
-         //allocate temporary buffer, where we will place our data
-         temp_buffer = (void*)malloc(bytes_per_cluster);
+          {
+          fat=fat_cache_get(bpbblock,id);
+          if (!fat)
+          {
+             fat=(BYTE*)malloc(bpbblock->sectors_per_fat*512);//allocate memory for FAT
+             loadfat(bpbblock,fat,id);
+             fat_own=1;
+          }
+          };
+
+          ofs = 0;
+
+          //allocate temporary buffer, where we will place our data
+          temp_buffer = (void*)malloc(bytes_per_cluster);
          
          do {
             
@@ -1922,11 +2039,11 @@ int writefile12EX2(fatdirentry *dir,BPB *bpbblock,char *buf,int se,int start,int
          
 
          free(temp_buffer);
-                  
-         if (fat!=0)
-         free(fat);
-         return 1; //success
-      ;};
+
+          if (fat!=0 && fat_own)
+          free(fat);
+          return 1; //success
+       ;};
       
       
 DWORD fat_openfileEX(vfs_node *f,char *bufr,int start,int end,int id)
@@ -1962,12 +2079,13 @@ int loadfile12EX2(fatdirentry *dir,BPB *bpbblock,char *buf,int se,int start,int 
          DWORD bytes_per_cluster = bpbblock->sectors_per_cluster*512;
          DWORD spc = bpbblock->sectors_per_cluster;
          DWORD startblock, endblock, adj, startadj, startlength;
-         BYTE *fat = 0;
-         int fat_type;
-         void *temp_buffer;
-         /* Cap a single request: large enough for ~32KB sequential runs
-            (classic readahead size) without exhausting the I/O manager. */
-         DWORD max_run_sectors = 64;
+          BYTE *fat = 0;
+          int fat_own = 0;
+          int fat_type;
+          void *temp_buffer;
+          /* Cap a single request: large enough for ~32KB sequential runs
+             (classic readahead size) without exhausting the I/O manager. */
+          DWORD max_run_sectors = 64;
          DWORD max_run_clusters;
          (void)se;
 
@@ -1985,18 +2103,23 @@ int loadfile12EX2(fatdirentry *dir,BPB *bpbblock,char *buf,int se,int start,int 
 
          fat_type  = fat_get_fat_type(id,bpbblock);
 
-         if (fat_type!=FAT12_FAT32)
-         {
-            fat=(BYTE*)malloc(fat_sectors_per_fat(bpbblock)*512);
-            loadfat(bpbblock,fat,id);
-         };
+        if (fat_type!=FAT12_FAT32)
+          {
+             fat=fat_cache_get(bpbblock,id);
+             if (!fat)
+             {
+                fat=(BYTE*)malloc(fat_sectors_per_fat(bpbblock)*512);
+                loadfat(bpbblock,fat,id);
+                fat_own=1;
+             }
+          };
 
-         temp_buffer = (void*)malloc(max_run_clusters * bytes_per_cluster);
-         if (!temp_buffer)
-         {
-            if (fat!=0) free(fat);
-            return 0;
-         }
+          temp_buffer = (void*)malloc(max_run_clusters * bytes_per_cluster);
+          if (!temp_buffer)
+          {
+             if (fat!=0 && fat_own) free(fat);
+             return 0;
+          }
 
          while (cluster < (unsigned)fat_get_eoc(fat_type))
          {
@@ -2084,11 +2207,11 @@ int loadfile12EX2(fatdirentry *dir,BPB *bpbblock,char *buf,int se,int start,int 
             block++;
          }
 
-         free(temp_buffer);
-         if (fat!=0)
-            free(fat);
-         return 1;
-      ;};
+       free(temp_buffer);
+          if (fat!=0 && fat_own)
+             free(fat);
+          return 1;
+       ;};
       
       
       int loadfile12(fatdirentry *dir,BPB *bpbblock,char *buf,int id)

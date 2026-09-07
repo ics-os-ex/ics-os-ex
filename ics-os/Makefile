@@ -17,10 +17,21 @@ QEMU_KERNEL=-kernel kernel/Kernel64.bin
 OVMF_FD := $(firstword $(wildcard /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd))
 UEFI_MEM=512M
 
+# Distribution image: the full dev toolchain (host GCC cc1 + thin gcc driver,
+# binutils, make, tcc, vim, utilities) packaged as a BIOS+UEFI bootable FAT
+# USB thumb drive. autoexec seeds the SDK runtime objects into /ramdisk so the
+# gcc driver can link; the rest of the image is the plain-USB content.
+DIST_IMG ?= ics-os-dist.img
+DIST_TEST_IMG ?= ics-os-dist-test.img
+DIST_SIZE_MB ?= 128
+# SDK runtime objects the gcc driver links against (mirrors test-gcc's host
+# build flags so the .o's match what cc1/as/ld expect).
+HOSTG_RTFLAGS := -m64 -std=gnu89 -w -nostdlib -fno-builtin -static -ffreestanding -fno-pie -fno-pic -fno-stack-protector -fno-asynchronous-unwind-tables -fno-strict-aliasing -mcmodel=large -mno-red-zone -Isdk/include
+
 vmdex:
 	make -C kernel/
 
-.PHONY: vmdex clean usb floppy livecd apps test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-ide-thumbdrive
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -68,8 +79,8 @@ test-vbox-usb-image-efi: ics-os-usb.img
 
 clean:
 	rm -f vmdex
-	rm -f ics-os-livecd.iso ics-os-usb.img ics-os-gpt.img
-	rm -fr tmp/* tmp-usb
+	rm -f ics-os-livecd.iso ics-os-usb.img ics-os-gpt.img ics-os-dist.img ics-os-dist-test.img
+	rm -fr tmp/* tmp-usb /tmp/icsos-gcc/rt
 	make -C kernel/ clean
 
 update_kernel_only: vmdex
@@ -113,6 +124,61 @@ usb: apps prep_image
 	chmod +x scripts/mkusb.sh
 	ICSOS_USB_SIZE_MB=$${ICSOS_USB_SIZE_MB:-128} scripts/mkusb.sh
 	rm -fr tmp/ tmp-usb
+
+# Host-built GCC toolchain pieces the distribution ships: the cc1 compiler
+# proper, the thin gcc driver, and the five SDK runtime objects the driver
+# links against. All are self-contained ELF64 (SDK flags) so they run in-OS.
+dist-tools: vmdex
+	@if [ ! -s /tmp/icsos-gcc/cc1 ]; then echo "Building host cc1 (slow, one-time)..."; $(MAKE) -C contrib/gcc cc1; fi
+	@echo "Building gcc driver + SDK runtime objects..."
+	@$(MAKE) -C contrib/gccdriver
+	@mkdir -p /tmp/icsos-gcc/rt
+	@gcc $(HOSTG_RTFLAGS) -c sdk/crt1.c    -o /tmp/icsos-gcc/rt/crt1.o
+	@gcc $(HOSTG_RTFLAGS) -c sdk/tccsdk.c  -o /tmp/icsos-gcc/rt/tccsdk.o
+	@gcc $(HOSTG_RTFLAGS) -c sdk/libtcc1.c -o /tmp/icsos-gcc/rt/libtcc1.o
+	@gcc $(HOSTG_RTFLAGS) -c sdk/posix.c   -o /tmp/icsos-gcc/rt/posix.o
+	@gcc $(HOSTG_RTFLAGS) -c sdk/setjmp.c  -o /tmp/icsos-gcc/rt/setjmp.o
+
+# Stage the full distribution content into tmp/ (reuses the plain-USB staging,
+# then adds the GCC toolchain + the runtime objects the driver links against).
+prep-dist: prep_image dist-tools
+	@mkdir -p tmp/apps/ldscripts
+	@cp /tmp/icsos-gcc/cc1 tmp/apps/cc1.exe
+	@cp contrib/gccdriver/gcc.exe tmp/apps/gcc.exe
+	@cp /tmp/icsos-gcc/rt/crt1.o /tmp/icsos-gcc/rt/tccsdk.o /tmp/icsos-gcc/rt/libtcc1.o \
+	  /tmp/icsos-gcc/rt/posix.o /tmp/icsos-gcc/rt/setjmp.o tmp/apps/
+	@cp apps/ldscripts/elf_x86_64.x* tmp/apps/ldscripts/
+	@printf 'extern int puts(const char *s);\nint main(void)\n{\n   puts("DIST_GCC_OK");\n   return 0;\n}\n' > tmp/apps/drvprobe.c
+
+# Distribution image (BIOS+UEFI FAT thumb drive) with the full toolchain.
+# autoexec seeds the SDK runtime objects into /ramdisk, then drops to the shell.
+dist: prep-dist
+	cp base/dist-autoexec.bat tmp/autoexec.bat
+	chmod +x scripts/mkusb.sh
+	ICSOS_USB_IMG=$(DIST_IMG) ICSOS_USB_SIZE_MB=$${DIST_SIZE_MB:-128} scripts/mkusb.sh
+	rm -fr tmp/ tmp-usb
+
+# Boot the distribution and prove the GCC toolchain works end-to-end: the
+# gccdrv console builtin stages drvprobe.c + the runtime objects into /ramdisk,
+# drives cc1/as/ld, and runs the resulting ELF (GCC_DRIVER_OK / DIST_GCC_OK /
+# GCC_DRV_RUN_OK). Attached via IDE like test-ide-thumbdrive.
+test-dist: prep-dist
+	@printf '%s\n' 'set PATH=/icsos/apps' 'gccdrv' 'reboot' > tmp/autoexec.bat
+	chmod +x scripts/mkusb.sh
+	ICSOS_USB_IMG=$(DIST_TEST_IMG) ICSOS_USB_SIZE_MB=$${DIST_SIZE_MB:-128} scripts/mkusb.sh
+	rm -fr tmp/ tmp-usb
+	@echo "Boot-testing the distribution (GCC end-to-end, KVM)..."
+	@-timeout 420 $(QEMU_X64) -enable-kvm -cpu host -smp 2 -display none -serial stdio \
+		-no-reboot -m 1024M \
+		-drive file=$(DIST_TEST_IMG),format=raw,if=ide -boot c < /dev/null > /tmp/icsos-dist.log 2>&1
+	@grep -aq "serial console ready" /tmp/icsos-dist.log
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-dist.log
+	@grep -aq "gccdriver: cc1 ok" /tmp/icsos-dist.log
+	@grep -aq "GCC_DRIVER_OK" /tmp/icsos-dist.log
+	@grep -aq "DIST_GCC_OK" /tmp/icsos-dist.log
+	@grep -aq "GCC_DRV_RUN_OK" /tmp/icsos-dist.log
+	@! grep -aq "GCC_DRV_FAIL" /tmp/icsos-dist.log
+	@echo "test-dist PASS"
 
 apps:
 	-$(MAKE) -C contrib/hello
@@ -190,6 +256,26 @@ boot-usb-uefi: usb
 test-usb:
 	timeout 45 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(QEMU_MEM) \
 		$(QEMU_DISK_BOOT)
+
+# IDE (PATA) thumbdrive boot: the USB image is attached as an IDE hard disk and
+# booted via GRUB. Regression test for the MBR signature check, which compared the
+# 0x55 0xAA magic bytes against a signed char; 0xAA sign-extended to -86 and never
+# matched, so a valid MBR was reported as "PART_SCAN hdp0 bad MBR signature" and no
+# partition was registered. Asserts the MBR parses (partition registered) and the
+# partition is mounted as root, and that no GPF occurs.
+test-ide-thumbdrive: usb
+	@echo "Boot-testing USB thumbdrive image via IDE (PATA)..."
+	@-timeout 60 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
+		$(QEMU_DISK_BOOT) \
+		< /dev/null > /tmp/icsos-ide-thumbdrive.log 2>&1
+	@grep -aq "serial console ready" /tmp/icsos-ide-thumbdrive.log
+	@grep -aq "Mounting boot device hdp0" /tmp/icsos-ide-thumbdrive.log
+	@grep -aq "PART_REG hdp0 hdp0p0" /tmp/icsos-ide-thumbdrive.log
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-ide-thumbdrive.log
+	@! grep -aq "bad MBR signature" /tmp/icsos-ide-thumbdrive.log
+	@! grep -aq "no root filesystem mounted" /tmp/icsos-ide-thumbdrive.log
+	@! grep -aq "General Protection fault" /tmp/icsos-ide-thumbdrive.log
+	@echo "test-ide-thumbdrive PASS"
 
 # UEFI thumbdrive boot: OVMF loads EFI/BOOT/BOOTX64.EFI from the USB stick,
 # then the kernel re-detects the USB mass-storage device and mounts it as root.
@@ -1168,6 +1254,21 @@ test-kbuild: test-gcc-kbuild
 # the SDK runtime are rebuilt in ICS-OS, the rebuilt cc1 builds a new gcc
 # driver, and that in-OS-built toolchain rebuilds + kexecs the kernel. The new
 # kernel must then pass SMP, ELF exec, and GCC/binutils capability checks.
+# CERT_TIMEOUT overrides the QEMU wall-clock bound (seconds) for bounded
+# diagnostic runs of this otherwise multi-hour closure build.
+CERT_TIMEOUT ?= 28800
+# Multi-core closure knobs. The serial closure boots `selfhost-stage1` with a
+# single vCPU; the parallel closure boots `selfhost-stage1-parallel`, which
+# starts the APs and lets the in-OS GCC driver build run with make -jN (see
+# kernel/console/selfhost.c). Overridden by test-selfhost-cert-parallel.
+SELFHOST_CMDLINE ?= selfhost-stage1
+SELFHOST_SMP ?= 1
+SELFHOST_MEM ?= 2048M
+# COM2 (0x2F8) interactive shell endpoint. QEMU's second -serial maps to COM2;
+# 'nowait' lets the guest boot without a client, and a telnet client can then
+# attach for live command execution / introspection without a reboot:
+#   telnet 127.0.0.1 4555
+COM2_TELNET ?= 127.0.0.1:4555
 test-selfhost-cert: vmdex apps/as.exe apps/ld.exe apps/ar.exe apps/hello.exe apps/make.exe apps/objcopy.exe apps/cp.exe apps/mkdir.exe apps/rm.exe
 	@echo "Updating stage-1 cc1 seed (contrib/gcc)..."
 	@$(MAKE) -C contrib/gcc cc1
@@ -1210,16 +1311,17 @@ test-selfhost-cert: vmdex apps/as.exe apps/ld.exe apps/ar.exe apps/hello.exe app
 		> /tmp/icsos-gccself-iso/autoexec.bat
 	@printf '%s\n' 'set PATH=/icsos/apps' 'exectest' 'gccclosed' 'kexeccert' 'reboot' \
 		> /tmp/icsos-gccself-iso/postkexec.bat
-	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex selfhost-stage1; boot }' \
+	@printf 'set timeout=0\nmenuentry "ics" { multiboot2 /vmdex $(SELFHOST_CMDLINE); boot }\n' \
 		> /tmp/icsos-gccself-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-gccself.iso /tmp/icsos-gccself-iso >/dev/null 2>&1
 	@truncate -s 512M /tmp/icsos-gccself-work.img
 	@mkfs.vfat -F 16 -s 32 /tmp/icsos-gccself-work.img >/dev/null
 	@echo "Running strict GCC self-host closure test (may take several hours)..."
 	@rm -f /tmp/icsos-gccself.log
-	@-timeout 28800 $(QEMU_X64) -enable-kvm -cpu host -smp 1 \
-		-display none -monitor none -serial file:/tmp/icsos-gccself.log \
-		-no-reboot -m 2048M -cdrom /tmp/icsos-gccself.iso -boot d \
+	@-timeout $(CERT_TIMEOUT) $(QEMU_X64) -enable-kvm -cpu host -smp $(SELFHOST_SMP) \
+  		-display none -monitor none -serial file:/tmp/icsos-gccself.log \
+		-serial telnet:$(COM2_TELNET),server,nowait \
+		-no-reboot -m $(SELFHOST_MEM) -cdrom /tmp/icsos-gccself.iso -boot d \
 		-drive file=/tmp/icsos-gccself-work.img,if=none,id=vd0,format=raw \
 		-device virtio-blk-pci,drive=vd0,disable-legacy=on \
 		< /dev/null
@@ -1244,6 +1346,15 @@ test-selfhost-cert: vmdex apps/as.exe apps/ld.exe apps/ar.exe apps/hello.exe app
 	@grep -aq "KEXEC_CAPABILITY_PASS" /tmp/icsos-gccself.log
 	@! grep -aq "GCC_SELF_.*FAIL\|GMAKE_SELF_FAIL\|GCC_DRV_FAIL\|GCC_CLOSED_TOOLCHAIN_FAIL\|GKBUILD_TEST_FAIL\|KEXEC_CAPABILITY_FAIL\|GCC_E2E_FAIL\|POOL EMPTY\|userpd map failed" /tmp/icsos-gccself.log
 	@echo "test-selfhost-cert PASS"
+
+# Multi-core strict self-host closure. Identical to test-selfhost-cert but boots
+# the `selfhost-stage1-parallel` kernel cmdline on 4 vCPUs with 4 GiB so the
+# in-OS GCC driver build runs make -j4 (see kernel/console/selfhost.c and
+# contrib/gcc/Selfhost.mk). The extra memory headroom covers 4 concurrent cc1
+# frontends plus their page-cache pressure.
+test-selfhost-cert-parallel:
+	@$(MAKE) test-selfhost-cert SELFHOST_CMDLINE=selfhost-stage1-parallel \
+		SELFHOST_SMP=4 SELFHOST_MEM=4096M
 
 # Full QEMU integration suite for the x86_64 / SMP / ELF64 path.
 test-integration: vmdex apps/hello.exe

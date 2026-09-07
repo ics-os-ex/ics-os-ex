@@ -27,6 +27,12 @@
 
 #include "console.h"
 #include "klog.h"
+#include "../process/sync.h"
+
+/* COM2 shell (shell2) line-discipline echo flag. Telnet clients typically
+   perform local echo themselves, so echo defaults ON but can be disabled with
+   'stty noecho' to avoid double-echoing. See shell2_main() below. */
+static volatile int shell2_echo = 1;
 
 static int cc1_window_contains(const char *hay, int hlen, const char *needle)
 {
@@ -195,26 +201,28 @@ int user_fork(){
  * Function that reads an executable and creates a new process for it.
  */
 int user_execp(char *fname, DWORD mode, char *params){
-   static char cached_name[256];
-   static char *cached_buf;
-   static DWORD cached_size;
-   DWORD id,size;
-   char *buf;
-   int from_cache = 0;
+    DWORD id,size;
+    char *buf;
 
-   if (cached_buf && strcmp(cached_name, fname) == 0){
-      buf = cached_buf;
-      size = cached_size;
-      from_cache = 1;
-   } else {
-      /* File-backed eager mmap: one contiguous fill via coalesced FAT I/O. */
-      buf = (char*)vfs_mapfile(fname, &size);
-      if (!buf)
-         return 0;
-   }
+    /* Serialize the eager ELF map + load path with sys_spawn().  The previous
+       per-image cache was not safe under SMP: two concurrent callers could map
+       different images into the same static buffer, and the first waiter could
+       free an image still in use by the second loader.  The loader copies every
+       PT_LOAD into the child's private frames before returning, so the image
+       buffer can be freed immediately after dex32_loader() and does not need to
+       stay alive while the child runs.  Holding the crit only across map+load
+       also bounds kernel-heap pressure from large concurrent cc1.exe images. */
+     printf("ELFCRIT enter %s pid=%d (execp)\n", fname, (int)getprocessid());
+     sync_entercrit(&elf_map_crit);
+     printf("ELFCRIT held %s pid=%d (execp)\n", fname, (int)getprocessid());
+     buf = (char*)vfs_mapfile(fname, &size);
+     if (!buf){
+        printf("ELFCRIT leave-nobuf %s pid=%d (execp)\n", fname, (int)getprocessid());
+        sync_leavecrit(&elf_map_crit);
+        return 0;
+     }
 
-   printf("execp: loading %s (%u bytes)%s\n", fname, (unsigned)size,
-           from_cache ? " [cached]" : " [mmap]");
+    printf("execp: loading %s (%u bytes) [mmap]\n", fname, (unsigned)size);
     {
          char temp[255];
 
@@ -222,41 +230,41 @@ int user_execp(char *fname, DWORD mode, char *params){
             kthread path can starve under software scheduling while the console
             spins on pd_ok(). */
          id = dex32_loader(fname, buf, userspace, mode, params,
-                          showpath(temp), current_process);
+                           showpath(temp), current_process);
 
-         if (!id || (int)id == -1){
-            printf("execp: failed to start %s\n", fname);
-            if (!from_cache){
-               free(buf);
-               cached_buf = 0;
-               cached_name[0] = 0;
-            }
-            return 0;
-         }
+        if (!id || (int)id == -1){
+             printf("execp: failed to start %s\n", fname);
+             free(buf);
+             printf("ELFCRIT leave %s pid=%d (execp fail)\n", fname, (int)getprocessid());
+             sync_leavecrit(&elf_map_crit);
+             return 0;
+          }
+          free(buf);
+          printf("ELFCRIT leave %s pid=%d (execp id=%d)\n", fname, (int)getprocessid(), (int)id);
+          sync_leavecrit(&elf_map_crit);
+
          printf("execp: started pid=%d, waiting\n", (int)id);
-         fg_setmykeyboard(id);
-         int child_status = 0;
-         dex32_child_faulted = 0;
-         /* Consume the direct child's retained status. A process-global fault
-            flag can be set by a faulting grandchild and must not classify its
-            healthy parent as failed. */
-         if (sys_waitpid((int)id,&child_status,0)!=(long)id)
-            child_status = 1;
+          fg_setmykeyboard(id);
+          int child_status = 0;
+          dex32_child_faulted = 0;
+          printf("execp: waitpid enter pid=%d\n", (int)id);
+          /* Consume the direct child's retained status. A process-global fault
+             flag can be set by a faulting grandchild and must not classify its
+             healthy parent as failed. */
+          if (sys_waitpid((int)id,&child_status,0)!=(long)id)
+             child_status = 1;
+          printf("execp: waitpid exit pid=%d status=%d\n", (int)id,
+                 child_status);
          dex32_child_faulted = child_status != 0;
 
          fg_setmykeyboard(getprocessid());
-         if (!from_cache){
-            /* Do not cache ELF images across runs: user processes share
-               pagedir1 and a stale buffer can be left inconsistent after exit. */
-            free(buf);
-         }
          if (dex32_child_faulted) {
             printf("execp: child faulted\n");
             return 0;
          }
          return id;
-   };
-};
+    };
+ };
 
 int exec(char *fname, DWORD mode, char *params){
    DWORD id;
@@ -829,8 +837,70 @@ int console_execute(const char *str){
       };
    }else
    if (strcmp(u,"meminfo") == 0){   //-- Show memory map information.
-      mem_interpretmemory(memory_map,map_length);
-   }else
+       mem_interpretmemory(memory_map,map_length);
+    }else
+    if (strcmp(u,"pf64stats") == 0){  //-- Demand-paging (PF64-DIAG) counters.
+       extern void pf64_stats(unsigned long*,unsigned long*,unsigned long*,
+                              unsigned long*,unsigned long*);
+       unsigned long t,r,e,h,p;
+       pf64_stats(&t,&r,&e,&h,&p);
+       printf("pf64stats: demand_total=%lu recovered=%lu elf-region=%lu committed-heap=%lu past-brk=%lu\n",
+              (unsigned long)t,(unsigned long)r,(unsigned long)e,(unsigned long)h,(unsigned long)p);
+    }else
+    if (strcmp(u,"brk") == 0){        //-- Show the break/heap pointers of a process. Args: <pid>
+       extern PCB386 *ps_findprocess(DWORD);
+       int pid;
+       u = strtok(0," ");
+       if (u != 0) {
+          pid = atoi(u);
+          {
+             PCB386 *pp = ps_findprocess((DWORD)pid);
+             if (pp && pp != (PCB386 *)-1) {
+                printf("brk pid=%d name=%s\n", pid, pp->name);
+                printf("  knext (heap end) = %p\n", (void *)pp->knext);
+                printf("  mmap_brk         = %p\n", (void *)pp->mmap_brk);
+                printf("  pagedirloc       = %p\n", (void *)pp->pagedirloc);
+             } else {
+                printf("brk: no process %d\n", pid);
+             }
+          }
+       } else {
+          printf("brk: usage: brk <pid>\n");
+       }
+    }else
+    if (strcmp(u,"heap") == 0){       //-- Show the heap layout of a process. Args: <pid>
+       extern PCB386 *ps_findprocess(DWORD);
+       int pid;
+       u = strtok(0," ");
+       if (u != 0) {
+          pid = atoi(u);
+          {
+             PCB386 *pp = ps_findprocess((DWORD)pid);
+             if (pp && pp != (PCB386 *)-1) {
+                printf("heap pid=%d name=%s\n", pid, pp->name);
+                printf("  knext (heap end) = %p\n", (void *)pp->knext);
+                printf("  mmap_brk         = %p\n", (void *)pp->mmap_brk);
+                printf("  pagedirloc       = %p\n", (void *)pp->pagedirloc);
+             } else {
+                printf("heap: no process %d\n", pid);
+             }
+          }
+       } else {
+          printf("heap: usage: heap <pid>\n");
+       }
+    }else
+    if (strcmp(u,"stty") == 0){       //-- COM2 shell line discipline: stty echo | noecho
+       u = strtok(0," ");
+       if (u && strcmp(u,"echo") == 0) {
+          shell2_echo = 1;
+          printf("stty: com2 shell echo on\n");
+       } else if (u && strcmp(u,"noecho") == 0) {
+          shell2_echo = 0;
+          printf("stty: com2 shell echo off\n");
+       } else {
+          printf("stty: com2 shell echo=%d  (usage: stty echo | stty noecho)\n", shell2_echo);
+       }
+    }else
    if (strcmp(u,"pause") == 0){     //-- Waits for a key press
       printf("press any key to continue or 'q' to quit..\n");
       if (getch() == 'q') 
@@ -1698,8 +1768,97 @@ void console_main(){
          sendtokeyb(last,&_q);
          sendtokeyb("\r",&_q);
       }
-      else   
-         console_execute(s);
-   } while (1);
+      else
+          console_execute(s);
+    } while (1);
 };
+
+/* shell2: an interactive terminal on COM2 (0x2F8) for live command execution
+   and kernel introspection without a QEMU/OS reboot. Reads a line from COM2,
+   echoes it (unless echo is disabled), and dispatches it through the same
+   console_execute() interpreter the built-in console uses. Command output
+   (printf) is mirrored to COM2 via serial2_mirror so the shell sees results
+   on the same port it types on.
+
+   The line discipline is telnet-compatible:
+     * CR (0x0d) is the Enter key (telnet clients send CR, not LF); a trailing
+       LF (CRLF) is swallowed so it does not submit an empty line.
+     * Both DEL (0x7f) and BS (0x08) act as backspace.
+     * Ctrl-C (0x03) aborts the current line.
+   Echo is controlled by the 'stty echo' / 'stty noecho' console commands
+   (see shell2_echo above), because telnet clients typically do local echo
+   themselves and would otherwise double-echo. */
+void shell2_main(void)
+{
+    static char line[512];
+    int len = 0;
+    int saw_cr = 0;
+    extern int serial2_getc(void);
+    extern void serial2_putc(char c);
+    extern void serial2_puts(const char *s);
+    extern void serial2_mirror_set(int on);
+    extern void taskswitch(void);
+
+    serial2_mirror_set(1);
+    serial2_puts("\r\n[ICS-OS com2 shell] type 'help' for commands, 'exit' to quit\r\n");
+    serial2_puts("com2> ");
+    while (1) {
+        int c = serial2_getc();
+        if (c < 0) {
+            taskswitch();
+            continue;
+        }
+        if (c == '\r') {
+            /* telnet Enter: submit the line. */
+            line[len] = 0;
+            if (len > 0) {
+                if (shell2_echo) serial2_puts("\r\n");
+                console_execute(line);
+            }
+            len = 0;
+            saw_cr = 1;
+            serial2_puts("com2> ");
+        } else if (c == '\n') {
+            /* LF: if it trails a CR (CRLF) swallow it, else treat as Enter. */
+            if (saw_cr) {
+                saw_cr = 0;
+            } else {
+                line[len] = 0;
+                if (len > 0) {
+                    if (shell2_echo) serial2_puts("\r\n");
+                    console_execute(line);
+                }
+                len = 0;
+                serial2_puts("com2> ");
+            }
+        } else if (c == 127 || c == 8) {
+            /* DEL or BS backspace. */
+            if (len > 0) {
+                len--;
+                if (shell2_echo) serial2_puts("\b \b");
+            }
+            saw_cr = 0;
+        } else if (c == 3) {
+            /* Ctrl-C: abort the current line. */
+            len = 0;
+            saw_cr = 0;
+            if (shell2_echo) serial2_puts("^C\r\n");
+            serial2_puts("com2> ");
+        } else if (c >= 32 && c < 127) {
+            if (len < 511) {
+                line[len++] = (char)c;
+                if (shell2_echo) serial2_putc((char)c);
+            }
+            saw_cr = 0;
+        } else {
+            saw_cr = 0;
+        }
+    }
+}
+
+DWORD shell2_start(void)
+{
+    extern DWORD createkthread_on_cpu(void *ptr, char *name, DWORD stacksize, int cpu);
+    return createkthread_on_cpu((void*)shell2_main, "shell2", 32768, 0);
+}
 

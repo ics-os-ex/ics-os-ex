@@ -1,5 +1,161 @@
 # Development blog
 
+## 2026-09-04 (Manila, UTC+8)
+
+### 14:00 — GCC self-host: `as` OOM root-caused; SDK `malloc` slab allocator fix
+**Objective:** continue Round-4 compiler closure. The first full
+`test-selfhost-cert` background run failed while assembling
+`/work/gccobj/cc1/insn-attrtab.o`.
+
+**Failure signature:**
+`sbrk DENIED /icsos/apps/as.exe: ret=0x3fcff010 pages=1 limit=0x3fd00000`,
+`out of memory allocating 8 bytes`, `can't close insn-attrtab.o: Memory
+exhausted`, `GCC_SELF_CERT_FAIL make bootstrap`. `insn-attrtab.c` is 6.3 MB /
+175,354 lines. Free frames were ~900 MiB, so physical RAM was **not** the
+binding constraint — the ~1 GiB per-process user-VA cap (`MEM_USER_HEAP_LIMIT`
+= `0x3FD00000`) was.
+
+**Root cause:** the SDK `malloc` (`sdk/tccsdk.c`) did **one `sbrk()` per fresh
+block**, and the kernel `dex32_sbrk` (`kernel/memory/dexmem.c`) rounds every
+request up to a full 4096-byte page (`pages=(amt/4096)+1`). So every small
+allocation consumed its own 4 KiB page. GAS makes one symbol/frag per input
+line (~250k blocks for `insn-attrtab`), so ~250k blocks × 4 KiB ≈ 1 GiB of
+pure page-rounding waste for a few-MB object → hit the VA cap.
+
+**Fix:** new blocks are now carved from a shared page-aligned **slab**
+(≥ 64 KiB) so many small blocks share pages; blocks > 1 MiB still get their
+own page-aligned `sbrk` region. The per-bucket freelist reuse path is
+unchanged. This drops `as`'s heap from ~1 GiB to the size of its actual live
+data (~tens of MiB).
+
+**Validation (fast gates, all green with the new allocator):**
+`make test-bintools` PASS (as/ld/ar in-OS), `make test-fork` FORK_CPUS=2 PASS,
+`make test-exec` PASS. Rebuilt `apps/{as,ld,ar,objcopy}.exe` + stage-1
+`cc1`/`gcc`/`make` all relink against the new `tccsdk.c`. Kicking off the full
+`test-selfhost-cert` closure to confirm `insn-attrtab.o` assembles.
+
+### 15:40 — `insn-attrtab.o` assembled: the OOM blocker is cleared
+
+Relaunched the full closure (`make test-selfhost-cert CERT_TIMEOUT=7200`) with
+the slab `malloc`. It ran cleanly through cc1 object #129 and then
+**assembled `insn-attrtab.o`** (`gccdriver: wrote /work/gccobj/cc1/insn-attrtab.o`;
+`as ok` and `cc1 ok` both reached 130) with **no** `sbrk DENIED`,
+`Memory exhausted`, or `out of memory`. That is the exact step that killed the
+previous run, so the root cause (one sbrk page per small block) is confirmed
+fixed in the real closure. The closure continues: ~219 more cc1 objects, then
+link `cc1.exe`, rebuild `gcc.exe` with the rebuilt cc1, `loop.o`, make rebuild,
+and the kernel rebuild + kexec.
+
+### 09:00 — GCC self-host: binutils closure unblocked + Round-4 closure baseline measured
+
+**Objective:** continue kernel + GCC 4.7.4 self-hosting toward Round 4 (compiler
+closure), measure in-OS compile-time performance, and fix errors / add kernel
+enhancements as necessary.
+
+**Binutils `LD_FAIL` root cause (unblocks the toolchain path):** the in-OS
+`ld` failed because the SDK `stat()` path reported every file as non-directory.
+`sys_fstat_fd` (`kernel/vfs/posixfd.c`) now sets `S_IFDIR` in `st_mode` when
+`f->ptr->attb & FILE_DIRECTORY` and reports the stable `st_dev`/`st_ino`; this
+was already at HEAD, and re-running the gate confirms it:
+- `make test-bintools` → **PASS** (13.3s): `AS_PASS`, `AR_PASS`, `LD_PASS`,
+  `LD_EXEC_PASS`, `BINTOOLS_PASS`. The `ld` "can't open ldscript" / directory
+  confusion is gone.
+
+**Garbled `ld` output explained (not a printf bug):** (a) SDK `strerror()`
+(`sdk/posix.c:892`) returns the literal string `"error"` for every errno;
+(b) `vfinfo` (`ldmisc.c`) writes literal text via `fwrite` (syscall 0x45) with
+`fp==(FILE*)1` — the kernel `fwrite` (`vfs_core.c:1305`) requires a valid
+`file_PCB*`, `file_ok(1)` fails, so that literal text is silently dropped; only
+`fprintf("%s")` (via `do_printf` → `charputc` → syscall 6) reaches the console.
+
+**All GCC baseline gates confirmed green** (host-seeded path): `test-cc1`
+(1m03s), `test-gcc` (56s), `test-gccdriver` (33s), `test-kbuild`/`test-gcc-kbuild`
+(9m39s; `KBUILD_TEST_PASS`, `GKBUILD_LINK_OK`, `KEXEC_BOOT_OK`,
+`KEXEC_CAPABILITY_PASS`). The fstat change is validated on the in-OS GCC kernel
+build (include resolution intact).
+
+**Round-4 (compiler closure) is scaffolded** as `test-selfhost-cert`:
+in-OS make runs `contrib/gcc/Selfhost.mk` to rebuild ~441 objects (349 cc1 +
+15 libcpp + 44 libiberty + 15 libdec + 13 zlib + 5 runtime), links `cc1.exe`,
+uses the *rebuilt* cc1 to build a new `gcc.exe`, compiles `loop.o` with that
+driver, rebuilds make, then rebuilds + kexecs the kernel with provenance
+`in-os-rebuilt`. Post-kexec must pass SMP, ELF exec, and GCC/binutils capability
+checks.
+
+**Kernel enhancement this session (compile-time instrumentation + bounded runs):**
+- `kernel/console/selfhost.c`: added `GKBUILD_TIME <phase> phase=N s cum=N s`
+  marks anchored by `time_count` in `gccselfhost_run` (gcc-rebuild /
+  make-rebuild) and `gmake_kbuild_run` (kbuild-extract / kbuild-make) so a
+  closure run yields a per-phase compile-time profile.
+- `Makefile`: `test-selfhost-cert` now honors `CERT_TIMEOUT ?= 28800` so the
+  multi-hour closure can be bounded for diagnostics.
+
+**Round-4 baseline (bounded 12-min `test-selfhost-cert CERT_TIMEOUT=720`):**
+staged 3240 GCC source files (148 MiB); boot clean (`APIC id=0`, APs
+`deferred for self-host kexec`, `Root mount [OK]`, `work: mounted`),
+`GCC_SELF_BEGIN` + `GCC_SELF_ORCHESTRATOR GNU_MAKE_3_82` printed, **no FAIL /
+error markers**. 22/349 cc1 objects compiled cleanly in ~11 min of build
+(~31 s/object on the heavy `c-family` units), `cc1-1.a` created, memory ~95%
+free. The fstat change is validated on the GCC build's include resolution.
+
+**Performance diagnosis (compile time):** the closure is **serial and
+uniprocessor by architecture** — `selfhost-stage1` leaves APs in reset
+(`kernel32.c:596-602`) because the BSP kexecs a new kernel image (APs cannot run
+the old image during kexec). Per-compile overhead was already reduced on
+2026-09-01 (`-quiet`, 4 KiB FILE buffering → syscalls 209 K→38 K, 18 archives →
+−331 `ar` launches, 2 GiB VM, waitpid exit-code propagation, 4096-byte spawn
+buffer). The remaining cost is genuine single-core cc1 compilation in the KVM
+guest (~2.5–3 h full build, fresh work disk each run so no resumability benefit).
+The one remaining lever (AP-parallel object builds) is blocked by the kexec
+requirement; the safe path is to bring APs up for the build and park them before
+kexec — deferred as a risky, needs-its-own-validation change, not made here.
+
+**Current problem / next step:** the bounded run only covered the first 22 cc1
+objects; the closure-critical later stages (link `cc1.exe`, rebuilt-cc1 →
+`gcc.exe`, `loop.o`, make rebuild, kernel rebuild) were not reached. **Next:**
+run the full `make test-selfhost-cert` (~3 h, 2 GiB) to validate the closure and
+close Round 4, watching for the first blocker in the link/rebuild stages.
+
+### 04:30–05:15 — `test-dist` green: FAT LFN padding corrupted long-name VFS nodes
+
+**Current problem:** `make test-dist` (BIOS+UEFI FAT thumb-drive distribution
+with the in-OS GCC toolchain) failed at the link step. `cc1` and `as` succeeded,
+but `ld` could not open `/icsos/apps/ldscripts/elf_x86_64.xc`, so
+`GCC_DRIVER_OK`/`DIST_GCC_OK`/`GCC_DRV_RUN_OK` never printed. A diagnostic
+autoexec (`type <long-named file>`) confirmed short 8.3 names opened fine while
+every long name printed `error opening file.`
+
+**Root cause:** some FAT writers (mformat/mtools) pad the unused tail of a
+long-name sub-component with `0x0020` (space) and terminate the name with
+`0xFFFF`. Hexdumping the `ldscripts` LFN entry showed
+`name1="ldscr"`, `name2="ipts"+0x20+0x20`, `name3=0xFFFF+0xFFFF`. But
+`unicodetoascii()` (`kernel/filesystem/fat12.c`) stopped only at `0x0000`, so it
+swallowed the space padding and the `0xFFFF` marker (as `0xFF` bytes). The node
+name became `"ldscripts  \xFF\xFF"`, and `vfs_nameeq()` (case-insensitive but
+exact-until-null) failed at the first trailing byte, so `vfs_searchname()`
+returned NULL. Full 13-char names (e.g. `buildtest.exe`) had no padding and were
+unaffected — which is why only some long names broke.
+
+**Fixes:**
+- `unicodetoascii()` now stops at `0x0000` **or** `0xFFFF`.
+- `fat_mount()` trims trailing `0x0020`/`0x0000` padding from the reconstructed
+  name before applying it to the VFS node (falling back to the short name if the
+  trim empties it).
+- `Makefile` `test-dist` asserted a non-existent `GCC_DRV_OK` marker; it now
+  checks `DIST_GCC_OK` (the compiled program's actual output — the strongest
+  end-to-end proof). The real markers are `GCC_DRIVER_OK` (driver), `DIST_GCC_OK`
+  (program stdout), and `GCC_DRV_RUN_OK` (builtin confirmed exec).
+
+**Verification (all green, serial oracle):**
+- `make test-dist` → **PASS** (`gccdriver: cc1 ok`/`as ok`/`ld ok`,
+  `GCC_DRIVER_OK`, `DIST_GCC_OK`, `GCC_DRV_RUN_OK`; no `GCC_DRV_FAIL`).
+- `make test-ide-thumbdrive` (FAT root + MBR) → PASS.
+- `make test-integration` (boot+smp+exec) → PASS.
+- `make test-spawn` (FAT `/work` on virtio) → PASS.
+
+Docs updated: AGENTS.md test table and the QA plan's GCC-path row now list
+`test-dist` with the FAT-LFN regression note.
+
 ## 2026-09-03 (Manila, UTC+8)
 
 ### 12:51–13:51 — test-kbuild regression fix: shell-free warncheck recipe, real `-w` strip, in-OS skip
@@ -3644,3 +3800,229 @@ Verification (all green, serial oracle):
 **Next:** IDE MBR partition-scan fix (so the thumbdrive also boots via IDE), and
 optionally a split-OVMF (pflash) variant in the test for hosts without the
 combined `OVMF.fd`.
+
+## 2026-09-04 (Manila, UTC+8)
+
+### 00:10–01:40 — IDE thumbdrive boot fixed: root-caused the `bad MBR signature` to a **signed-`char`** magic check
+
+**Current problem:** booting the thumbdrive image via *IDE/PATA*
+(`-drive …,if=ide`) failed with `PART_SCAN hdp0 bad MBR signature;
+unpartitioned`, so no partition registered and root never mounted. This was the
+"Next" item from the UEFI thumbdrive work (2026-09-03).
+
+**Debugging difficulty (the real cost was here, not the fix):**
+- **Stale USB image.** Manual QEMU runs against `ics-os-usb.img` boot the kernel
+  *embedded in the image*, not `kernel/vmdex`. After any kernel change the image
+  had to be rebuilt with `make usb` or the new diagnostics never appeared, which
+  looked like the code "wasn't running" and burned several rounds.
+- **A wrong hypothesis chased for a while.** The first theory was an ATA
+  post-command BSY timing race (stale zeroed read buffer). A defensive
+  `reg_wait_cmd_set_busy()` helper was added to `ataioreg.c` and `ec=32` was
+  suspected. **Both disproven** — the read buffer in fact held the correct
+  `[eb 63 … 55 aa]` bytes; the data was fine. That speculative change was
+  reverted to keep the diff minimal.
+
+**Root cause:** `partition_mbr.magic_value` was declared `char magic_value[2]`
+(signed) in `ide.c`. The MBR magic byte `0xAA` (170) exceeds signed-`char` max
+(127), so it is stored as `-86`. The check `mbr->magic_value[1] != 0xAA` then
+evaluated `-86 != 170` → true, so a *valid* MBR was rejected as a bad signature.
+The raw buffer bytes were always correct; only the comparison type was wrong.
+
+**Fix (`kernel/hardware/ATA/ide.c`):**
+- `partition_mbr`: `char magic_value[2]` → `BYTE magic_value[2]` (`BYTE` =
+  `unsigned char`, already used for the struct's `active_flag`/`type`). This is
+  the one-line root-cause fix.
+- `ide_readsectors()`: now captures the `reg_pio_data_in_lba()` return and, on
+  failure, logs `IDE read LBA … failed: ec/st2/as2` and returns 0 instead of
+  silently returning success with a garbage buffer (the exact failure class we
+  just debugged). Kept as a small, in-path correctness improvement.
+
+**Regression test (`ics-os/Makefile` `test-ide-thumbdrive`):** boots
+`ics-os-usb.img` attached as an IDE disk and asserts `serial console ready`,
+`Mounting boot device hdp0`, `PART_REG hdp0 hdp0p0 …`, `Root mount [OK]`, and
+absence of `bad MBR signature` / `no root filesystem mounted` / `General
+Protection fault`. **Verified it fails for the original cause:** reverting the
+`BYTE`→`char` fix reproduces `bad MBR signature` + no `PART_REG` + no root mount
+(test errors); re-applying the fix makes it PASS.
+
+**Sweep of the other MBR/FAT magic checks (no bug):** `gpt.c` uses
+`unsigned char mbr[512]`, `uhci.c` uses `unsigned char mbr[512]`, and the
+`BPB.magic` field (`fat12.h`) is `BYTE`. So the signed-`char` defect was isolated
+to the `partition_mbr` struct; the others compare against unsigned bytes already.
+
+**Verification (all green, serial oracle):**
+- `make test-ide-thumbdrive` → PASS (IDE/PATA thumbdrive root via GRUB).
+- `make test-integration` (boot+smp+exec) → PASS; `make test-partition-unit`
+  (15/15 TAP) → PASS.
+- Kernel host build clean; `ide.c` diff is only the `BYTE` field + the
+  `ide_readsectors` error propagation; `ataioreg.c` reverted to original.
+
+**Next:** optionally apply the same defensive `ide_writesectors` error
+propagation for symmetry; document IDE thumbdrive boot in the developer guide.
+
+## 2026-09-05 (Manila, UTC+8)
+
+### 07:55 — Round-4 GCC closure: I/O performance fixes (per-op FAT reload + vblk 4 KiB cap)
+
+**Current problem:** the strict `test-selfhost-cert` closure stalls at cc1 object
+#136 (`insn-opinit`). After `insn-modes.o` (obj #135) writes and `GCC_DRIVER_OK`,
+the `gcc.exe` driver watchdog shows `no-yield` climbing with `sc_total` frozen and
+`rip=0x10df32`, then `cc1.exe` faults with `PF64 cr2=0xa041000 rip=0x1096154
+err=0x2` (not-present, user window). The question is whether this is a true hang,
+a past-brk heap overflow masked by fail-open demand paging, an under-committed
+heap page, or simply extreme I/O slowness.
+
+**Activity in progress:** debug I/O and compile performance (target: no slower than
+an equivalent Linux system) and relaunch the closure.
+
+**I/O investigation findings (subagent sweep of the read/write path):**
+- The dominant bottleneck is a **per-operation full FAT reload**. On the FAT16
+  `/work` disk (16 KiB clusters, `mkfs.vfat -F 16 -s 32`), every `loadfile12EX2` /
+  `writefile12EX2` does `malloc + loadfat` of the *entire* 2 MiB FAT, even though
+  data I/O never modifies the FAT. For a 1 MiB `.o` that is ~256 full FAT reloads
+  (≈ 512 MiB of block I/O, ~512× amplification).
+- The 4 KiB page cache (`blkcache.c`, 512 pages) is exactly the FAT size, so the
+  FAT and the file data cannot coexist; they thrash each other out of the cache.
+- The virtio-blk driver had a **4 KiB hard cap** (`VBLK_BOUNCE=4096`,
+  `vblk_rw_chunks` splits every I/O into 4 KiB round-trips), so even the page
+  cache's 128 KiB read-merge runs were served as 32 × 4 KiB transfers.
+
+**Fixes applied (both build clean via `make -C kernel bzImage`):**
+1. **Per-device FAT RAM cache** (`kernel/filesystem/fat12.c`): new
+   `fat_cache_get` / `fat_cache_invalidate` / `fat_cache_freeall`. `loadfile12EX2`
+   and `writefile12EX2` now reuse a cached FAT instead of re-reading 2 MiB on every
+   operation. The cache is invalidated only in `update_fats` (the sole on-disk FAT
+   writer, reached via `update_dirs_fats`) and carries a `devmgr_get_generation`
+   check so a USB hot-plug replacement with the same device id cannot read a stale
+   FAT. Falls back to a temporary load if the 4-slot cache is full.
+2. **virtio-blk bounce cap lifted 4 KiB → 64 KiB**
+   (`kernel/hardware/virtio/virtio_blk.c`): `VBLK_BOUNCE=65536`. `nslots ≤
+   VIRTIO_QUEUE_MAX/3 = 42`, so the bounce ring stays ~2.75 MiB; a 128 KiB read
+   merge is now ≤ 2 descriptors instead of 32.
+
+**Also carried in:** PF64 diagnostics in `kernel/hardware/exceptions.c` that
+classify a not-present user-window fault as `elf-region` / `committed-heap` /
+`PAST-BRK-OVERFLOW` vs `current_process->knext`, count consecutive demand faults,
+and print a `recovered -> user rip=` marker after a successful `userpd_map_page`.
+
+**Next:** monitor the relaunched closure (`/tmp/icsos-gccself.log`), confirm the
+obj-136 stall is gone (I/O-bound, not a true hang), and measure per-stage timing.
+Optional follow-up: grow the page cache 512→2048 if data-only I/O is still the
+limiting factor.
+
+## 2026-09-07 (Manila, UTC+8)
+
+### 00:00 — SMP corruption: duplicate-pid race + per-CPU double-schedule probe
+
+**Current problem:** `test-selfhost-cert-parallel` (SMP=4, 4 GiB) still fails
+`exit=2`. The original `CTXCANARY` (32-bit `0x20` into `rbp+12` of an
+off-CPU process's saved retcanary/return slot) no longer reproduces; the runs
+now surface a different face of the same SMP race: early `EPF64
+cr2=0x100000000 rip=0x13c3d6 err=0 cr3=0xbee44000` (rip inside
+`syscallentry64`), then a long yielding `sync: spin crit=0x3bc920
+(processmgr_busy) owner=0x1f self=0x1a/0x1e` and a `WATCHDOG` on
+`/icsos/apps/mkdir.exe` that does not recover.
+
+**Key finding (double-schedule / duplicate-pid):** the guest log shows the same
+pid (`pid=30`, `/icsos/apps/mkdir.exe`) reported on **two CPUs at once**
+(`WDCPU cpu=0 pid=30 ...` and `WDCPU cpu=1 pid=30 ...`), and `SCHEDSEL` reports
+the best task with `on=` = 0/3/0/1 across CPUs. Two explanations: (A) one PCB is
+claimed by two CPUs (true double-schedule → cross-corruption of the shared user
+stack/CR3), or (B) two distinct PCBs were handed the **same pid** because the pid
+counter is racy. `nextprocessid++` (7 sites in `process.c`) is a plain, non-atomic
+increment shared by all CPUs, so concurrent `spawn`/`fork` can lose updates and
+assign duplicate pids. Distinguishing (A) from (B) requires the PCB *address* in
+the watchdog dump, not just the pid.
+
+**Activity in progress:**
+1. `WDCPU` (time.c) now prints the per-CPU `pcb=` pointer and `oncpu=` so a
+   same-PCB-on-two-CPUs (double-schedule) is distinguishable from two-PCBs-same-pid
+   (duplicate-pid).
+2. Made pid allocation atomic: all 7 `nextprocessid++` sites now use
+   `__sync_fetch_and_add(&nextprocessid, 1)`, eliminating duplicate pids under
+   concurrent spawn/fork.
+3. Removed the earlier `USERPDFREE` serial print from `userpd_free()` (it deadlocked
+   on the `uart1` guard while `processmgr_busy`/frame release held IRQs off) and
+   replaced it with a lock-free `freed_pml4_ring[128]` in `dexmem.c`
+   (`freed_pml4_record/_count/_contains`); `CTXDIAG` now also reports
+   `wasfreed=%d fring=%lu` to check whether the faulting CR3's PML4 was already
+   freed while still mapped.
+
+**Confirmed safe / not the trigger:** `kill_process()` frees the PML4 before
+checking `on_cpu` (latent bug, kept for now) but headless self-host never sets
+`sigterm`, so it is not exercised. All other `userpd_free()` callers (fork error
+path, zombie reap, ELF error paths) are on dead/off-CPU PCBs.
+
+**Next:** rebuild (clean), `test-boot`, then re-run the cert and read the `WDCPU`
+pcb/oncpu dump: if the same pcb= address appears on two CPUs it is a scheduler
+ claim/CR3 race in `ps_switchto`/`context.S`; if two different pcb= share a pid the
+ atomic-pid fix should have removed it. If the corruption persists, add a CR3/PCB
+ consistency check at the `context_load` seam and isolate with `SELFHOST_SMP=1/2`.
+
+ ### 17:56 — SMP=1 cc1 page-fault root cause: `dex32_sbrk()` one-page under-commit
+
+**Current problem:** the strict GCC self-host closure (`test-selfhost-cert`,
+SMP=1) failed early with `PF64 cr2=0xa041000 ... committed-heap` from
+`/icsos/apps/cc1.exe`, i.e. cc1 faulted on a committed user-heap page that was
+not actually present in its page tables. This was the blocker for
+`GCC_SELF_CERT_PASS`.
+
+**Root cause (confirmed):** `createprocess()` starts the heap cursor at
+`knext = userheap + 16` (`process.c`), so `knext` is **never** page-aligned.
+`dex32_sbrk(amt)` computed `pages = (amt/4096)+1`, then (for `amt%4096==0`)
+`pages = amt/4096`, and committed exactly `pages` 4KiB pages starting at the
+page **containing** the non-aligned `ret`. But it advanced the break to
+`ret + pages*4096`. When `ret` is mid-page, the range `[ret, ret+pages*4096)`
+spans **one extra page**, so the page holding the new break was left unmapped.
+The next write into that page (cc1's first big heap use) faulted.
+
+**Fix (in `dex32_sbrk()`, `kernel/memory/dexmem.c`):**
+- Added `DWORD span_pages = pages;` and, after the `amt%4096` adjustment, set
+  `span_pages = pages + (((unsigned long)ret & 0xFFF) != 0);` — commit one extra
+  page whenever the start is not page-aligned.
+- Limit check now covers the full span:
+  `((unsigned long long)ret & ~0xFFFULL) + span_pages*4096ULL > mmap_lim`.
+- `dex32_commit((DWORD)ret, span_pages, ...)` and the `invlpg` loop both use
+  `span_pages`.
+- `knext` still advances by `pages*4096` (not `span_pages`/`amt`), so the new
+  break stays inside the last committed page.
+- Net effect: for `ret=0xa031010, pages=16`, span=17 maps `0xa031000..0xa041000`,
+  which contains the new break `0xa041010`.
+
+**Verification:**
+- Clean rebuild (`make -C kernel bzImage`) OK.
+- `test-selfhost-cert` SMP=1 (bounded 900s): **0 `PF64`**, `SBRK-TRACE` shows
+  `make`/`cc1` `span=17`, in-OS GCC build progresses (gcc/cc1 pids advance
+  31→52, ~6 objects). The original cc1 committed-heap fault is gone.
+- `dex32_commitblock()`/`dex32_reserveblock()` reviewed: safe — ELF-loader
+  callers pass page-aligned `userheap`/`userstackloc-ELF_STACK_COMMIT`.
+
+**Side fix — `test-boot` flakiness:** after removing the temporary diagnostics,
+`test-boot` started failing its `grep "AP scheduling enabled"` (BOOT_EXIT=2). The
+guest log showed the BSP string split by an AP line:
+`...; AP scheduling` / `IPI_DEBUG cpu=1 ...` / ` enabled`. `IPI_DEBUG`
+(`kernel/cpu/smp.c` `smp_reschedule_ipi()`) printed from an AP in interrupt
+context, bypassing the BSP-pinned console and interleaving into the marker.
+Removed the `IPI_DEBUG` block (kept the `taskswitch()` call). `test-boot PASS`
+restored (BOOT_EXIT=0).
+
+**Temporary diagnostics removed:** `SBRK-TRACE`, `UMAP`, `UMAP-EXIST`
+(dexmem.c), `pf64_dump_pte_chain`/`PF64-PTE` (exceptions.c), `IPI_DEBUG`
+(smp.c). Kept: throttled `PF64-DIAG` classifier and the sbrk heap-growth marker.
+
+**Remaining gaps (not blockers to the fix itself):**
+1. The full strict closure (`GCC_SELF_CERT_PASS`) is a **multi-hour** build
+   (349 GCC objects + in-OS GCC rebuild of make + kernel + kexec capability
+   suite; `CERT_TIMEOUT ?= 28800`). On SMP=1 it is ~14h, so it cannot complete
+   in a bounded session — the page-fault blocker is resolved, but a full PASS
+   still needs a long (or parallel) run.
+2. `test-selfhost-cert-parallel` (SMP=4) hits a **separate** scheduling stall:
+   `make.exe` (the build orchestrator) on an AP stops yielding
+   (`WATCHDOG ... no-yield` climbs, `sc_total` frozen, no new cc1 spawned).
+   This is independent of the sbrk under-commit (PF64=0 on that run) and is the
+   same SMP-race family as the earlier duplicate-pid / double-schedule probe.
+
+**Next:** (a) run the strict closure to completion (long/parallel) to capture
+`GCC_SELF_CERT_PASS`; (b) chase the SMP=4 `make.exe` no-yield stall using the
+`WDCPU` pcb/oncpu dump (double-schedule vs. duplicate-pid) with
+`SELFHOST_SMP=1/2/4` bisection.
