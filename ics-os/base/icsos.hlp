@@ -1,11 +1,14 @@
 ICS-OS Commands
 ---------------
-1252:   if (strcmp(u,"posixio") == 0){
-1257:   if (strcmp(u,"spawntest") == 0){
-1262:   if (strcmp(u,"forktest") == 0){
-1267:      if (strcmp(u,"forkoomtest") == 0){
-1274:     if (strcmp(u,"ext4test") == 0){
-1279:      if (strcmp(u,"termtest") == 0){
+1322:   if (strcmp(u,"posixio") == 0){
+1327:   if (strcmp(u,"spawntest") == 0){
+1332:   if (strcmp(u,"forktest") == 0){
+1337:      if (strcmp(u,"forkoomtest") == 0){
+1344:     if (strcmp(u,"ext4test") == 0){
+1349:      if (strcmp(u,"termtest") == 0){
+894:       if (u && strcmp(u,"echo") == 0) {
+897:       } else if (u && strcmp(u,"noecho") == 0) {
+brk- Show the break/heap pointers of a process. Args: <pid>
 cc1test- Run host-built GCC cc1 to compile a trivial file in-OS.
 cc- Builds a C program (invokes tcc.exe). Args: <name.exe> <name.c>
 cd- Changes working directory. Args: <directory>
@@ -30,6 +33,7 @@ gccdrv- Run the standalone in-OS gcc driver (gcc.exe):
 gccselfhost- Rebuild GCC, then kernel, entirely in-OS.
 gctest- Full in-OS GCC toolchain: cc1 -> as -> ld -> exec.
 gkbuild- Diagnostic direct GCC build (without make).
+heap- Show the heap layout of a process. Args: <pid>
 help- Displays this help screen.
 iobench- Benchmark file I/O / block cache.
 kbuild- Supported path: GNU make + GCC + binutils.
@@ -54,6 +58,7 @@ off- Power off the machine.
 partitions- Shows partition tables (MBR/GPT) and partitions.
 pause- Waits for a key press
 pcut- Creates a path alias. Args: <alias:> [path]
+pf64stats- Demand-paging (PF64-DIAG) counters.
 procinfo- Show process information. Args: <pid>
 procs- List the running processes. "ps" can also be used.
 pwd- Shows the current working directory.
@@ -65,6 +70,7 @@ run- Executes a batch file or script. Args: <script>
 selfhost- Compile a test program with in-OS tcc and run it.
 set- Sets an environment variable. Args: <key>=<value>
 shutdown- Shuts down the system.
+stty- COM2 shell line discipline: stty echo | noecho
 tccboot- Rebuild TinyCC with the in-OS tcc.
 tccfullhost- Optional TinyCC bootstrap.
 tcckbuild- Optional TinyCC kernel-build experiment.

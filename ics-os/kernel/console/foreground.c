@@ -45,13 +45,25 @@ static int fg_prefix = 0;
 
 static void fg_vga_status(const char *msg, unsigned char attr)
 {
-   volatile unsigned char *vga = (unsigned char *)0xB8000 + 24 * 80 * 2;
-   int i;
-   for (i = 0; i < 80; i++) {
-      char ch = (msg && msg[i]) ? msg[i] : ' ';
-      vga[i * 2] = (unsigned char)ch;
-      vga[i * 2 + 1] = attr;
-   }
+    int i;
+    if (fbconsole_active() && ActiveDDL && ActiveDDL->active &&
+        !ActiveDDL->bufmode) {
+       /* Framebuffer mode: the status line is row 24 of the active DDL;
+          write through the DDL so each cell renders to the framebuffer. */
+       for (i = 0; i < 80; i++)
+          Dex32PutChar(ActiveDDL, i, 24,
+                       (msg && msg[i]) ? msg[i] : ' ',
+                       (char)attr);
+       return;
+    }
+    {
+       volatile unsigned char *vga = (unsigned char *)0xB8000 + 24 * 80 * 2;
+       for (i = 0; i < 80; i++) {
+          char ch = (msg && msg[i]) ? msg[i] : ' ';
+          vga[i * 2] = (unsigned char)ch;
+          vga[i * 2 + 1] = attr;
+       }
+    }
 }
 
 void fg_status(const char *msg)

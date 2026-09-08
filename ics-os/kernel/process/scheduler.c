@@ -122,14 +122,16 @@ PCB386 *scheduler(PCB386 *lastprocess){
     if (best && best != lastprocess) {
        static volatile unsigned long schedsel_user_count = 0;
        if (best->accesslevel == ACCESS_USER && schedsel_user_count < 96) {
-          char sb[128];
-          schedsel_user_count++;
-          sprintf(sb, "SCHEDSEL cpu=%d n=%lu last=%s best=%s prio=%d on=%d\n",
-                  me, (unsigned long)schedsel_user_count,
-                  lastprocess ? lastprocess->name : "?",
-                  best->name, (int)best->priority, (int)best->on_cpu);
-          serial_puts(sb);
-       }
+           char sb[160];
+           schedsel_user_count++;
+           sprintf(sb, "SCHEDSEL cpu=%d n=%lu last=%s best=%s prio=%d on=%d bptr=0x%llx lptr=0x%llx\n",
+                   me, (unsigned long)schedsel_user_count,
+                   lastprocess ? lastprocess->name : "?",
+                   best->name, (int)best->priority, (int)best->on_cpu,
+                   (unsigned long long)(uintptr)best,
+                   (unsigned long long)(uintptr)lastprocess);
+           serial_puts(sb);
+        }
     }
     return best ? best : lastprocess;
 };

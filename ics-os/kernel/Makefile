@@ -96,7 +96,7 @@ kernel32.o: kernel32.c build.h hardware/usb/uhci.c hardware/usb/xhci.c hardware/
 		console/foreground.c process/dex_taskmgr.c process/pdispatch.c \
 		console/console.c console/selfhost.c console/tty.c console/tty.h \
 		console/tty_vt.c console/tty_tc.c console/dex_DDL.h \
-	hardware/chips/ports.c hardware/vga/dexvga.c stdlib/qsort.c \
+	hardware/chips/ports.c hardware/vga/dexvga.c hardware/vga/fbconsole.c hardware/vga/fbconsole.h stdlib/qsort.c \
 		hardware/dexapm.c hardware/chips/irqhandlers.c memory/dlmalloc.c \
 		memory/bsdmallo.c vfs/vfs_core.c module/module.c module/elf_module.c console/dexio.c \
 		stdlib/stdlib.c hardware/keyboard/mouse.c hardware/exceptions.c \

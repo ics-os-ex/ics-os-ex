@@ -31,7 +31,7 @@ Useful individual targets (from `ics-os/`):
 | Target | Checks |
 |--------|--------|
 | `test-kbuild` | In-OS GCC → cc1 → GAS → GNU ld kernel build and kexec; not full self-host certification |
-| `test-boot` | Multiboot2 ISO boots; `Root mount [OK]` |
+| `test-boot` | Multiboot2 ISO boots; `Root mount [OK]`; MB2 framebuffer console active (`FBCONSOLE_PASS`) |
 | `test-smp` | `-smp 4` by default; every AP executes pinned work; no GPF |
 | `test-smp-matrix` | `-smp 1/2/4/8`; boot, online count, root mount, per-AP scheduler mask |
 | `test-exec` | `hello.exe` → `Hello World` + `EXEC_TEST_PASS` |
@@ -40,8 +40,8 @@ Useful individual targets (from `ics-os/`):
 | `test-tcc-kbuild` | Optional TinyCC kernel experiment; not a supported-path gate |
 | `test-iobench` | CD sequential map; 4KiB page cache hits; `IOBENCH_PASS` + `IOBENCH_CACHE_OK` |
 | `test-usb-storage` | UHCI USB root; guest write + SCSI cache sync + host readback |
-| `test-usb-uefi` | OVMF UEFI boot of the USB thumbdrive image via USB mass-storage; USB root + AP scheduling |
- | `test-ide-thumbdrive` | IDE/PATA thumbdrive image booted via GRUB; MBR parses (partition registered) + FAT root mount (signed-`char` MBR magic regression) |
+| `test-usb-uefi` | OVMF UEFI boot of the USB thumbdrive image via USB mass-storage; USB root + AP scheduling; GOP framebuffer console (`FBCONSOLE_PASS`) |
+ | `test-ide-thumbdrive` | IDE/PATA thumbdrive image booted via GRUB; MBR parses (partition registered) + FAT root mount (signed-`char` MBR magic regression); VBE framebuffer console (`FBCONSOLE_PASS`) |
  | `test-dist` | BIOS+UEFI FAT thumb-drive image with the full in-OS GCC toolchain; `gccdrv` drives cc1/as/ld against a long-named ldscript and runs the resulting ELF (`GCC_DRIVER_OK` + `DIST_GCC_OK` + `GCC_DRV_RUN_OK`); regression for FAT long-name (LFN) padding that corrupted VFS node names |
  | `test-usb-storage-xhci` | q35 xHCI USB root; guest write + SCSI cache sync + host readback |
 | `test-usb-storage-xhci-multi-controller` | Empty HCD 0 is skipped; HCD 1 delivers MSI-X and persists USB-root writes |
@@ -160,6 +160,8 @@ that will affect applications, ensure the sample applications, SDK and tools tha
 For research on documentation, third party sources, state-of-the-art and industry standard approaches you may perform web search as available
 in the current agent MCP functions as needed. You may also download any public, non-proprietary
 documentation or sources for reference (e.g. hardware specs, standards). Place all of these artifacts in the /references folder for later reference and retrieval, but do not commit this as part of the repo.
+
+When implementing a standard spec like multiboot, PCI-E, ACPI or the like do not guess, download the necessary references and base it on that. If there are existing stable opensource implementations of that you may also download that for reference.
 
 Properly index these files as needed in a file called reference.md
 

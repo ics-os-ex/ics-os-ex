@@ -1802,9 +1802,13 @@ static volatile int voluntary_switch[MAX_CPUS];
  volatile int selfhost_cooperative_ready;
 
 
-/* Safe page-presence walk for bounded context diagnostics.  The kernel
-   identity-maps the low physical ranges used for page tables, so the table
-   entries themselves can be read without switching CR3. */
+/* Safe page-presence walk for bounded context diagnostics.  This runs under
+   the *destination* task's CR3 (a private PML4), which does NOT identity-map
+   the page-table frames themselves (only the low 4GiB kernel image + the kept
+   PD0 blocks).  Walking via raw physical addresses would demand-page the
+   PML4's own frame and fault.  KDIRECT is kept in every private PML4
+   (pml4v[256]=boot_pdpt_high), so read the tables through the high canonical
+   direct map instead. */
 static int ctx_page_present(u64 cr3, u64 va)
 {
    u64 *pt;
@@ -1812,7 +1816,7 @@ static int ctx_page_present(u64 cr3, u64 va)
 
    if (!cr3 || (cr3 & 0xffFULL) != 0)
       return 0;
-   pt = (u64 *)cr3;
+   pt = (u64 *)KDIRECT(cr3);
    for (level = 3; level >= 0; level--) {
       u64 idx = (va >> (12 + level * 9)) & 0x1ffULL;
       u64 e = pt[idx];
@@ -1822,7 +1826,7 @@ static int ctx_page_present(u64 cr3, u64 va)
          return level > 0;
       if (level == 0)
          return 1;
-      pt = (u64 *)(e & 0x000ffffffffff000ULL);
+      pt = (u64 *)KDIRECT(e & 0x000ffffffffff000ULL);
       if (!pt)
          return 0;
    }
@@ -1849,11 +1853,48 @@ void ctx_load_check(cpu_context *ctx)
    if (rbp < 0x3fff0000ULL || rbp >= 0x40000000ULL)
       return;
    if (!ctx_page_present(ctx->cr3, rbp) ||
-       !ctx_page_present(ctx->cr3, rbp + 8)) {
-      src = "ctx";
-      n = 0;
-      while (src[n] && n < 11) { nm[n] = src[n]; n++; }
-      nm[n] = 0;
+        !ctx_page_present(ctx->cr3, rbp + 8)) {
+       /* Diagnostic: walk the destination PML4 for the rbp page and print
+          every level entry so the missing level and its parent table frame
+          are visible.  frame_diag_report on the last table distinguishes a
+          freed-while-mapped table frame (alloc=0) from a wild write to a
+          live frame (alloc=1). */
+       {
+          u64 va = rbp & 0x000FFFFFFFFF000ULL;
+          u64 cur = ctx->cr3;
+          int lvl;
+          int missing = -1;
+          if (cur && (cur & 0xFFFULL) == 0) {
+              for (lvl = 3; lvl >= 0; lvl--) {
+                 u64 idx = (va >> (12 + lvl * 9)) & 0x1FFULL;
+                 /* cur holds the physical table frame; read it through KDIRECT
+                    because this walk runs under the destination's private
+                    PML4, which does not identity-map table frames. */
+                 u64 e = ((u64 *)KDIRECT(cur))[idx];
+                 char lw[160];
+                 sprintf(lw, "CTXPTE L%d idx=%llu entry=0x%llx tbl=0x%llx\n",
+                         lvl, (unsigned long long)idx,
+                         (unsigned long long)e, (unsigned long long)cur);
+                 serial_puts(lw);
+                 if (!(e & 1ULL) || (e & 0x80ULL)) { missing = lvl; break; }
+                 if (lvl == 0) break;
+                 cur = e & 0x000FFFFFFFFFFF000ULL;
+              }
+           }
+          frame_diag_report("CTXTBL", cur);
+          {
+             char cd[160];
+             sprintf(cd, "CTXUNMAP cr3=0x%llx missing_lvl=%d wasfreed=%d fring=%lu\n",
+                     (unsigned long long)ctx->cr3, missing,
+                     (int)freed_pml4_contains(ctx->cr3),
+                     (unsigned long)freed_pml4_count());
+             serial_puts(cd);
+          }
+       }
+       src = "ctx";
+       n = 0;
+       while (src[n] && n < 11) { nm[n] = src[n]; n++; }
+       nm[n] = 0;
       sprintf(cb,
               "CTXCANARY UNMAP %s rip=0x%llx rsp=0x%llx rbp=0x%llx cr3=0x%llx canary=0x%llx\n",
               nm,
@@ -2004,18 +2045,20 @@ void ps_switchto(PCB386 *process){
       int ok = (rr >= 0x100000ULL && rr < 0x300000ULL)
             || (rr >= 0x400000ULL && rr < 0x100000000ULL);
       if (!ok) {
-        char cb[96];
-        char nm[12];
-        int n = 0;
-        const char *src = process->name ? process->name : "?";
-        while (src[n] && n < 11) { nm[n] = src[n]; n++; }
-        nm[n] = 0;
-        sprintf(cb, "CTXBAD p%d %s rip=0x%llx EIP=0x%lx rsp=0x%llx\n",
-                (int)process->processid, nm, (unsigned long long)rr,
-                (unsigned long)process->regs.EIP,
-                (unsigned long long)process->ctx.rsp);
-        serial_puts(cb);
-      }
+         char cb[160];
+         char nm[12];
+         int n = 0;
+         const char *src = process->name ? process->name : "?";
+         while (src[n] && n < 11) { nm[n] = src[n]; n++; }
+         nm[n] = 0;
+         sprintf(cb, "CTXBAD p%d %s ptr=0x%llx rip=0x%llx EIP=0x%lx rsp=0x%llx\n",
+                 (int)process->processid, nm,
+                 (unsigned long long)(uintptr)process,
+                 (unsigned long long)rr,
+                 (unsigned long)process->regs.EIP,
+                 (unsigned long long)process->ctx.rsp);
+         serial_puts(cb);
+       }
     }
 
      {
@@ -2239,13 +2282,25 @@ void schedule_from_timer(void){
         }
      }
 
-    readyprocess = (PCB386*)bridges_link((devmgr_generic*)cursched, &cursched->scheduler,
+   readyprocess = (PCB386*)bridges_link((devmgr_generic*)cursched, &cursched->scheduler,
                                           current_process,0,0,0,0,0);
-   if (!readyprocess || readyprocess == current_process)
-      return;
+    if (!readyprocess || readyprocess == current_process)
+       return;
 
-   current_process->totalcputime++;
-   ps_switchto(readyprocess);
+    {
+       static volatile unsigned long rptr_user_count = 0;
+       if (readyprocess->accesslevel == ACCESS_USER && rptr_user_count < 96) {
+          char rb[160];
+          rptr_user_count++;
+          sprintf(rb, "RSEL n=%lu rptr=0x%llx cptr=0x%llx\n",
+                  (unsigned long)rptr_user_count,
+                  (unsigned long long)(uintptr)readyprocess,
+                  (unsigned long long)(uintptr)current_process);
+          serial_puts(rb);
+       }
+    }
+    current_process->totalcputime++;
+    ps_switchto(readyprocess);
 }
 
 //The taskswitcher() is basically the program that runs all the time, aka CPU scheduler.

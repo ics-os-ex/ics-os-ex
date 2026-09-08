@@ -69,12 +69,18 @@ typedef struct {
 /* Every range the page allocator must never hand out. */
 static const mem_range mem_reserved[] = {
    { 0,                    MEM_LOW_END,         "low/firmware" },
-   { MEM_KERNEL_LOAD,      MEM_KERNEL_LIMIT,    "kernel+framestack" },
+   { MEM_KERNEL_LOAD,      MEM_KERNEL_LIMIT,    "kernel" },
    { MEM_USER_ELF_BASE,    MEM_USER_ELF_END,    "user-elf" },
    { MEM_KEXEC_STAGE,      MEM_KEXEC_STAGE_END, "kexec-stage" },
    { MEM_KHEAP_BASE,       MEM_KHEAP_END,       "kheap" },
-    { MEM_USER_WIN_BASE,    MEM_USER_WIN_END,    "user-windows" },
-};
+     { MEM_USER_WIN_BASE,    MEM_USER_WIN_END,    "user-windows" },
+    /* The private-PD0 user stack VA [MEM_USER_STACK_GUARD, MEM_USER_STACK)
+       is identity-addressable in the low map.  The pool must never hand out
+       frames from this physical range: page-table frames (PML4/PDPT/PD/PTE)
+       and stack leaf pages live there, and an in-place free-list next-pointer
+       write or an identity-mapped stack alias would corrupt a live table. */
+    { MEM_USER_STACK_GUARD, MEM_USER_STACK,      "user-stack-phys" },
+ };
 
 int mem_is_reserved(unsigned long phys)
 {
@@ -2020,12 +2026,19 @@ int userpd_map_identity_page(u64 *pml4, unsigned long long vaddr, unsigned long 
      u64 *pdpt, *pd, *pte, *pml4v;
 
      if (!pml4 || vaddr >= 0x40000000ULL || pmi != 0 || pi != 0)
-        return 0;
-     if (memamount && vaddr >= (unsigned long long)memamount)
-        return 0;
+         return 0;
+      if (memamount && vaddr >= (unsigned long long)memamount)
+         return 0;
+      /* The private-PD0 user stack VA [MEM_USER_STACK_GUARD, MEM_USER_STACK)
+         is user-private, not a kernel identity range.  Mapping it identity
+         would alias the physical user-stack window (now reserved from the
+         pool) and turn a user stack write into a page-table write.  Kernel
+         code must not demand-page into the user stack. */
+      if (vaddr >= MEM_USER_STACK_GUARD && vaddr < MEM_USER_STACK)
+         return 0;
 
-     pml4v = (u64 *)KDIRECT((u64)(uintptr)pml4 & 0x000FFFFFFFFF000ULL);
-     pe = pml4v[pmi];
+      pml4v = (u64 *)KDIRECT((u64)(uintptr)pml4 & 0x000FFFFFFFFF000ULL);
+      pe = pml4v[pmi];
      if (!(pe & 1) || (pe & 0x80)) return 0;
      pdpt = (u64 *)KDIRECT(pe & 0x000FFFFFFFFF000ULL);
 

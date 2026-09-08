@@ -340,11 +340,48 @@ When changing ext4 allocation or metadata, preserve these on-disk invariants:
 - Directory blocks with `metadata_csum` need the 12-byte directory tail entry.
 
 The target writes `/tmp/icsos-ext4-e2fsck.log` and
-`/tmp/icsos-ext4-debugfs.log` for inspection. Update the guest test or host
-validation when the driver gains new allocation, journaling, multi-group, or
-filesystem-feature support.
-
-# 4. Source Code Directory Structure
+ `/tmp/icsos-ext4-debugfs.log` for inspection. Update the guest test or host
+ validation when the driver gains new allocation, journaling, multi-group, or
+ filesystem-feature support.
+ 
+ ## 3.6 Multiboot2 framebuffer console (fbconsole)
+ 
+ The framebuffer console lives in `ics-os/kernel/hardware/vga/fbconsole.{c,h}`.
+ When the bootloader provides a Multiboot2 framebuffer *info* tag (type 8),
+ `main()` in `kernel32.c` hands it to `fbconsole_boot_init()`, the console
+ renderer is switched to the framebuffer (1024x768x32 RGB), and a self-test
+ prints `FBCONSOLE_PASS`. Without the tag the legacy VGA text driver remains
+ active and no FBCONSOLE marker appears; serial stays the headless oracle
+ either way.
+ 
+ Keep these Multiboot2 v2.0 invariants in `kernel/startup/startup.S` — GRUB
+ fails the whole boot with `error: unsupported tag: 0x8` if they break:
+ 
+ - The framebuffer *header* tag is `type=5`, `flags=1` (optional), `size=20`
+   (type, flags, size, width, height, depth), followed by the end tag
+   (`type=0`, `size=8`).
+ - Every tag in the header table must start at an 8-byte-aligned address.
+   Padding between tags is *not* counted in the tag's `size` field, and the
+   header `length` includes that padding.
+ - Header tag types must never collide with *info* tag types (0x8 is the
+   framebuffer info tag and is only valid in the Multiboot2 information
+   structure). The bootloader may legally omit the info tag; a compliant
+   kernel must still boot without it.
+ 
+ The info tag is consumed in two phases: `fbconsole_boot_init()` records the
+ geometry, and `fbconsole_deferred_init()` maps it. Framebuffers below 4 GiB
+ are mapped immediately via `mmio_mark_uncacheable`; framebuffers at or above
+ 4 GiB (BIOS VBE on QEMU, e.g. `0xfd000000`) must wait until after memory
+ initialization.
+ 
+ GRUB only emits the info tag when its video subsystem is present. The EFI
+ image and the BIOS `CORE_IMG` embedded in the thumbdrive MBR gap are built
+ in `scripts/mkusb.sh`; both module lists must keep `video all_video`.
+ `make test-boot`, `make test-usb-uefi`, and `make test-ide-thumbdrive` all
+ assert `FBCONSOLE_PASS` and cover the three GRUB paths (BIOS VBE, UEFI GOP,
+ embedded i386-pc core).
+ 
+ # 4. Source Code Directory Structure
 Top level directories.
 
 | **Directory** | **Description** |

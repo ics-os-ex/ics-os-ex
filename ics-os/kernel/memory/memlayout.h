@@ -17,7 +17,9 @@
  *  +------------------+ 0x00100000  MEM_KERNEL_LOAD
  *  | kernel ELF       |          linker .text/.data/.bss (grows down)
  *  |  + kstacks in BSS|
- *  |  + frame-stack   |          immediately after bssEnd
+ *  |  + guard region  |          64KiB slack before the user ELF (the former
+ *  |                  |          256KiB "frame stack" was replaced by the
+ *  |                  |          global E820-seeded frame pool in dexmem.c)
  *  +------------------+ 0x00400000  MEM_KERNEL_LIMIT / MEM_USER_ELF_BASE
  *  | user ELF window  |          ELF_START_ADDR; private PTEs (cc1 ~22MB)
  *  +------------------+ 0x01800000  MEM_KEXEC_STAGE
@@ -39,8 +41,11 @@
  *  +------------------+ 0xFE000000  PCI MMIO (PCD|PWT)
  *
  * Rules:
- *  1. Kernel image + frame stack MUST stay below MEM_KERNEL_LIMIT (linker
- *     ASSERT + boot halt).  TinyCC user ELFs start at 4MiB.
+ *  1. The kernel image (bssEnd) MUST stay <= MEM_KERNEL_BSS_LIMIT (linker
+ *     ASSERT), leaving 64KiB of slack below the 4MiB user-ELF base.  TinyCC
+ *     user ELFs start at 4MiB.  The frame pool skips the whole
+ *     MEM_KERNEL_LOAD..MEM_KERNEL_LIMIT reserved range, so growing the kernel
+ *     image into that gap is safe.
  *  2. Kernel stacks live in .bss (like AP stacks), not at a magic PA.
  *  3. Kernel heap is a closed interval; sbrk must not mempop and must not
  *     walk past MEM_KHEAP_END.
@@ -71,7 +76,11 @@
 #define MEM_KERNEL_LOAD        0x00100000UL
 #define MEM_KERNEL_LIMIT       0x00400000UL   /* TinyCC ELF_START_ADDR */
 
-#define MEM_FRAME_STACK_SIZE   0x00040000UL   /* 256KiB of page pointers */
+/* Linker ASSERT bound: bssEnd must stay <= this.  It is MEM_KERNEL_LIMIT
+   (the 4MiB user-ELF base) minus a 64KiB guard.  The former 256KiB "frame
+   stack" that occupied that gap was replaced by the global E820-seeded frame
+   allocator (dexmem.c), which skips the reserved kernel range entirely. */
+#define MEM_KERNEL_BSS_LIMIT   0x003F0000UL
 
 #define MEM_USER_ELF_BASE      0x00400000UL
 #define MEM_USER_ELF_END       0x01800000UL   /* 20MiB window for large EXEs (cc1 ~22MB) */

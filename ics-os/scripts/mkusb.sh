@@ -27,9 +27,14 @@ rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR/boot/grub" "$STAGE_DIR/EFI/BOOT"
 
 cat > "$STAGE_DIR/boot/grub/grub.cfg" << 'EOF'
-serial --unit=0 --speed=115200
-terminal_input serial console
-terminal_output serial console
+# Real laptops often expose no COM0; fall back to the video console so the
+# menu and OS still get a terminal when the serial probe fails.
+terminal_input console
+terminal_output console
+if serial --unit=0 --speed=115200; then
+    terminal_input serial console
+    terminal_output serial console
+fi
 set timeout=0
 set default=0
 
@@ -52,10 +57,12 @@ fi
 
 # UEFI GRUB image (64-bit firmware can still chain a 32-bit multiboot kernel).
 if [ -d "$GRUB_EFI_DIR" ] && command -v grub-mkimage >/dev/null; then
+    # video + all_video (efifb/GOP) so the multiboot2 loader can hand the
+    # kernel a framebuffer info tag under UEFI.
     grub-mkimage -O x86_64-efi -o "$STAGE_DIR/EFI/BOOT/BOOTX64.EFI" \
         -p /boot/grub \
         fat iso9660 part_msdos part_gpt multiboot multiboot2 gzio serial terminal \
-        normal configfile ls search echo linux boot || \
+        video all_video normal configfile ls search echo linux boot || \
         echo "warning: could not build BOOTX64.EFI (UEFI boot will be unavailable)"
 fi
 
@@ -75,9 +82,11 @@ mcopy -i "${IMG}@@${OFFSET}" -s "$STAGE_DIR"/* ::
 CORE_IMG=$(mktemp)
 trap 'rm -f "$CORE_IMG"' EXIT
 
+# video + all_video (VBE) so the multiboot2 loader hands the kernel a
+# framebuffer info tag; +3.6 KiB, well inside the 1 MiB MBR gap.
 grub-mkimage -O i386-pc -p '(hd0,msdos1)/boot/grub' -o "$CORE_IMG" \
     biosdisk part_msdos fat multiboot multiboot2 gzio serial terminal \
-    configfile normal ls search echo boot
+    video all_video configfile normal ls search echo boot
 
 python3 - "$IMG" "$GRUB_PC_DIR/boot.img" "$CORE_IMG" << 'PY'
 import sys, math, pathlib

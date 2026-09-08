@@ -4026,3 +4026,202 @@ restored (BOOT_EXIT=0).
 `GCC_SELF_CERT_PASS`; (b) chase the SMP=4 `make.exe` no-yield stall using the
 `WDCPU` pcb/oncpu dump (double-schedule vs. duplicate-pid) with
 `SELFHOST_SMP=1/2/4` bisection.
+
+ ### ~18:40 — Committed self-host fix; SMP=4 stall narrowed to `kill_process` teardown
+
+**Commit:** `41e9998` "Close strict GCC self-host path: fix dex32_sbrk under-commit,
+harden SMP, add tests" (83 files). Excluded machine-local/artifact files:
+`j.img`, `HANDOFF.md`, `session-ses_fb56.md`. Working tree clean apart from those.
+
+**SMP=4 stall — reproduced and narrowed.** `test-selfhost-cert-parallel` (SMP=4)
+reliably stalls early (only ~12 user task switches before the freeze; no `cc1.exe`
+spawned). Observations that rule things out:
+- `PF64`=0 → NOT the sbrk under-commit.
+- `WDCPU` dump (time.c:294) shows **unique `pcb=` per CPU with `on_cpu` matching the
+  CPU** → NOT a double-schedule in the sampled state.
+- ALL CPUs report `no-yield=500` → a full-system stall, not one wedged AP.
+- `KFREE` (process.c:1311, the end-of-teardown marker) has **count 0** → `kill_process()`
+  never reached `sync_leavecrit` (line 1310). The teardown is **stuck** with
+  `processmgr_busy` held.
+- No `sync: spin` / `syncirq: spin`, no `SMP: TLB shootdown timeout`, no
+  `CTXDIAG`/`CTXBAD`/`CTXUNMAP`.
+
+**Stall sequence (from the guest log tail):** three CPUs concurrently switch to user
+tasks (`cpu1→make.exe`, `cpu2→mkdir.exe`, `cpu3→gcc.exe`) and a child process is freed.
+That is the concurrent multi-user-process teardown path that cannot occur on SMP=1.
+
+**Root-cause area (`kill_process()`, process.c:1185-1321):** it takes
+`processmgr_busy` (line 1188) and holds it across the *entire* teardown —
+`kill_children` (1205), the `closeallfiles()` busy loop (1219-1220),
+`smp_tlb_shootdown()` (1248, an IPI wait with a **10,000,000-iteration** spin whose body
+calls `smp_tlb_process_requests()` every iteration — extremely slow under QEMU), then
+`freeprocessmemory`/`userpd_free`/`free(ptr)` (1259-1308). Because the selfhost
+cooperative gate suppresses timer preemption, the shooter CPU is not preempted and grinds
+through the shootdown (or the closeallfiles loop) for a very long time while holding the
+lock. The stuck `kill_process` is the single point that wedges the system.
+
+Note: `sync_entercrit` (sync.c:87) does **not** disable interrupts and yields via
+`taskswitch()` every 4096 spins, so the deadlock is not "waiter can't service the IPI";
+it is the combination of (a) a very long lock-held section that includes an IPI wait and
+(b) the cooperative gate removing the only thing (timer preemption) that would move a
+stuck task forward.
+
+**Proposed fix (not yet applied — needs verification):** shrink the `processmgr_busy`
+critical section in `kill_process()` to only the process-list mutations
+(`ps_findprocess`, `kill_children`, `wait_queue_cancel`, `ps_dequeue`, and the final
+PCB list unlink/free). Release the lock **before** `closeallfiles()`,
+`smp_tlb_shootdown()`, `freeprocessmemory()`, and `userpd_free()`. The victim is already
+`ps_dequeue`d (not runnable) and marked unloadable before that point, so it cannot be
+rescheduled mid-teardown. Also consider bounding the shootdown 10M-spin timeout. Must
+re-run `test-boot` and the parallel cert to confirm the stall is gone and no
+use-after-free/double-free is introduced.
+
+**Activity now:** implement the lock-scope reduction in `kill_process()`, rebuild, run
+`test-boot` (must stay green) and `test-selfhost-cert-parallel` (expect the no-yield
+stall to clear and cc1 to start spawning).
+
+---
+
+### 2026-09-07 — Real SMP=4 stall root cause: zombie use-after-free in `self_exit_current`
+
+The `kill_process()` lock theory was a red herring for the *current* stall. The sbrk
+fix is verified (SMP=1 `cc1.exe` now spawns, `PF64=0`). The SMP=4 parallel cert now gets
+much further (`/icsos/apps/cc1.exe` loads on `cpu=2`) and then wedges with a system-wide
+`WATCHDOG no-yield`, and — the decisive new evidence — `CTXCANARY`/retcanary failures:
+a saved context's `rbp+8` slot no longer matches the retcanary stored at switch-out
+(`expected=0x138c0c actual=0x1023c9/0x0` for `p25`, `rip=0x1381de` in the
+`waitpid_notify_parent` region, `rbp=0x3fffcd50`). That is a live process's stack being
+overwritten while it is out — memory corruption, not a lock.
+
+`FRDIAG ... OOB idx=...` was a red herring: `KDIRECT()` is a kernel virtual map
+(`0xFFFF800000000000 | (phys & 0xFFFFFFFF)`, memlayout.h:58) and the whole `CTXDIAG`
+line is garbled by multi-CPU serial interleave, so the `phys` value is not trustworthy.
+The user stack (`0x3FF00000-0x40000000`) is private (PDPT[0] → private PD0), not shared,
+so it is not a plain PD0 aliasing.
+
+**Root cause (confirmed in code):** `self_exit_current()` (process.c:2095-2149) did:
+`ps_dequeue(dying); zombie_free = dying; sync_leavecrit(&processmgr_busy);`
+then `sync_release_process_crits(dying, ...)`. The BSP frees `zombie_free` in
+`schedule_from_timer()` (process.c:2203-2237) **without** holding `processmgr_busy` —
+it reads/clears the global, calls `userpd_free(z->pagedirloc)` and `free(z)`. So the BSP
+can `free(dying)` on one CPU while the exiting CPU is still inside
+`sync_release_process_crits(dying, ...)` reading `dying->held_crit_n` /
+`dying->held_crits[i]` / `dying->processid`. `sync_release_process_crits` (sync.c:55)
+then does `v = p->held_crits[i]; v->wait = 0; __sync_lock_release(&v->busy);` — writing
+through pointers read from freed/reused PCB memory, i.e. a use-after-free that corrupts
+arbitrary memory (a live process stack → the CTXCANARY).
+
+**Fix (applied, process.c `self_exit_current`):** release the held crits *before* the
+PCB is queued for free, while still under `processmgr_busy` and while `zombie_free` is
+still null (so the BSP cannot have reclaimed it):
+`ps_dequeue(dying); sync_release_process_crits(dying, ...); zombie_free = dying;`
+`sync_release_process_crits` is non-blocking (atomic read/release only, no
+`sync_entercrit`), so it is deadlock-free under the crit.
+
+**Known remaining (separate, not this stall):** `zombie_free` is a single global, so
+concurrent self-exits overwrite it and leak earlier PCBs/PD0s (slow OOM, not a
+use-after-free). Needs a small locked queue to be fully correct.
+
+**Activity now:** rebuild done; running `test-selfhost-cert-parallel CERT_TIMEOUT=600`
+in the background (log /tmp/icsos-cert.log, guest /tmp/icsos-gccself.log). Expect the
+CTXCANARY failures and no-yield wedge to clear and cc1 to finish. Will follow with
+`test-boot` (must stay green). Temporary `KSTEP`/`KSSTACK` diagnostics still in the tree
+and must be cleaned or made permanent before any commit.
+
+---
+
+### 2026-09-07 — First fix regressed: it double-released `processmgr_busy`; corrected ordering applied
+
+The first fix (releasing held crits *before* `sync_leavecrit(&processmgr_busy)`) was
+wrong. `self_exit_current()` acquires `processmgr_busy` via `sync_entercrit`, and
+`sync_entercrit` tracks the crit in the *current* (dying) process's `held_crits[]`
+(sync.c `sync_track_hold`). So `processmgr_busy` itself is in `dying->held_crits[]`.
+Releasing the held crits first therefore ran
+`sync_release_process_crits` → `__sync_lock_release(&processmgr_busy.busy)` **while still
+inside the critical section**, dropping `busy` to 0 mid-teardown. The later
+`sync_leavecrit(&processmgr_busy)` then hit the non-owner path
+(`sync: warning critical section released by non-owner! crit=0x3bdbe0` — 0x3bdbe0 is
+`processmgr_busy`, confirmed from mapfile). The call chain was
+`make.exe → syscallwrapper → api_syscall → exit → ps_switchto → sync_leavecrit`.
+
+`sync_leavecrit` (sync.c:145) releases **and** `sync_untrack_hold`s the crit when
+`wait` hits 0, so the original order was safe: `sync_leavecrit` first removed
+`processmgr_busy` from `held_crits`, so the subsequent held-crit sweep never touched it.
+
+**Corrected fix (applied, `self_exit_current`):** keep the leave-first order and only
+delay the free:
+`ps_dequeue(dying); sync_leavecrit(&processmgr_busy);`
+`sync_release_process_crits(dying, ...); zombie_free = dying;`
+- `sync_leavecrit` first: releases + untracks `processmgr_busy` (no double-release).
+- held-crit sweep second: reads `dying->held_crits[]` while the PCB is still valid.
+- `zombie_free = dying` **last**: the BSP cannot `free(dying)` (in `schedule_from_timer`,
+  which does not hold `processmgr_busy`) until after the sweep has finished reading it.
+  This is what actually closes the use-after-free, not the reordering of the release.
+
+**Verification so far:**
+- `test-selfhost-cert-parallel`: 0 "released by non-owner" warnings (double-release gone).
+  Run now progresses much further — it is actually compiling GCC objects
+  (`/units/alias.c -o /work/gccobj/cc1/alias.o` via gcc.exe) before dying.
+- `test-boot`: PASS (Root mount [OK], SMP work-steal OK) — the change is boot-safe.
+
+**New crash point (unresolved):** the run now dies with `make.exe` (pid=25) on `cpu=1`
+stuck in `memmove` (rip 0x12a2ac) called from `Dex32ScrollUp` (console scroll) —
+`WATCHDOG ... no-yield=500` — then garbled multi-CPU serial output ends the run
+(last clean event: `cpu=3` switching to `mkdir.exe`, rip 0x40bd68). This is a different
+failure than the earlier CTXCANARY wedge; need to determine whether the console-scroll
+memmove is a corruption victim or itself corrupting (bad size/pointer), and whether the
+wedge is a spin in the scroll path under load.
+
+**Known remaining (separate):** `zombie_free` single-global leak (concurrent self-exits
+overwrite it, leaking earlier PCBs/PD0s). Temporary `KSTEP`/`KSSTACK` diagnostics still in
+the tree and must be cleaned or made permanent before any commit.
+
+## 2026-09-08 (Manila, UTC+8)
+
+### 04:45–05:25 — **Multiboot2 framebuffer console: boot blocker resolved, `FBCONSOLE_PASS` on all three GRUB paths**
+
+Feature: framebuffer text console (`kernel/hardware/vga/fbconsole.c`) driven by the
+Multiboot2 framebuffer *info* tag (type 8). When the bootloader hands over a
+framebuffer the console renders there (1024x768x32 RGB); otherwise the legacy VGA
+text driver stays in use. Serial remains the headless test oracle.
+
+**Blocker 1 — BSS cliff at 0x3C0000.** Kernel BSS no longer fit under the old
+`0x3C0000` limit. Root cause: the "frame stack" that supposedly reserved
+0x3C0000–0x3EFFFF is a vestige — `kernel/memory/dexmem.c` never allocates from
+it and only the linker scripts treated it as a fixed pool. (TinyCC's
+`ELF_START_ADDR` 0x400000 in `contrib/tcc/x86_64-link.c` is a separate user-space
+concern.) Fix: raised the limit to `0x3F0000` in `lscript64.ld`,
+`lscript64-objs.ld`, and `memlayout.h` (`MEM_KERNEL_BSS_LIMIT`); docs updated.
+New `bssEnd=0x3c0af4`, ~192 KiB of headroom.
+
+**Blocker 2 — `error: unsupported tag: 0x8` from GRUB.** Root cause: the
+framebuffer *header* tag in `startup.S` violated Multiboot2 v2.0 in two ways:
+its `size` field was 24 but the tag is 20 bytes (type, flags, size, width,
+height, depth), and tags must start at 8-byte-aligned addresses with padding
+*outside* the size field. GRUB's tag walker ran past the end tag and interpreted
+leftover bytes as a tag of type 0x8 — a *framebuffer info* request, which is
+invalid in the header (info tags belong to the info structure). Fixed: size=20
+and `.align 8` before the end tag; header is now 48 bytes. Verified byte-for-byte
+in `Kernel64.bin` at file offset 0x1000.
+
+**Blocker 3 — GRUB images built without video modules.** Per the spec the
+framebuffer info tag is optional; a bootloader may omit it. `scripts/mkusb.sh`
+built `BOOTX64.EFI` with a minimal module list, so under UEFI the kernel never
+received the tag and (correctly) fell back to VGA text with no FBCONSOLE output.
+Added `video all_video` (efifb/GOP driver) to the EFI image and to the BIOS
+`CORE_IMG` embedded in the MBR gap (+3.6 KiB, well inside the 1 MiB gap limit).
+
+**Result — `FBCONSOLE: 1024x768 bpp=32 pitch=4096` + `FBCONSOLE_PASS` everywhere:**
+- `test-boot` (BIOS, grub-mkrescue ISO): fb at 0xfd000000 → deferred high-mapping path.
+- `test-usb-uefi` (OVMF GOP): fb at 0x80000000 → immediate `mmio_mark_uncacheable` path.
+- `test-ide-thumbdrive` (embedded i386-pc GRUB in the MBR gap, BIOS VBE): 0xfd000000.
+
+Added `FBCONSOLE_PASS` assertions to all three Makefile targets (per the QA
+policy: feature markers must be asserted, not just present in logs). Regression
+coverage: `test-usb-storage` (UHCI, shares the CORE_IMG change) and
+`test-integration` (boot + SMP 4 + exec) still PASS.
+
+**Notes:** GRUB 2.16~rc2 source is available in `references/grub` but not needed —
+system GRUB 2.12 emits the framebuffer info tag correctly on every path once the
+video modules are present. Building GRUB from source would only buy a
+version-pinned reproducible test image; deferred unless we want that.

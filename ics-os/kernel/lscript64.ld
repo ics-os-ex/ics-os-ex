@@ -32,7 +32,10 @@ SECTIONS {
     *(.gnu*)
   }
 }
-ASSERT(bssEnd <= 0x003C0000, "kernel BSS collided with 4MiB user ELF window");
+/* bssEnd must stay below the 4MiB user-ELF base (TinyCC ELF_START_ADDR).
+   The former 256KiB "frame stack" after bssEnd was replaced by the global
+   E820-seeded frame allocator (see dexmem.c), so only a small guard is kept. */
+ASSERT(bssEnd <= 0x003F0000, "kernel BSS collided with 4MiB user ELF window");
 INPUT(startup.o asmlib.o context.o ap_trampoline.o lapic.o smp.o
       kernel32.o scheduler.o iomgr.o blkcache.o posixfd.o fat.o ext4.o iso9660.o ramdisk.o
       devfs.o irqwrap.o devmgr_error.o kexec.o irq_lifecycle.o vtd.o virtio_blk.o)

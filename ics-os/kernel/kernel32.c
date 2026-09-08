@@ -104,6 +104,7 @@ extern void textcolor(unsigned char c);
 #include "hardware/chips/ports.c"
 #include "hardware/chips/serial.c"
 #include "hardware/vga/dexvga.c"
+#include "hardware/vga/fbconsole.h"
 #include "stdlib/qsort.c"
 #include "hardware/floppy/floppy.h"
 #include "hardware/ATA/ataio.h"
@@ -156,6 +157,7 @@ extern int cpu_count;
   compilation without the use of a makefile*/
 
 #include "console/dex_DDL.c"
+#include "hardware/vga/fbconsole.c"
 #include "console/tty.c"
 #include "console/tty_vt.c"
 #include "console/tty_tc.c"
@@ -316,9 +318,17 @@ void main(){
                    mb2map_n++;
                 }
              }
-          }
-          if ((tag->type == 15 || (tag->type == 14 && !acpi_rsdp_length)) &&
-              tag->size > 8) {
+           }
+           if (tag->type == MB2_TAG_FRAMEBUFFER && tag->size >= 38) {
+              const mb2_fb_tag *fb = (const mb2_fb_tag *)tag;
+              fbconsole_boot_init(fb->addr, fb->pitch, fb->width, fb->height,
+                                  fb->bpp, fb->ftype,
+                                  fb->r_shift, fb->r_size,
+                                  fb->g_shift, fb->g_size,
+                                  fb->b_shift, fb->b_size);
+           }
+           if ((tag->type == 15 || (tag->type == 14 && !acpi_rsdp_length)) &&
+               tag->size > 8) {
              DWORD length = tag->size - 8;
              if (length > sizeof(acpi_rsdp))
                 length = sizeof(acpi_rsdp);
@@ -458,8 +468,11 @@ void main(){
       
      NOtE: DEX uses the flat memory model and all segment registers used by
      DEX has a base equal to zero*/
-   mem_init(); 
-    
+ mem_init();
+    /* A framebuffer above 4GiB needs the full paging setup that mem_init()
+       completes; below 4GiB boot_init already mapped it uncacheable. */
+    fbconsole_deferred_init();
+
    /*The default values of the current_process variable, which is the kernel
      PCB (also seeded before the first printf above). */
    current_process = &sPCB;
@@ -482,9 +495,13 @@ void main(){
    current_process = &sPCB;
    sPCB.outdev = consoleDDL;
    fg_kernel = fg_register(consoleDDL, 0);
-   fg_setforeground(fg_kernel);
-    
-   /* Preliminary initializaation complete, start up the operating system*/
+    fg_setforeground(fg_kernel);
+
+    /* Verify the framebuffer renderer against the live panel before any
+       user output; no-op (serial note) when the legacy text path is in use. */
+    fbconsole_selftest();
+
+    /* Preliminary initializaation complete, start up the operating system*/
    dex32_startup(); 
 };
 

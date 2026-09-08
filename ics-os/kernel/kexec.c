@@ -101,11 +101,12 @@ int kexec_load(const char *path)
    return 0;
 }
 
-void kexec_reboot(void)
+ void kexec_reboot(void)
 {
-   unsigned int tramp_len;
-   unsigned int *mb2;
-   void (*tramp)(void *, unsigned long, unsigned long, unsigned long);
+    unsigned int tramp_len;
+    unsigned int *mb2;
+    unsigned char fbtag[40];
+    void (*tramp)(void *, unsigned long, unsigned long, unsigned long);
 
    if (!kexec_ready || !kexec_entry) {
       printf("kexec: nothing loaded\n");
@@ -119,17 +120,26 @@ void kexec_reboot(void)
    }
    memcpy((void *)(uintptr)KEXEC_TRAMP, (void *)kexec_tramp, tramp_len);
 
-   /* Minimal Multiboot2 info with a cmdline tag so the new kernel can
-      skip autoexec and prove it is the kexec'd image. */
-   mb2 = (unsigned int *)(uintptr)KEXEC_MB2;
-   memset(mb2, 0, 128);
-   mb2[0] = 32;                       /* header + cmdline + end */
-   mb2[1] = 0;
-   mb2[2] = 1;                       /* cmdline tag */
-   mb2[3] = 8 + 8;                   /* size including "kexeced\0" */
-   memcpy((char *)mb2 + 16, "kexeced", 8);
-   mb2[6] = 0;                       /* end tag */
-   mb2[7] = 8;
+  /* Minimal Multiboot2 info with a cmdline tag so the new kernel can
+      skip autoexec and prove it is the kexec'd image. When the current
+      boot used a linear framebuffer, forward the tag so the kexec'd
+      kernel keeps the on-screen console. */
+    mb2 = (unsigned int *)(uintptr)KEXEC_MB2;
+    memset(mb2, 0, 128);
+    mb2[2] = 1;                       /* cmdline tag */
+    mb2[3] = 8 + 8;                   /* size including "kexeced\0" */
+    memcpy((char *)mb2 + 16, "kexeced", 8);
+    if (fbconsole_active()) {
+       fbconsole_export_tag(fbtag);
+       memcpy((char *)mb2 + 24, fbtag, sizeof(fbtag));
+       mb2[16] = 0;                   /* end tag at offset 64 */
+       mb2[17] = 8;
+       mb2[0] = 72;                   /* header + cmdline + fb + end */
+    } else {
+       mb2[6] = 0;                    /* end tag at offset 24 */
+       mb2[7] = 8;
+       mb2[0] = 32;                   /* header + cmdline + end */
+    }
 
    printf("kexec: jumping to 0x%lx (KBUILD_KEXEC)\n", kexec_entry);
    serial_puts("KBUILD_KEXEC\n");

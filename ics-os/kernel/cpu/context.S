@@ -142,16 +142,20 @@ context_load:
     movl $0, (%rax,%r11,4)
     movq %r10, %r11
     movq CTX_R10(%r13), %r10
-    movq CTX_RFLAGS(%r13), %r14
-    movq CTX_RIP(%r13), %r12
-    movq CTX_RAX(%r13), %rax
-    movq CTX_R13(%r13), %r13
-    pushq %r12
+    /* Restore RIP/RFLAGS via rax, NOT r12/r14: those already hold the
+       destination's saved R12/R14 (loaded above) and must reach `ret`
+       intact.  rax is reloaded with the destination RAX after the pushes.
+       The flag stays clear and the RIP is published before IF goes on. */
+    movq CTX_RIP(%r13), %rax
+    pushq %rax
     /* Force IF=1 on resume as well (belt-and-suspenders for any context
        saved with IF=0 before the save-side fix, and for the first switch of
        a freshly-created task). */
-    orl $0x200, %r14d
-    pushq %r14
+    movq CTX_RFLAGS(%r13), %rax
+    orl $0x200, %eax
+    pushq %rax
+    movq CTX_RAX(%r13), %rax
+    movq CTX_R13(%r13), %r13
     popfq
     ret
 

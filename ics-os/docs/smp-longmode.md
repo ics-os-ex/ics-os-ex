@@ -219,8 +219,9 @@ If sector 0 looks like FAT, the kernel mounts `vblk` at `/work` and prints
 
 Identity-mapped low 4GiB. **Source of truth:** `kernel/memory/memlayout.h`.
 The page allocator skips that reserved-range table; the linker
-`ASSERT`s `bssEnd <= 0x3C0000` so the kernel cannot grow into TinyCC's
-4MiB ELF window. `KMMIO_BASE` reserves a 2 MiB kernel-only MMIO window for
+`ASSERT`s `bssEnd <= 0x3F0000` (a 64KiB guard under the 4MiB user-ELF base;
+the former 256KiB "frame stack" was replaced by the global frame pool) so the
+kernel cannot grow into TinyCC's ELF window. `KMMIO_BASE` reserves a 2 MiB kernel-only MMIO window for
 device BARs above 4 GiB. Kernel stacks are `.bss` arrays. Kernel heap is a
 closed 32MiB interval; `sbrk` must not `mempop`. Add new regions to
 the header first.

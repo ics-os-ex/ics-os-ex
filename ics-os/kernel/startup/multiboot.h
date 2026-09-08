@@ -66,6 +66,27 @@ typedef struct __attribute__((packed)) {
     DWORD entry_version;
 } mb2_mmap_tag;
 
+/* Multiboot2 info tag types used by the kernel. */
+#define MB2_TAG_FRAMEBUFFER 8
+
+/* Multiboot2 framebuffer info tag (tag type 8). */
+#define MB2_FB_TYPE_INDEXED 0
+#define MB2_FB_TYPE_RGB     1
+#define MB2_FB_TYPE_EGA     2
+
+typedef struct __attribute__((packed)) {
+    DWORD type;
+    DWORD size;
+    unsigned long long addr;
+    DWORD pitch;
+    DWORD width;
+    DWORD height;
+    BYTE bpp;
+    BYTE ftype;
+    WORD reserved;
+    BYTE r_shift, r_size, g_shift, g_size, b_shift, b_size;
+} mb2_fb_tag;
+
 DWORD map_length = 0;
 mmap *memory_map;
 extern unsigned int multiboot_magic;

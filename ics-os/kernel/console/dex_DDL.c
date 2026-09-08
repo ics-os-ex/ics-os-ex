@@ -54,9 +54,24 @@ DEX32_DDL_INFO *Dex32CreateDDL(){
    if (!dev->mem_ptr)
       return 0; 
    memset(dev->mem_ptr,0,80*25*2*sizeof(char));
-   dev->buf_ptr=dev->mem_ptr; 
-   dev->hdw_ptr=(char*)0xB8000;
-   dev->type=DDL_CGA;
+   dev->buf_ptr=dev->mem_ptr;
+    dev->hdw_ptr=0;
+    if (fbconsole_active()) {
+       /* Framebuffer mode: the "hardware" buffer is a text shadow; the
+          visible pixels are rendered into the linear framebuffer by
+          fbconsole. */
+       dev->hdw_ptr=(char*)malloc(80*25*2*sizeof(char));
+       if (dev->hdw_ptr)
+          memset(dev->hdw_ptr,0,80*25*2*sizeof(char));
+    }
+    if (!dev->hdw_ptr) {
+       if (fbconsole_active()) {
+          free(dev->mem_ptr);
+          return 0;
+       }
+       dev->hdw_ptr=(char*)0xB8000;
+    }
+    dev->type=DDL_CGA;
    dev->active=0;
    dev->locked=0;
    dev->lines=0;
@@ -95,11 +110,12 @@ void dd_swaptomemory(DEX32_DDL_INFO *dev){
 
 //swap to hardware
 void dd_swaptohardware(DEX32_DDL_INFO *dev){
-   if (dev == ActiveDDL){
-      memcpy(dev->hdw_ptr,dev->mem_ptr,dev->buf_size);
-      dev->buf_ptr=dev->hdw_ptr;    
-      dev->bufmode = 0;
-   };
+    if (dev == ActiveDDL){
+       memcpy(dev->hdw_ptr,dev->mem_ptr,dev->buf_size);
+       dev->buf_ptr=dev->hdw_ptr;
+       dev->bufmode = 0;
+       fbconsole_screen_refresh();
+    };
 };
 
 
@@ -124,26 +140,33 @@ DEX32_DDL_INFO *Dex32SetActiveDDL(DEX32_DDL_INFO *dev){
       dev->buf_ptr=dev->hdw_ptr;
       ActiveDDL = dev;
       
-      //set as the active DDL
-      dev->active=1;
-      
-      if (!dev->bufmode)
-         move_cursor(dev->cury,dev->curx);
-      return temp_ptr;
+     //set as the active DDL
+       dev->active=1;
+
+       if (fbconsole_active())
+          fbconsole_screen_refresh();
+
+       if (!dev->bufmode)
+          move_cursor(dev->cury,dev->curx);
+       return temp_ptr;
    };
    return dev;
 };
 
 //Clear the device
 void Dex32Clear(DEX32_DDL_INFO *dev){
-   memset(dev->buf_ptr,0,dev->buf_size);
-   dev->curx=0;dev->cury=0;dev->lines=0;
+    memset(dev->buf_ptr,0,dev->buf_size);
+    dev->curx=0;dev->cury=0;dev->lines=0;
+    if (dev==ActiveDDL && dev->active && !dev->bufmode)
+       fbconsole_clear_screen();
 };
 
 //perform a scroll up
 void Dex32ScrollUp(DEX32_DDL_INFO *dev){
-   DWORD vidmemloc=dev->buf_ptr;
-   memmove((void*)vidmemloc,(void*)vidmemloc+0x000A0,3840);
+    DWORD vidmemloc=dev->buf_ptr;
+    memmove((void*)vidmemloc,(void*)vidmemloc+0x000A0,3840);
+    if (dev==ActiveDDL && dev->active && !dev->bufmode)
+       fbconsole_screen_refresh();
 };
 
 //set the text attribute
@@ -159,8 +182,10 @@ void Dex32SetTextColor(DEX32_DDL_INFO *dev, char color){
 
 //move the cursor to a new location
 void Dex32MoveCursor(DEX32_DDL_INFO *dev, int y, int x){
-   if (dev->active && !dev->bufmode) 
-      move_cursor(y,x);
+    if (dev->active && !dev->bufmode) {
+       move_cursor(y,x);
+       fbconsole_cursor_to(x,y);
+    };
 };
 
 //Set the background
@@ -189,16 +214,22 @@ void Dex32NextLn(DEX32_DDL_INFO *dev){
    };
                  
    Dex32PutChar(dev,dev->curx,dev->cury,' ',dev->attb);
-   if (dev->active && !dev->bufmode) 
-      move_cursor(dev->cury,dev->curx);
+    if (dev->active && !dev->bufmode)
+       move_cursor(dev->cury,dev->curx);
+    /* The scroll refresh (above) ran before the bottom line was cleared;
+       redraw so the cleared line is not stale on the framebuffer. */
+    if (dev->active && !dev->bufmode && dev->cury==24)
+       fbconsole_screen_refresh();
 };
 
 //update the cursor position
 void Dex32UpdateCursor(DEX32_DDL_INFO *dev, int y, int x){
-   if (dev->active && !dev->bufmode) 
-      move_cursor(y,x);
-   dev->curx = x;
-   dev->cury = y;
+    if (dev->active && !dev->bufmode) {
+       move_cursor(y,x);
+       fbconsole_cursor_to(x,y);
+    };
+    dev->curx = x;
+    dev->cury = y;
 };
 
 //Emulates an ANSI compatible display subsystem
@@ -264,11 +295,13 @@ int Dex32PutChar(DEX32_DDL_INFO *dev,int x, int y,char c,char color){
       return 0;
    vidmemloc=dev->buf_ptr;
    
-   if (x>=0&&x<80 &&y>=0&&y <25){
-      cptr=(char*)(vidmemloc+ (y * 80 + x) * 2);
-      *cptr=c;
-      *(cptr+1)=color;
-   };
+  if (x>=0&&x<80 &&y>=0&&y <25){
+       cptr=(char*)(vidmemloc+ (y * 80 + x) * 2);
+       *cptr=c;
+       *(cptr+1)=color;
+       if (dev==ActiveDDL && dev->active && !dev->bufmode)
+          fbconsole_cell_render(x,y,(unsigned char)c,(unsigned char)color);
+    };
 };
 
 //outoyt text
@@ -278,17 +311,19 @@ int Dex32PutText(DEX32_DDL_INFO *dev,int left, int top, int right,
    DWORD vidmemloc=dev->buf_ptr;
    int i,i2,i3=0;
   
-   for (i2=top;i2<=bottom;i2++){
-      for (i=left;i<=right;i++){
-         char *cptr;
-         cptr=(char*)(vidmemloc+ (i2 * 80 + i) * 2);
-         *cptr = source[i3];
-         i3++;
-         *(cptr+1) = source[i3];
-         i3++;
-      };
-   }
-}; 
+  for (i2=top;i2<=bottom;i2++){
+       for (i=left;i<=right;i++){
+          char *cptr;
+          cptr=(char*)(vidmemloc+ (i2 * 80 + i) * 2);
+          *cptr = source[i3];
+          i3++;
+          *(cptr+1) = source[i3];
+          i3++;
+       };
+    }
+    if (dev==ActiveDDL && dev->active && !dev->bufmode)
+       fbconsole_screen_refresh();
+};
 
 
 //retrieve the text at a given position

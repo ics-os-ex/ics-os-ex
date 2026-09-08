@@ -272,6 +272,7 @@ test-ide-thumbdrive: usb
 	@grep -aq "Mounting boot device hdp0" /tmp/icsos-ide-thumbdrive.log
 	@grep -aq "PART_REG hdp0 hdp0p0" /tmp/icsos-ide-thumbdrive.log
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-ide-thumbdrive.log
+	@grep -aq "FBCONSOLE_PASS" /tmp/icsos-ide-thumbdrive.log
 	@! grep -aq "bad MBR signature" /tmp/icsos-ide-thumbdrive.log
 	@! grep -aq "no root filesystem mounted" /tmp/icsos-ide-thumbdrive.log
 	@! grep -aq "General Protection fault" /tmp/icsos-ide-thumbdrive.log
@@ -292,6 +293,7 @@ test-usb-uefi: usb
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-uefi-usb.log
 	@grep -aq "Root filesystem is the USB mass-storage device" /tmp/icsos-uefi-usb.log
 	@grep -aq "AP scheduling enabled" /tmp/icsos-uefi-usb.log
+	@grep -aq "FBCONSOLE_PASS" /tmp/icsos-uefi-usb.log
 	@! grep -aq "General Protection fault" /tmp/icsos-uefi-usb.log
 	@echo "test-usb-uefi PASS"
 
@@ -318,6 +320,7 @@ test-boot: vmdex
 	@grep -aq "serial console ready" /tmp/icsos-boot.log
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-boot.log
 	@grep -aq "AP scheduling enabled" /tmp/icsos-boot.log
+	@grep -aq "FBCONSOLE_PASS" /tmp/icsos-boot.log
 	@! grep -aq "General Protection fault" /tmp/icsos-boot.log
 	@echo "test-boot PASS"
 

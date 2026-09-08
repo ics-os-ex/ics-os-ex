@@ -6,6 +6,16 @@ mb2_header_start:
     .long 0                     /* arch: i386 */
     .long mb2_header_end - mb2_header_start
     .long -(0xE85250D6 + 0 + (mb2_header_end - mb2_header_start))
+    /* framebuffer header tag: request a linear framebuffer (UEFI GOP / VBE)
+       so the kernel gets a visible console under firmware without a legacy
+       VGA text mode. Bootloader fills an MB2_TAG_FRAMEBUFFER info tag. */
+    .word 5                 /* MB2 header tag: framebuffer */
+    .word 1                 /* optional */
+    .long 20                /* tag size: type(2)+flags(2)+size(4)+w(4)+h(4)+depth(4) */
+    .long 1024              /* preferred width */
+    .long 768               /* preferred height */
+    .long 32                /* color depth */
+    .align 8                /* MB2: each tag starts at an 8-byte aligned address */
     /* end tag */
     .word 0
     .word 0
