@@ -1,9 +1,6 @@
 @echo off
-@echo Loading Microsoft C runtime library...
-loadmod /icsos/lib1/msvcrt.dll
-@echo Initializing RAM Disk...
-loadmod /icsos/lib1/ramdisk.dll -blocks 30000
-mount fat ramdisk /ramdisk
+rem msvcrt.dll + ramdisk.dll are obsolete/legacy: the kernel now provides
+rem /ramdisk natively and the in-OS toolchain is ELF64 (no PE runtime).
 rem copy /icsos/apps/ed.exe /ramdisk
 pcut rd: /ramdisk/
 cls

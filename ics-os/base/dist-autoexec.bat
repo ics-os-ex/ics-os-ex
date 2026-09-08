@@ -1,7 +1,6 @@
 @echo off
-loadmod /icsos/lib1/msvcrt.dll
-loadmod /icsos/lib1/ramdisk.dll -blocks 30000
-mount fat ramdisk /ramdisk
+rem msvcrt.dll + ramdisk.dll are obsolete/legacy: the kernel now provides
+rem /ramdisk natively and the in-OS toolchain is ELF64 (no PE runtime).
 copy /icsos/apps/crt1.o /ramdisk/crt1.o
 copy /icsos/apps/tccsdk.o /ramdisk/tccsdk.o
 copy /icsos/apps/libtcc1.o /ramdisk/libtcc1.o

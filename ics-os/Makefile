@@ -99,7 +99,10 @@ prep_image: vmdex
 	cp base/* tmp
 	if [ -d apps ] && ls apps/* >/dev/null 2>&1; then cp -r apps/* tmp/apps/; fi
 	find sdk -maxdepth 1 -type f -exec cp {} tmp/tcc1/ \;
-	if [ -d lib ] && ls lib/* >/dev/null 2>&1; then cp lib/* tmp/lib1/; fi
+	# msvcrt.dll + ramdisk.dll are obsolete/legacy: the kernel now provides
+	# /ramdisk natively and the in-OS toolchain is ELF64 (no PE runtime),
+	# so both are excluded from the image.
+	@if [ -d lib ] && ls lib/* >/dev/null 2>&1; then for f in lib/*; do b=$$(basename "$$f"); case "$$b" in msvcrt.dll|ramdisk.dll) continue;; esac; cp "$$f" tmp/lib1/; done; fi
 	chmod +x scripts/stage-selfhost.sh
 	scripts/stage-selfhost.sh tmp
 
