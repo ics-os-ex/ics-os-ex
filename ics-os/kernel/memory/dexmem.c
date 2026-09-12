@@ -129,6 +129,20 @@ static volatile int cow_fail_next;
 static u8 frame_allocmap[0x100000000ull / 0x1000 / 8];
 static u8 frame_refs[0x100000000ull / 0x1000];
 static int frame_dbg;           /* enable alloc/free anomaly reporting      */
+static unsigned long frame_anomaly_prints;  /* cap: avoid serial flood      */
+static void frame_report(const char *tag, u64 phys);
+
+/* Report a frame anomaly at most a few times, then stay quiet but keep
+   counting, so a corrupted free list cannot flood the serial console
+   (the 16550 UART drops bytes under 4-CPU output anyway). */
+static int frame_anomaly_report(const char *tag, u64 phys)
+{
+   if (frame_anomaly_prints < 8) {
+      frame_anomaly_prints++;
+      frame_report(tag, phys);
+   }
+   return 0;
+}
 
 static void frame_report(const char *tag, u64 phys)
 {
@@ -152,8 +166,24 @@ u64 frame_alloc(void)
    spin_lock(&frame_lock);
    head = frame_head;
     if (head) {
-       u64 next = *(volatile u64 *)KDIRECT(head);
        u64 idx = head >> 12;
+       u64 next;
+       /* The free list is intrusive: each free frame holds its own next
+          pointer, so a write to a frame that is on the free list (a
+          freed-while-mapped frame) corrupts the list head.  A bogus head must
+          never be dereferenced or used to index frame_allocmap/frame_refs, or
+          it turns one corrupted pointer into a wild write past the 128KiB map
+          (cr2 far from the map's own base).  Fail closed before touching the
+          head: drop the bogus head, report, and return 0 (caller treats it as
+          exhaustion) instead of corrupting adjacent BSS. */
+       if (idx >= sizeof(frame_refs)) {
+          if (!frame_dbg) { frame_dbg = 1; }
+          frame_anomaly_report("BAD-HEAD", head);
+          spin_unlock(&frame_lock);
+          restoreflags(flags);
+          return 0;
+       }
+       next = *(volatile u64 *)KDIRECT(head);
       frame_head = next;
       frame_free--;
       if (frame_allocmap[idx >> 3] & (1u << (idx & 7))) {
@@ -228,6 +258,16 @@ void frame_release(u64 phys)
    spin_lock(&frame_lock);
    {
       u64 idx = phys >> 12;
+      /* Out-of-range phys (a corrupted caller) must not index the 128KiB
+         map / 1MiB ref table or be pushed onto the free list (which would
+         poison frame_head for the next frame_alloc).  Report and drop. */
+      if (idx >= sizeof(frame_refs)) {
+         if (!frame_dbg) { frame_dbg = 1; }
+         frame_anomaly_report("BAD-RELEASE", phys);
+         spin_unlock(&frame_lock);
+         restoreflags(flags);
+         return;
+      }
       if (!(frame_allocmap[idx >> 3] & (1u << (idx & 7)))
           || frame_refs[idx] == 0) {
          if (!frame_dbg) { frame_dbg = 1; }
@@ -2644,11 +2684,7 @@ void userpd_free(u64 *pml4)
     frame_release((u64)(uintptr)pdpt);
     frame_release((u64)(uintptr)pml4);
     freed += 2;
-
-    printf("userpd: freed %d frames, free %llu/%llu\n",
-           freed,
-           (unsigned long long)frame_free_count(),
-           (unsigned long long)frame_total_count());
+    (void)freed;
  }
 
 void mem_init()

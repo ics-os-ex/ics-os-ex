@@ -4,11 +4,22 @@ OBJCOPY=objcopy
 CP=cp
 TOOLPREFIX=
 DEBUGFLAGS=-g
+# -MMD -MP: emit <obj>.d header-dependency files (included below). The manual
+# per-rule header prerequisites are sparse; without auto deps, editing a shared
+# header (e.g. process/process.h changing sizeof(PCB386)) leaves most objects
+# stale and the kernel links a mixed-layout image, corrupting PCB fields and
+# saved contexts on every switch. Host build only: the in-OS gcc driver
+# (INOS=1) does not support -MMD.
+ifeq ($(INOS),1)
+HDRDEP=
+else
+HDRDEP=-MMD -MP
+endif
 CFLAGS=-std=gnu89 -fno-stack-protector -fgnu89-inline -m64 -mcmodel=large -w -nostdlib \
 	-fno-builtin -ffreestanding -fno-pie -fno-pic \
 	-fno-asynchronous-unwind-tables \
 	-mno-red-zone -msse -msse2 \
-	-fno-strict-aliasing -fcommon -c $(DEBUGFLAGS) -I.
+	-fno-strict-aliasing -fcommon -c $(DEBUGFLAGS) -I. $(HDRDEP)
 ASM=gcc
 ASMFLAGS=$(CFLAGS)
 LDFLAGS=-m elf_x86_64 -T lscript64.ld --build-id=none -z max-page-size=0x1000 -z noexecstack -nostdlib
@@ -181,3 +192,8 @@ clean:
 	rm -f Kernel64.bin Kernel32.bin
 	rm -f Kernel64.sym Kernel32.sym
 	rm -f vmdex
+	rm -f *.d
+
+# Header dependencies emitted by -MMD -MP. Included last so a missing .d
+# (fresh checkout) is not an error.
+-include $(wildcard *.d)

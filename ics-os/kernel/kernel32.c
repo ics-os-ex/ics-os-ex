@@ -320,13 +320,24 @@ void main(){
              }
            }
            if (tag->type == MB2_TAG_FRAMEBUFFER && tag->size >= 38) {
-              const mb2_fb_tag *fb = (const mb2_fb_tag *)tag;
-              fbconsole_boot_init(fb->addr, fb->pitch, fb->width, fb->height,
-                                  fb->bpp, fb->ftype,
-                                  fb->r_shift, fb->r_size,
-                                  fb->g_shift, fb->g_size,
-                                  fb->b_shift, fb->b_size);
-           }
+               const mb2_fb_tag *fb = (const mb2_fb_tag *)tag;
+               fbconsole_boot_init(fb->addr, fb->pitch, fb->width, fb->height,
+                                   fb->bpp, fb->ftype,
+                                   fb->r_shift, fb->r_size,
+                                   fb->g_shift, fb->g_size,
+                                   fb->b_shift, fb->b_size);
+               /* Direct-to-panel fb state (no serial on the N150). Visible only
+                  when the framebuffer is ready (fb_base != 0), so seeing it
+                  proves the fb console path is live. */
+               {
+                  char fbl[96];
+                  sprintf(fbl, "FB %ux%u bpp=%u pitch=%u active=%d",
+                          (unsigned)fb->width, (unsigned)fb->height,
+                          (unsigned)fb->bpp, (unsigned)fb->pitch,
+                          fbconsole_active());
+                  fbdbg_info(fbl);
+               }
+            }
            if ((tag->type == 15 || (tag->type == 14 && !acpi_rsdp_length)) &&
                tag->size > 8) {
              DWORD length = tag->size - 8;
@@ -395,11 +406,12 @@ void main(){
    program8259(IRQ_TIMER | IRQ_KEYBOARD | IRQ_FDC | IRQ_CASCADE); 
 
    //sets up the default interrupt handlers, like the PF handler,GPF handler
-   setdefaulthandlers();   
-    
-   /*and some device handlers like the keyboard handler
-     initializes the keyboard*/
-   installkeyboard(); 
+    setdefaulthandlers();
+    fbdbg_stage(1, "IDT installed");
+
+    /*and some device handlers like the keyboard handler
+      initializes the keyboard*/
+    installkeyboard();
 
     //obtain the device which booted this operating system         
    kernel_systeminfo.boot_device = mbhdr->boot_device >> 24;
@@ -472,10 +484,11 @@ void main(){
     /* A framebuffer above 4GiB needs the full paging setup that mem_init()
        completes; below 4GiB boot_init already mapped it uncacheable. */
     fbconsole_deferred_init();
+     fbdbg_stage(2, "mem_init + fb deferred");
 
-   /*The default values of the current_process variable, which is the kernel
-     PCB (also seeded before the first printf above). */
-   current_process = &sPCB;
+    /*The default values of the current_process variable, which is the kernel
+      PCB (also seeded before the first printf above). */
+    current_process = &sPCB;
 
    //Program the Timer to context switch n times a second	
    dex32_set_timer(context_switch_rate);
@@ -495,7 +508,8 @@ void main(){
    current_process = &sPCB;
    sPCB.outdev = consoleDDL;
    fg_kernel = fg_register(consoleDDL, 0);
-    fg_setforeground(fg_kernel);
+   fg_setforeground(fg_kernel);
+    fbdbg_stage(3, "console up");
 
     /* Verify the framebuffer renderer against the live panel before any
        user output; no-op (serial note) when the legacy text path is in use. */
@@ -519,20 +533,23 @@ void dex32_startup(){
     
    //obtain CPU information using the CPUID instruction
    printf("Obtaining CPU information...\n");
-   hardware_getcpuinfo(&hardware_mycpu);
-   hardware_printinfo(&hardware_mycpu);
-    
-   printf("Available memory: %d KB\n", memamount/1024);
+  hardware_getcpuinfo(&hardware_mycpu);
+    hardware_printinfo(&hardware_mycpu);
+     fbdbg_stage(4, "CPU info");
+
+    printf("Available memory: %d KB\n", memamount/1024);
 
    //Initialize the extension manager
-   printf("Initializing the extension manager...");
-   extension_init();
-   printf("[OK]\n");
+ printf("Initializing the extension manager...");
+    extension_init();
+    printf("[OK]\n");
+    fbdbg_stage(5, "ext mgr");
 
    //initialize the device manager
-   printf("Initializing the device manager...");
-   devmgr_init();
-   printf("[OK]\n");
+printf("Initializing the device manager...");
+    devmgr_init();
+    printf("[OK]\n");
+    fbdbg_stage(6, "dev mgr");
 
    //register the memory manager
    printf("Registering the memory manager and the memory allocator...");
@@ -545,8 +562,9 @@ void dex32_startup(){
     
    /* initialize the malloc server, place the device name of the malloc
       function you wish to use as the paramater*/
-   alloc_init("dl_malloc"); 
-   printf("[OK]\n");
+   alloc_init("dl_malloc");
+    printf("[OK]\n");
+    fbdbg_stage(7, "alloc");
 
    {
       extern int vtd_discover(const void *rsdp, unsigned int length);
@@ -554,53 +572,60 @@ void dex32_startup(){
       if (acpi_rsdp_length)
          vtd_discover(acpi_rsdp, acpi_rsdp_length);
       else
-         printf("vtd: ACPI RSDP unavailable\n");
-      printf("[OK]\n");
-   }
-    
-   //register the hardware ports manager
-   printf("Initializing ports...");
-   ports_init();
-   printf("[OK]\n");
+          printf("vtd: ACPI RSDP unavailable\n");
+       printf("[OK]\n");
+    }
+    fbdbg_stage(8, "vtd");
+
+    //register the hardware ports manager
+printf("Initializing ports...");
+    ports_init();
+    printf("[OK]\n");
+    fbdbg_stage(9, "ports");
 
    //Initialize the PCI bus driver
    printf("Initializing PCI devices...");
    //show_pci();
    //icsos_pci_init();
    printf("[OK]\n");
-   printf("Initializing rtl8139 NIC...");
-   //rtl8139_init();
-   printf("[OK]\n");
+printf("Initializing rtl8139 NIC...");
+    //rtl8139_init();
+    printf("[OK]\n");
+    fbdbg_stage(10, "pci/nic");
    //delay(400/80);
 				
    //initialize the API module
    printf("Initializing kernel API...");		  
-   api_init();
-   printf("[OK]\n");
+api_init();
+    printf("[OK]\n");
+    fbdbg_stage(11, "api");
 
    //initialize the keyboard device driver
    printf("Initializing keyboard and mouse drivers...");
    irq_init();
    init_keyboard();
-   installmouse();
-   init_mouse();
-   printf("[OK]\n");
+installmouse();
+    init_mouse();
+    printf("[OK]\n");
+    fbdbg_stage(12, "kbd/mouse");
 
    /* x86_64: LAPIC probe early; AP bring-up after process manager is ready. */
    {
       extern void lapic_init(void);
       extern void smp_init(void);
       printf("Initializing LAPIC/SMP...");
-      lapic_init();
-      smp_init();
-      printf("[OK]\n");
-   }
+lapic_init();
+       smp_init();
+       printf("[OK]\n");
+    }
+    fbdbg_stage(13, "lapic/smp");
    
    //Initialize the process manager and the initial
    //processes
    printf("Initializing the process manager...");
-   process_init();    //defined in process.c
-   printf("[OK]\n");
+process_init();    //defined in process.c
+    printf("[OK]\n");
+    fbdbg_stage(14, "process mgr");
 
    /* Start APs after process manager exists, but park them until root is mounted.
       (LAPIC timer on APs is deferred until smp_enable_scheduling.) */
@@ -624,17 +649,19 @@ void dex32_startup(){
           smp_start_aps();
        }
        printf("[OK]\n");
-       restoreflags(flags);
-   }
+        restoreflags(flags);
+    }
+    fbdbg_stage(15, "APs started");
 
-   /* BSP keeps PIT/LAPIC timer for scheduling; enable after AP probe. */
+    /* BSP keeps PIT/LAPIC timer for scheduling; enable after AP probe. */
    {
       extern void lapic_timer_init(unsigned int hz);
       lapic_timer_init(context_switch_rate);
    }
 
-   //process manager is ready, pass execution to the taskswitcher
-   taskswitcher();      //defined in process.h
+  //process manager is ready, pass execution to the taskswitcher
+    fbdbg_stage(16, "taskswitcher");
+    taskswitcher();      //defined in process.h
 
     //============ we should not reach this point at all =================
    while (1)

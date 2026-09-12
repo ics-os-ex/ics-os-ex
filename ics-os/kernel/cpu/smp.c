@@ -37,6 +37,78 @@ static volatile u64 tlb_shootdown_cr3[MAX_CPUS];
 static volatile u32 tlb_shootdown_targets[MAX_CPUS];
 static volatile u32 tlb_shootdown_ack[MAX_CPUS];
 
+/* IA32_TSC_AUX: logical CPU id independent of CR3 and LAPIC MMIO.  After a
+   user process loads a private PML4, 0xFEE00000 may not be readable, so
+   lapic_get_id() returns 0 and the old smp_cpu_id() treated every AP as the
+   BSP.  That made sync_entercrit use the BSP process token (pc_busy
+   non-owner leave under make -j4).  RDTSCP reads TSC_AUX without a memory
+   walk.  GS cannot hold this: startup/kexec reload %gs from the GDT. */
+#define MSR_IA32_TSC_AUX 0xC0000103u
+
+static void smp_publish_cpu_id(int id)
+{
+    u32 lo = (u32)id;
+    u32 hi = 0;
+    __asm__ __volatile__("wrmsr"
+                         :
+                         : "c"(MSR_IA32_TSC_AUX), "a"(lo), "d"(hi)
+                         : "memory");
+}
+
+static int smp_cpu_id_from_lapic(void)
+{
+    u32 apic;
+    int i;
+    if (!lapic_mmio)
+        return -1;
+    apic = lapic_get_id();
+    for (i = 0; i < MAX_CPUS; i++) {
+        if (cpus[i].cpu_id == i && cpus[i].apic_id == apic)
+            return i;
+    }
+    return -1;
+}
+
+static int smp_have_rdtscp = -1;
+
+static int smp_rdtscp_available(void)
+{
+    u32 a, b, c, d, maxext;
+    if (smp_have_rdtscp >= 0)
+        return smp_have_rdtscp;
+    __asm__ __volatile__("cpuid"
+                         : "=a"(maxext), "=b"(b), "=c"(c), "=d"(d)
+                         : "a"(0x80000000u)
+                         : "memory");
+    if (maxext < 0x80000001u) {
+        smp_have_rdtscp = 0;
+        return 0;
+    }
+    __asm__ __volatile__("cpuid"
+                         : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                         : "a"(0x80000001u)
+                         : "memory");
+    smp_have_rdtscp = (d & (1u << 27)) ? 1 : 0;
+    return smp_have_rdtscp;
+}
+
+int smp_cpu_id(void) {
+    int id;
+    if (smp_rdtscp_available()) {
+        u32 aux, lo, hi;
+        __asm__ __volatile__("rdtscp"
+                             : "=a"(lo), "=d"(hi), "=c"(aux)
+                             :
+                             : "memory");
+        if (aux < (u32)MAX_CPUS)
+            return (int)aux;
+    }
+    id = smp_cpu_id_from_lapic();
+    if (id >= 0)
+        return id;
+    return 0;
+}
+
 static void smp_tlb_process_requests(int cpu)
 {
     unsigned long cr3;
@@ -54,19 +126,6 @@ static void smp_tlb_process_requests(int cpu)
             __asm__ __volatile__("movq %0, %%cr3" :: "r"(cr3) : "memory");
         __sync_fetch_and_or(&tlb_shootdown_ack[sender], bit);
     }
-}
-
-int smp_cpu_id(void) {
-    u32 id;
-    int i;
-    if (!lapic_mmio)
-        return 0;
-    id = lapic_get_id();
-    for (i = 0; i < cpu_count; i++) {
-        if (cpus[i].online && cpus[i].apic_id == id)
-            return i;
-    }
-    return 0;
 }
 
 cpu_local *smp_this_cpu(void) {
@@ -93,15 +152,18 @@ void smp_cpu_idle(void) {
     }
 }
 
-/* IPI handler: nudge this CPU to pick up runnable work.
-    Use the voluntary-switch path (taskswitch) so a spawned user task is
-    scheduled even while the selfhost-stage1 cooperative gate suppresses
-    periodic timer preemption.  The gate exists only to stop the periodic
-    LAPIC/PIT tick from preempting a running tool; an explicit reschedule
-    IPI is an event and must still run the scheduler. */
+/* IPI handler: wake idle/kernel threads so they can claim newly published
+   work.  Do not software-context-switch a USER process from this wrapper.
+   Stage-1 cooperative certs suppress timer preemption of tools; an IPI
+   that still called taskswitch() preempted gcc mid-syscall, resumed with
+   IF=1 before iretq (context_switch forces IF on save), and GPF'd in
+   reschedwrapper (err=0xe470).  Idle and ACCESS_SYS threads may still
+   switch: test-smp work-steal depends on that. */
 void smp_reschedule_ipi(void) {
     lapic_eoi();
     if (!smp_sched_enabled)
+        return;
+    if (current_process && current_process->accesslevel == ACCESS_USER)
         return;
     taskswitch();
 }
@@ -172,6 +234,9 @@ static volatile u32 ap_work_mask = 0;
 
 static void ap_work_smoke(void) {
     int cpu=smp_cpu_id();
+    char record[48];
+    sprintf(record,"\nSMP_RESULT cpuid cpu=%d\n",cpu);
+    serial_puts(record);
     if (cpu>0 && cpu<MAX_CPUS)
         __sync_fetch_and_or(&ap_work_mask,1u<<cpu);
     sched_block_process(current_process,0);
@@ -300,6 +365,7 @@ void ap_main(void) {
         for (;;)
             __asm__ __volatile__("cli; hlt");
     }
+    smp_publish_cpu_id(id);
     cpus[id].cpu_id = id;
     cpus[id].apic_id = (u32)apic;
     cpus[id].online = 0;
@@ -343,6 +409,15 @@ void smp_init(void) {
     cpus[0].cpu_id = 0;
     cpus[0].apic_id = lapic_get_id();
     cpus[0].online = 1;
+    smp_publish_cpu_id(0);
+    /* The BSP needs its own per-CPU kernel stack for int 0x30 / timer
+       entry: user ELFs run in kernel CS (CPL 0), so those traps are
+       same-privilege and never load a TSS RSP0.  Without this, the
+       kernel's full call depth runs on the current task's 1 MiB user
+       stack and deep syscall chains overflow it (SMP=4 cert PF64 in
+       sync_entercrit, orphaned io_devlock).  ap_stacks[0] is never
+       used by an AP (APs claim ids 1..MAX_CPUS-1), so it is free. */
+    cpus[0].kernel_stack = &ap_stacks[0][65536];
     /* BSP current is set by main/process_init; keep slot ready. */
     {
         extern PCB386 sPCB;

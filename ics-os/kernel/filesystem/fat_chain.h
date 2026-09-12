@@ -21,7 +21,10 @@
  * Decide the outcome of one step of a bounded FAT chain walk.
  *   next   - the next-cluster value just read from the FAT
  *   eoc    - the end-of-chain marker for the FAT type (>= eoc means EOC)
- *   maxent - the maximum number of data clusters in the volume (>= 1)
+ *   maxent - highest valid cluster **number** on the volume (FAT data
+ *            clusters are numbered 2 .. count+1, so pass count+1).
+ *            Also used as the loop bound: a walk longer than this many
+ *            steps is treated as a cycle.
  *   steps  - clusters counted so far, including this one (>= 1)
  */
 static int fat_chain_step(unsigned int next, unsigned int eoc,

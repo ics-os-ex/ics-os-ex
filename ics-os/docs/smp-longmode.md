@@ -47,8 +47,19 @@ Default scheduler is **priority round-robin** (`process/scheduler.c`):
 - xAPIC ICR writes wait for delivery-idle before and after each IPI. This avoids
   overwriting an in-progress reschedule or startup command at larger CPU counts.
 - `current_process` is per-CPU (`smp_this_cpu()->current`).
+- `smp_cpu_id()` reads **IA32_TSC_AUX** via `RDTSCP` (published at BSP `smp_init`
+  and as soon as an AP claims its slot). It does **not** walk LAPIC MMIO as the
+  primary source: a user private PML4 can make `0xFEE00000` unreadable, after
+  which a LAPIC-only id would return 0 and the AP would enter/leave crits as
+  the BSP process. A LAPIC id match is only a fallback if TSC_AUX is unset.
 - APs come up **parked** until `smp_enable_scheduling()` after a successful root mount, then load the **kernel GDT**, arm a **LAPIC timer on vector 0x41**, and participate in scheduling.
 - Ready-queue tasks are claimed via `on_cpu`; `cpu_affinity` pins console/`fg_mgr`/user processes to the BSP. APs run migratable kthreads (see `ap_work` smoke).
+- `IPI_RESCHEDULE` (0xFC) may `taskswitch()` only when the interrupted task is
+  idle or `ACCESS_SYS`. A user process is not preempted from that wrapper:
+  software `context_switch` from the IPI frame enables IF before `iretq` and
+  GPFs (`reschedwrapper`, selector error). Spawned user work is picked up by
+  idle CPUs or by the spawner's voluntary `waitpid`/`taskswitch`. Timer
+  preemption of user tools stays off for `selfhost-stage1-parallel`.
 - `createkthread_on_cpu()` installs affinity before ready-queue publication;
   setting affinity after `createkthread()` is unsafe once AP scheduling is live.
 - The ready-queue walk skips foreign idle threads and wrong-affinity tasks.

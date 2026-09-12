@@ -1470,12 +1470,9 @@ static int spawn_load(const char *path, const char *params)
     if (id && (int)id != -1)
        return (int)id;
 
-    printf("ELFCRIT enter %s pid=%d\n", name, (int)getprocessid());
     sync_entercrit(&elf_map_crit);
-    printf("ELFCRIT held %s pid=%d\n", name, (int)getprocessid());
     buf = (char *)vfs_mapfile(name, &size);
     if (!buf) {
-       printf("ELFCRIT leave-nobuf %s pid=%d\n", name, (int)getprocessid());
        sync_leavecrit(&elf_map_crit);
        return -ENOENT;
     }
@@ -1483,7 +1480,6 @@ static int spawn_load(const char *path, const char *params)
     id = dex32_loader(name, buf, userspace, 0, cmd, showpath(temp),
                       current_process);
     free(buf);
-    printf("ELFCRIT leave %s pid=%d id=%d\n", name, (int)getprocessid(), (int)id);
     sync_leavecrit(&elf_map_crit);
     if (!id || (int)id == -1)
        return -ENOEXEC;
@@ -1504,13 +1500,13 @@ static PCB386 *waitpid_live_child(PCB386 *parent)
    if (!head)
       return (PCB386 *)-1;
    p = head;
-   do {
-      if (p->owner == parent->processid && p != parent
+      do {
+         if (p->owner == parent->processid && p != parent
           && !(p->status & PS_ATTB_THREAD)
           && !(p->status & PS_ATTB_UNLOADABLE))
          return p;
-      p = p->next;
-   } while (p && p != head);
+         p = p->next;
+      } while (p && p->before && p != head);
    return (PCB386 *)-1;
 }
 

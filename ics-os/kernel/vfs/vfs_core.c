@@ -885,24 +885,26 @@ char * vfs_getcwd (char *buffer, unsigned int size)
     return buffer;
 };
 
-int file_ok(file_PCB* fhandle)
+static int file_ok_locked(file_PCB* fhandle)
 {
-    int retval = 0;
     file_PCB *ptr=file_globalopen;
     if (fhandle==0) return 0;
-
-    sync_entercrit(&vfs_busy);
     while (ptr!=0)
     {
-        if (ptr==fhandle) {
-            retval=1;
-            break;
-        };
+        if (ptr==fhandle)
+            return 1;
         ptr=ptr->next;
-        ;
-    };
+    }
+    return 0;
+}
 
-    sync_leavecrit(&vfs_busy);  
+int file_ok(file_PCB* fhandle)
+{
+    int retval;
+    if (fhandle==0) return 0;
+    sync_entercrit(&vfs_busy);
+    retval = file_ok_locked(fhandle);
+    sync_leavecrit(&vfs_busy);
     return retval;
 };
 
@@ -910,7 +912,7 @@ int vfs_file_get(file_PCB *fhandle)
 {
     int retval=0;
     sync_entercrit(&vfs_busy);
-    if (file_ok(fhandle) && !fhandle->closing) {
+    if (file_ok_locked(fhandle) && !fhandle->closing) {
         fhandle->active_refs++;
         retval=1;
     }
@@ -922,7 +924,7 @@ int vfs_file_inherit(file_PCB *fhandle)
 {
     int retval=0;
     sync_entercrit(&vfs_busy);
-    if (file_ok(fhandle) && !fhandle->closing && fhandle->fd_refs) {
+    if (file_ok_locked(fhandle) && !fhandle->closing && fhandle->fd_refs) {
         fhandle->fd_refs++;
         retval=1;
     }
@@ -933,7 +935,7 @@ int vfs_file_inherit(file_PCB *fhandle)
 void vfs_file_mark_posix(file_PCB *fhandle)
 {
     sync_entercrit(&vfs_busy);
-    if (file_ok(fhandle) && fhandle->legacy_refs) {
+    if (file_ok_locked(fhandle) && fhandle->legacy_refs) {
         fhandle->legacy_refs--;
         fhandle->fd_refs++;
     }
@@ -963,7 +965,7 @@ void vfs_file_put(file_PCB *fhandle)
 {
     int destroyed=0;
     sync_entercrit(&vfs_busy);
-    if (file_ok(fhandle) && fhandle->active_refs) {
+    if (file_ok_locked(fhandle) && fhandle->active_refs) {
         fhandle->active_refs--;
         if (fhandle->closing && !fhandle->fd_refs && !fhandle->legacy_refs &&
             !fhandle->active_refs)
@@ -1526,7 +1528,7 @@ int fclose(file_PCB *fhandle)
     int destroyed=0;
 
     sync_entercrit(&vfs_busy);
-    if (fhandle!=0 && file_ok(fhandle) && fhandle->legacy_refs) {
+    if (fhandle!=0 && file_ok_locked(fhandle) && fhandle->legacy_refs) {
         fhandle->legacy_refs--;
         retval=0;
         if (!fhandle->fd_refs && !fhandle->legacy_refs) {
@@ -1548,7 +1550,7 @@ int vfs_file_fdclose(file_PCB *fhandle)
     int retval=-1;
     int destroyed=0;
     sync_entercrit(&vfs_busy);
-    if (fhandle!=0 && file_ok(fhandle) && fhandle->fd_refs) {
+    if (fhandle!=0 && file_ok_locked(fhandle) && fhandle->fd_refs) {
         fhandle->fd_refs--;
         retval=0;
         if (!fhandle->fd_refs && !fhandle->legacy_refs) {

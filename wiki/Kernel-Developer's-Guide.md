@@ -136,7 +136,11 @@ must wait for delivery-idle. Use `createkthread_on_cpu()` when affinity is known
 setting affinity after ready-queue insertion races AP scheduling. Per-CPU arrays
 must use `MAX_CPUS`, never a literal topology size. Context-load/voluntary guards
 and FPU save/restore scratch storage must remain per CPU. The aggregate AP work mask is
-the scheduler test oracle. COM1 output is protected by an IRQ-safe SMP lock;
+the scheduler test oracle. Each AP worker also emits `SMP_RESULT cpuid cpu=N`
+from `smp_cpu_id()` (TSC_AUX/RDTSCP, not LAPIC MMIO). `IPI_RESCHEDULE` must
+not `taskswitch()` a user process (IRQ-frame software switch GPFs in
+`reschedwrapper`); idle/kernel threads may still switch so work-steal stays
+valid. COM1 output is protected by an IRQ-safe SMP lock;
 machine-consumed tests must emit one atomic `SMP_RESULT` record with
 `serial_puts()` instead of parsing concurrent `printf()` prose. Sparse APIC IDs,
 MADT/x2APIC discovery, NUMA, and CPU hotplug are not implemented and must not be
@@ -145,10 +149,11 @@ claimed.
 The FAT cluster-chain walk is bounded and fail-closed. `get_sector_fromcluster`
 (`filesystem/fat12.c`) advances a file's clusters one step at a time and must not
 trust the FAT table: each step is validated by `fat_chain_step()`
-(`filesystem/fat_chain.h`, a pure host-testable function) against the volume's
-real capacity (`fat_cluster_count()`). A next pointer that is a valid FAT32
-marker ends the chain; one outside the data-cluster range is a corrupt volume;
-and a chain that has taken more steps than the volume has clusters is a loop. In
+(`filesystem/fat_chain.h`, a pure host-testable function). Pass the highest
+legal cluster **id** (`fat_cluster_count()+1`, because FAT numbers data
+clusters from 2). A next pointer that is a valid FAT32
+marker ends the chain; one above that id is a corrupt volume;
+and a chain that has taken more steps than that id is a loop. In
 both failure cases the walk stops and returns 0 (the read fails closed) instead
 of spinning or reading out of bounds. Do not re-introduce an unbounded `while`
 over `obtain_next_cluster()`; if you change the walk, add a case to

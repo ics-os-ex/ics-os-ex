@@ -923,7 +923,13 @@ DWORD get_sector_fromcluster(DWORD cluster,BPB *bpbblock,int func,BYTE *fat, int
        walker unboundedly). */
     maxent = fat_cluster_count(bpbblock);
     if (maxent <= 0)
-       maxent = 1;
+       maxent = 2;
+    else
+       /* Cluster ids are 2 .. count+1. fat_chain_step treats maxent as
+          that highest legal id (next=count+1 is a full-volume file).
+          Using count alone rejected the last cluster (cert: next=8120
+          > max=8119) and aborted writes as "corrupt". */
+       maxent = maxent + 1;
 
     for (;;) {
        DWORD next;

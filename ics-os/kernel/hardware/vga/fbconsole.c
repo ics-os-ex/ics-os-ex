@@ -29,6 +29,20 @@ static unsigned char *fb_base;
 static int fb_cx = -1;
 static int fb_cy = -1;
 
+/* Live per-cell framebuffer blitting is OFF by default. Each cell render is
+   128 MMIO writes (and a full screen refresh is 256,000), which in QEMU are
+   slow VM-exits; doing them on the console hot path while a process holds a
+   device lock deadlocks the I/O path (see development_blog.md 2026-09-09).
+   The DDL already keeps a per-device text shadow; a deferred blit from a
+   low-priority context is the intended long-term path. The boot selftest
+   (fbconsole_selftest) turns this ON to validate the renderer directly. */
+static int fb_live_render = 0;
+
+void fbconsole_set_live_render(int on)
+{
+    fb_live_render = on ? 1 : 0;
+}
+
 static unsigned int fb_scale(unsigned int v, unsigned int size)
 {
     if (size >= 8)
@@ -150,7 +164,7 @@ int fbconsole_active(void)
 
 void fbconsole_cell_render(int x, int y, unsigned char c, unsigned char attr)
 {
-    if (!fbconsole_active())
+    if (!fbconsole_active() || !fb_live_render)
         return;
     if (x < 0 || x >= 80 || y < 0 || y >= 25)
         return;
@@ -186,7 +200,7 @@ void fbconsole_screen_refresh(void)
     DEX32_DDL_INFO *d;
     unsigned char *t;
     int x, y;
-    if (!fbconsole_active())
+    if (!fbconsole_active() || !fb_live_render)
         return;
     d = ActiveDDL;
     if (!d || !d->active || d->bufmode)
@@ -214,7 +228,7 @@ void fbconsole_cursor_to(int x, int y)
 {
     unsigned int row, col;
     unsigned int white;
-    if (!fbconsole_active())
+    if (!fbconsole_active() || !fb_live_render)
         return;
     if (x < 0) x = 0;
     if (x >= 80) x = 79;
@@ -242,6 +256,11 @@ void fbconsole_selftest(void)
 
     if (!fbconsole_active())
         return;
+
+    /* Enable live blitting just for this one-shot validation so the renderer
+       actually writes the framebuffer; restore it so the console hot path
+       stays out of the MMIO path afterwards. */
+    fb_live_render = 1;
 
     /* 1) absolute pixel check: red-on-black space at cell (0,0). Every
        pixel of the 8x16 cell must equal the packed palette[4] value. */
@@ -291,6 +310,8 @@ void fbconsole_selftest(void)
         sprintf(msg, "FBCONSOLE_FAIL %u pixel mismatches\n", (unsigned)fails);
         serial_puts(msg);
     }
+
+    fb_live_render = 0;
 }
 
 void fbconsole_export_tag(unsigned char *buf)
@@ -340,4 +361,95 @@ void fbconsole_export_tag(unsigned char *buf)
     buf[35] = 0;
     buf[36] = 0;
     buf[37] = 0;
+}
+
+/* ==========================================================================
+   Low-level direct-framebuffer diagnostics (early-boot crash localization).
+
+   These paint straight into the linear framebuffer using the validated fb
+   state (fb_base/fb_pitch/fb_bpp), bypassing the DDL/console entirely. They
+   are safe to call from kernel fault handlers: read-only 8x16 font, no
+   allocation, and the wrapper has already disabled interrupts. Every entry
+   no-ops when the framebuffer is not ready (fb_base == 0), so the legacy
+   0xB8000 text path is left completely untouched.
+   ========================================================================== */
+
+static void fbdbg_cell(int cx, int cy, char c, unsigned char attr)
+{
+    if (!fb_base)
+        return;
+    if (cx < 0 || cx >= 80 || cy < 0 || cy >= 25)
+        return;
+    fb_draw_glyph(&g_8x16_font[(unsigned int)(unsigned char)c * 16u],
+                  (unsigned int)cx * 8u, (unsigned int)cy * 16u,
+                  fb_color(attr & 0x0Fu), fb_color((attr >> 4) & 0x0Fu));
+}
+
+static int fbdbg_str(int cx, int cy, const char *s, unsigned char attr)
+{
+    while (*s && cx < 80) {
+        if (*s == '\n') { if (cy < 24) cy++; cx = 0; }
+        else { fbdbg_cell(cx, cy, *s, attr); cx++; }
+        s++;
+    }
+    return cx;
+}
+
+static void fbdbg_row(int cy, unsigned char attr)
+{
+    int x;
+    if (!fb_base || cy < 0 || cy >= 25)
+        return;
+    for (x = 0; x < 80; x++)
+        fbdbg_cell(x, cy, ' ', attr);
+}
+
+/* Record a boot stage on the bottom row (0x5F = white on magenta). Overwritten
+   each call, so the last visible badge is the stage where boot stopped. Bottom
+   placement keeps it clear of the top-down console text. */
+void fbdbg_stage(int n, const char *name)
+{
+    char line[72];
+    if (!fb_base)
+        return;
+    fbdbg_row(24, 0x5F);
+    sprintf(line, " STAGE %02d: %s", n, name);
+    fbdbg_str(0, 24, line, 0x5F);
+}
+
+/* One-shot info line on row 0 (0x1E = yellow on blue). Used right after the
+   multiboot2 framebuffer tag is parsed so the fb console state is visible on
+   the panel before the console init clears the screen. */
+void fbdbg_info(const char *s)
+{
+    if (!fb_base)
+        return;
+    fbdbg_row(0, 0x1E);
+    fbdbg_str(0, 0, s, 0x1E);
+}
+
+/* Full-panel fault banner (0x4F = white on red), rows 0-6. Painted by the
+   kernel fault handlers so the crash is visible on the panel (the N150 has no
+   serial). Shows the vector, name, faulting RIP and CR2; the RIP resolves
+   against Kernel64.sym. */
+void fbdbg_fault(int vec, const char *name,
+                 unsigned long long rip, unsigned long long cr2)
+{
+    static volatile int shown = 0;
+    char line[64];
+    int x, y;
+    if (!fb_base || shown)
+        return;
+    shown = 1;
+    for (y = 0; y < 7; y++)
+        for (x = 0; x < 80; x++)
+            fbdbg_cell(x, y, ' ', 0x40);
+    fbdbg_str(0, 0, "### KERNEL FAULT ###", 0x4F);
+    sprintf(line, "vector %d  (%s)", vec, name);
+    fbdbg_str(0, 1, line, 0x4F);
+    sprintf(line, "rip = 0x%llx", rip);
+    fbdbg_str(0, 2, line, 0x4F);
+    sprintf(line, "cr2 = 0x%llx", cr2);
+    fbdbg_str(0, 3, line, 0x4F);
+    fbdbg_str(0, 5, "system halted", 0x4F);
 }

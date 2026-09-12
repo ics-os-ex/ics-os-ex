@@ -47,7 +47,22 @@ void fbconsole_cursor_to(int x, int y);
 void fbconsole_selftest(void);
 
 /* Fill buf (>= 40 bytes) with the framebuffer info tag so a kexeced
-   kernel can reuse the same framebuffer. */
-void fbconsole_export_tag(unsigned char *buf);
+    kernel can reuse the same framebuffer. */
+ void fbconsole_export_tag(unsigned char *buf);
 
-#endif
+ /* ---- Direct-framebuffer crash diagnostics (early-boot localization) ----
+    Paint straight to the linear framebuffer, bypassing the DDL/console. Safe
+    to call from kernel fault handlers; no-op when the framebuffer is not
+    ready (legacy VGA path unaffected). */
+
+ /* Record a boot stage on the bottom row; the last badge is where boot stopped. */
+ void fbdbg_stage(int n, const char *name);
+
+ /* One-shot info line on row 0 (fb console state, right after tag parse). */
+ void fbdbg_info(const char *s);
+
+ /* Full-panel red fault banner: vector, name, faulting RIP and CR2. */
+ void fbdbg_fault(int vec, const char *name,
+                  unsigned long long rip, unsigned long long cr2);
+
+ #endif

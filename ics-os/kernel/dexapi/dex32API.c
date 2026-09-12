@@ -221,22 +221,6 @@ api_arg_t api_syscall(api_arg_t fxn, api_arg_t val, api_arg_t val2,
    api_arg_t (*syscall_function)(api_arg_t p1, api_arg_t p2, api_arg_t p3,
                                   api_arg_t p4, api_arg_t p5);
     diag_sc_count++;
-     {
-        static volatile unsigned long api_user_debug = 0;
-        if (current_process &&
-            current_process->accesslevel == ACCESS_USER &&
-            api_user_debug < 128) {
-           extern int smp_cpu_id(void);
-           extern void serial_puts(const char *s);
-           extern int sprintf(char *str, const char *fmt, ...);
-           char ab[128];
-           api_user_debug++;
-           sprintf(ab, "SYSCALL cpu=%d pid=%d fxn=0x%lx n=%lu\n",
-                   smp_cpu_id(), (int)current_process->processid,
-                   (unsigned long)fxn, (unsigned long)api_user_debug);
-           serial_puts(ab);
-        }
-     }
      //cursyscall[] is used for debugging purposes, it stores the last two different
     //system calls that was called and sets op_success if the system
     //call finished without crashing or causing a fault, false oherwise

@@ -19,11 +19,10 @@
  * The kernel propagates child status through waitpid. The driver additionally
  * verifies each phase's own output so truncated files cannot pass as success.
  *
- * The tool ELFs (cc1/as/ld) are loaded from TOOLDIR (the CD) by the kernel exec
- * path, which is safe.  The files the children READ as input (the .c source, the
- * intermediate .s/.o, and the SDK runtime .o's fed to ld) must live on /ramdisk,
- * because a spawned child reading the CD mid-run is flaky (the proven
- * bintest/selfhost pattern).  The console `gccdrv` command stages them.
+ * The tool ELFs (cc1/as/ld) are loaded from /work/apps when that volume is
+ * present (self-host cert), otherwise /icsos/apps (gccdrv smoke). Intermediate
+ * .s/.o temps follow: /work when the work disk is there, else /ramdisk. SDK
+ * runtime .o's stay on /ramdisk for the small `gccdrv` smoke that stages them.
  *
  * Usage (enough to build+link a C program, and to grow toward the self-host):
  *   gcc [opts] in.c -o out            compile+link  -> runnable ELF64
@@ -52,17 +51,40 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 
-#define TOOLDIR  "/icsos/apps"   /* cc1/as/ld ELFs (loaded by the kernel exec path) */
-#define RTDIR    "/ramdisk"      /* SDK runtime .o's + intermediates (child-readable) */
-#define CC1      TOOLDIR "/cc1.exe"
-#define AS       TOOLDIR "/as.exe"
-#define LD       TOOLDIR "/ld.exe"
+#define TOOLDIR_WORK "/work/apps"  /* cert / SMP make -jN */
+#define TOOLDIR_CD   "/icsos/apps" /* gccdrv smoke (no /work) */
+#define RTDIR        "/ramdisk"    /* SDK runtime .o's for gccdrv smokes */
 /* Intermediate temps are named per-process: the driver is invoked concurrently
    by `make -jN`, so a fixed shared path would let parallel jobs clobber each
    other's cc1/as scratch files. The concrete names are built in main() from
-   getpid(). */
-#define T_S_FMT  RTDIR "/.gccdrv.%d.s"
-#define T_O_FMT  RTDIR "/.gccdrv.%d.o"
+   getpid(). Prefer /work so four concurrent .s files cannot fill /ramdisk. */
+#define T_S_FMT  "%s/.gccdrv.%d.s"
+#define T_O_FMT  "%s/.gccdrv.%d.o"
+
+static int have_work_cc1(void)
+{
+   static int cached = -1;
+   int fd;
+   if (cached >= 0)
+      return cached;
+   fd = open("/work/apps/cc1.exe", O_RDONLY);
+   if (fd >= 0) {
+      close(fd);
+      cached = 1;
+   } else
+      cached = 0;
+   return cached;
+}
+
+static const char *gccdrv_tooldir(void)
+{
+   return have_work_cc1() ? TOOLDIR_WORK : TOOLDIR_CD;
+}
+
+static const char *gccdrv_tmpdir(void)
+{
+   return have_work_cc1() ? "/work" : "/ramdisk";
+}
 
 /* The SDK runtime ("libc") linked in automatically when linking (no -c). */
 static const char *sdkrt[] = {
@@ -99,18 +121,18 @@ static const char *selfhost_opts[] = {
    "-DHAVE_AS_TLS=1", "-DHAVE_AS_GOTTPLTPCALL=1",
    "-DHAVE_AS_TLSDIRECT=1", "-DHAVE_AS_CFI_SECTIONS=1",
    "-DHAVE_AS_X86_CMPXCHG16B=1",
-   "-I/icsos/gccsrc/gen", "-I/icsos/gccsrc/shims",
-   "-I/icsos/gccsrc/conf/gcc", "-I/icsos/gccsrc/sdk/include",
-   "-I/icsos/gccsrc/up/gcc", "-I/icsos/gccsrc/up/gcc/c-family",
-   "-I/icsos/gccsrc/up/gcc/common",
-   "-I/icsos/gccsrc/up/gcc/common/config/i386",
-   "-I/icsos/gccsrc/up/gcc/config", "-I/icsos/gccsrc/up/gcc/config/i386",
-   "-I/icsos/gccsrc/up/libcpp", "-I/icsos/gccsrc/up/libcpp/include",
-   "-I/icsos/gccsrc/up/libiberty", "-I/icsos/gccsrc/conf/gmp",
-   "-I/icsos/gccsrc/conf/mpfr", "-I/icsos/gccsrc/up/mpfr",
-   "-I/icsos/gccsrc/up/mpc/src", "-I/icsos/gccsrc/up/libdecnumber",
-   "-I/icsos/gccsrc/up/libdecnumber/bid", "-I/icsos/gccsrc/up/libgcc",
-   "-I/icsos/gccsrc/up/zlib", "-I/icsos/gccsrc/up/include", 0
+   "-I/work/gccsrc/gen", "-I/work/gccsrc/shims",
+    "-I/work/gccsrc/conf/gcc", "-I/work/gccsrc/sdk/include",
+    "-I/work/gccsrc/up/gcc", "-I/work/gccsrc/up/gcc/c-family",
+    "-I/work/gccsrc/up/gcc/common",
+    "-I/work/gccsrc/up/gcc/common/config/i386",
+    "-I/work/gccsrc/up/gcc/config", "-I/work/gccsrc/up/gcc/config/i386",
+    "-I/work/gccsrc/up/libcpp", "-I/work/gccsrc/up/libcpp/include",
+    "-I/work/gccsrc/up/libiberty", "-I/work/gccsrc/conf/gmp",
+    "-I/work/gccsrc/up/mpfr",
+    "-I/work/gccsrc/up/mpc/src", "-I/work/gccsrc/up/libdecnumber",
+    "-I/work/gccsrc/up/libdecnumber/bid", "-I/work/gccsrc/up/libgcc",
+    "-I/work/gccsrc/up/zlib", "-I/work/gccsrc/up/include", 0
 };
 
 static void die(const char *phase)
@@ -203,9 +225,9 @@ int main(int argc, char **argv)
    static char out[256];
    static char inc[256];
    static char objsrc[256];      /* object fed to ld (temp) or the -c output */
-   static char cc1path[256] = CC1;
-    static char aspath[256] = AS;
-    static char ldpath[256] = LD;
+   static char cc1path[256];
+    static char aspath[256];
+    static char ldpath[256];
     static char ts_name[160];     /* per-pid cc1 assembly temp */
     static char to_name[160];     /* per-pid as object temp (link mode) */
     static char *cc1argv[192];
@@ -218,6 +240,10 @@ int main(int argc, char **argv)
    int have_in = 0;
    int have_out = 0;
    int is_s = 0;
+
+   sprintf(cc1path, "%s/cc1.exe", gccdrv_tooldir());
+   sprintf(aspath, "%s/as.exe", gccdrv_tooldir());
+   sprintf(ldpath, "%s/ld.exe", gccdrv_tooldir());
 
    /* ---- parse the gcc command line ---- */
    for (i = 1; i < argc; i++) {
@@ -301,8 +327,10 @@ int main(int argc, char **argv)
     /* Per-pid scratch paths so concurrent `make -jN` driver invocations never
        share (and clobber) the same cc1/as intermediate files. */
     mypid = getpid();
-    sprintf(ts_name, T_S_FMT, mypid);
-    sprintf(to_name, T_O_FMT, mypid);
+    sprintf(ts_name, T_S_FMT, gccdrv_tmpdir(), mypid);
+    sprintf(to_name, T_O_FMT, gccdrv_tmpdir(), mypid);
+    printf("gccdriver: tooldir=%s tmpdir=%s pid=%d\n",
+           gccdrv_tooldir(), gccdrv_tmpdir(), mypid);
 
     if (!have_in) die("parse: no input file");
 
@@ -348,6 +376,8 @@ int main(int argc, char **argv)
    asargv[5] = 0;
    if (run_tool(aspath, asargv)) die("as spawn");
    if (check_out(objsrc, 1) < 0) die("as: no object");
+   if (!is_s)
+      unlink(ts_name);
    printf("gccdriver: as ok\n");
 
    /* ---- phase 3: ld (GNU ld) links object + SDK runtime into a runnable ELF64 ---- */
@@ -360,7 +390,9 @@ int main(int argc, char **argv)
          /* The ICS-OS binutils port cannot reliably derive ldscripts/ from
             argv[0], so select its packaged default script explicitly. */
          ldargv[k++] = "-T";
-         ldargv[k++] = "/icsos/apps/ldscripts/elf_x86_64.xc";
+          ldargv[k++] = have_work_cc1()
+             ? "/work/apps/ldscripts/elf_x86_64.xc"
+             : "/icsos/apps/ldscripts/elf_x86_64.xc";
          for (i = 0; sdkrt[i]; i++) ldargv[k++] = sdkrt[i];
       }
       for (i = 0; i < ldnopts; i++) ldargv[k++] = ldoptargv[i];

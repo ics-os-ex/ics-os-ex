@@ -31,7 +31,7 @@ HOSTG_RTFLAGS := -m64 -std=gnu89 -w -nostdlib -fno-builtin -static -ffreestandin
 vmdex:
 	make -C kernel/
 
-.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-ide-thumbdrive
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-ide-thumbdrive
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -498,7 +498,12 @@ test-smp: vmdex
 		expected_mask=$$(printf '%x' $$(( (1 << $(SMP_CPUS)) - 2 ))); \
 		grep -aq "AP scheduling enabled" /tmp/icsos-smp-$(SMP_CPUS).log && \
 		tr -d '\r' < /tmp/icsos-smp-$(SMP_CPUS).log | \
-		grep -aEq "^SMP_RESULT work-steal=ok cpus=$(SMP_CPUS) mask=$${expected_mask}$$"; \
+		grep -aEq "^SMP_RESULT work-steal=ok cpus=$(SMP_CPUS) mask=$${expected_mask}$$" && \
+		cpu=1; while test $$cpu -lt $(SMP_CPUS); do \
+			tr -d '\r' < /tmp/icsos-smp-$(SMP_CPUS).log | \
+			grep -aEq "^SMP_RESULT cpuid cpu=$$cpu$$" || exit 1; \
+			cpu=$$((cpu + 1)); \
+		done; \
 	fi
 	@! grep -aqE "General Protection fault|SMP: AP work-steal (TIMEOUT|CREATE FAIL)" /tmp/icsos-smp-$(SMP_CPUS).log
 	@echo "test-smp SMP_CPUS=$(SMP_CPUS) PASS"
@@ -845,6 +850,43 @@ test-spawn: kernel/Kernel64.bin apps/spawn.exe apps/hello.exe
 	@! grep -aq "FD_INHERIT_FAIL" /tmp/icsos-spawn.log
 	@! grep -aq "WORK_DISK_FAIL" /tmp/icsos-spawn.log
 	@echo "test-spawn PASS"
+
+# Spawn/exit/reap churn reproducer for the saved-context (ctx.rip) corruption
+# seen during the parallel self-host build.  STRESS_SMP overrides the vCPU
+# count (default 4 = the cert configuration; 1 = fastest single-CPU repro).
+STRESS_SMP ?= 4
+STRESS_ROUNDS ?= 40
+STRESS_BURST ?= 8
+STRESS_TIMEOUT ?= 120
+
+apps/stressproc.exe: contrib/stressproc/stressproc.c contrib/stressproc/Makefile
+	$(MAKE) -C contrib/stressproc install
+
+test-stress: kernel/Kernel64.bin apps/stressproc.exe apps/hello.exe
+	@$(MAKE) -C kernel all
+	@echo "Building Multiboot2 ISO for spawn/exit stress + work disk..."
+	@mkdir -p /tmp/icsos-stress-iso/boot/grub /tmp/icsos-stress-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-stress-iso/vmdex
+	@cp apps/stressproc.exe /tmp/icsos-stress-iso/apps/stressproc.exe
+	@cp apps/hello.exe /tmp/icsos-stress-iso/apps/hello.exe
+	@printf '%s\n' 'stressproc.exe' 'reboot' > /tmp/icsos-stress-iso/autoexec.bat
+	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
+		> /tmp/icsos-stress-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-stress.iso /tmp/icsos-stress-iso >/dev/null 2>&1
+	@echo "Formatting 512 MiB FAT16 virtio work disk..."
+	@truncate -s 512M /tmp/icsos-work.img
+	@mkfs.vfat -F 16 -s 32 /tmp/icsos-work.img >/dev/null
+	@echo "Running spawn/exit stress (KVM, smp $(STRESS_SMP))..."
+	@-timeout $(STRESS_TIMEOUT) stdbuf -oL $(QEMU_X64) -enable-kvm -cpu host -smp $(STRESS_SMP) -nographic -no-reboot -m 256M \
+		-cdrom /tmp/icsos-stress.iso -boot d \
+		-drive file=/tmp/icsos-work.img,if=none,id=vd0,format=raw \
+		-device virtio-blk-pci,drive=vd0,disable-legacy=on \
+		< /dev/null > /tmp/icsos-stress.log 2>&1
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-stress.log
+	@grep -aq "STRESSPROC_PASS" /tmp/icsos-stress.log
+	@! grep -aq "STRESSPROC_FAIL" /tmp/icsos-stress.log
+	@! grep -aqE "PF64 |GPF64 " /tmp/icsos-stress.log
+	@echo "test-stress PASS"
 
 apps/forktest.exe: contrib/forktest/forktest.c contrib/forktest/Makefile
 	$(MAKE) -C contrib/forktest install
@@ -1320,8 +1362,22 @@ test-selfhost-cert: vmdex apps/as.exe apps/ld.exe apps/ar.exe apps/hello.exe app
 	@printf 'set timeout=0\nmenuentry "ics" { multiboot2 /vmdex $(SELFHOST_CMDLINE); boot }\n' \
 		> /tmp/icsos-gccself-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-gccself.iso /tmp/icsos-gccself-iso >/dev/null 2>&1
-	@truncate -s 512M /tmp/icsos-gccself-work.img
+	@truncate -s 1G /tmp/icsos-gccself-work.img
 	@mkfs.vfat -F 16 -s 32 /tmp/icsos-gccself-work.img >/dev/null
+	@echo "Populating FAT work disk with GCC source, seed, apps, ldscripts..."
+	@mkdir -p /tmp/icsos-gccself-stage/apps/ldscripts
+	@cp /tmp/icsos-gcc/cc1 /tmp/icsos-gccself-stage/apps/cc1.exe
+	@cp contrib/gccdriver/gcc.exe /tmp/icsos-gccself-stage/apps/gcc.exe
+	@cp apps/as.exe apps/ar.exe apps/ld.exe apps/hello.exe \
+		/tmp/icsos-gccself-stage/apps/
+	@cp apps/make.exe /tmp/icsos-gccself-stage/apps/make.exe
+	@cp apps/objcopy.exe apps/cp.exe apps/mkdir.exe apps/rm.exe \
+		/tmp/icsos-gccself-stage/apps/
+	@cp apps/ldscripts/elf_x86_64.x* /tmp/icsos-gccself-stage/apps/ldscripts/
+	@cp /tmp/icsos-gcc/rt/*.o /tmp/icsos-gccself-stage/apps/
+	@mcopy -i /tmp/icsos-gccself-work.img -s /tmp/icsos-gccself/gccsrc ::gccsrc
+	@mcopy -i /tmp/icsos-gccself-work.img -s /tmp/icsos-gccself/seed ::seed
+	@mcopy -i /tmp/icsos-gccself-work.img -s /tmp/icsos-gccself-stage/apps ::apps
 	@echo "Running strict GCC self-host closure test (may take several hours)..."
 	@rm -f /tmp/icsos-gccself.log
 	@-timeout $(CERT_TIMEOUT) $(QEMU_X64) -enable-kvm -cpu host -smp $(SELFHOST_SMP) \

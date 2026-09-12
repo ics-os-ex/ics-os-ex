@@ -203,6 +203,7 @@ int user_fork(){
 int user_execp(char *fname, DWORD mode, char *params){
     DWORD id,size;
     char *buf;
+    char temp[255];
 
     /* Serialize the eager ELF map + load path with sys_spawn().  The previous
        per-image cache was not safe under SMP: two concurrent callers could map
@@ -212,59 +213,52 @@ int user_execp(char *fname, DWORD mode, char *params){
        buffer can be freed immediately after dex32_loader() and does not need to
        stay alive while the child runs.  Holding the crit only across map+load
        also bounds kernel-heap pressure from large concurrent cc1.exe images. */
-     printf("ELFCRIT enter %s pid=%d (execp)\n", fname, (int)getprocessid());
-     sync_entercrit(&elf_map_crit);
-     printf("ELFCRIT held %s pid=%d (execp)\n", fname, (int)getprocessid());
-     buf = (char*)vfs_mapfile(fname, &size);
-     if (!buf){
-        printf("ELFCRIT leave-nobuf %s pid=%d (execp)\n", fname, (int)getprocessid());
-        sync_leavecrit(&elf_map_crit);
-        return 0;
-     }
+    sync_entercrit(&elf_map_crit);
+    buf = (char*)vfs_mapfile(fname, &size);
+    if (!buf){
+       sync_leavecrit(&elf_map_crit);
+       return 0;
+    }
 
     printf("execp: loading %s (%u bytes) [mmap]\n", fname, (unsigned)size);
+    /* Load synchronously from the caller. The historic process_dispatcher
+       kthread path can starve under software scheduling while the console
+       spins on pd_ok(). */
+    id = dex32_loader(fname, buf, userspace, mode, params,
+                      showpath(temp), current_process);
+
+    if (!id || (int)id == -1){
+       printf("execp: failed to start %s\n", fname);
+       free(buf);
+       sync_leavecrit(&elf_map_crit);
+       return 0;
+    }
+    free(buf);
+    sync_leavecrit(&elf_map_crit);
+
+    printf("execp: started pid=%d, waiting\n", (int)id);
+    fg_setmykeyboard(id);
     {
-         char temp[255];
+       int child_status = 0;
+       dex32_child_faulted = 0;
+       printf("execp: waitpid enter pid=%d\n", (int)id);
+       /* Consume the direct child's retained status. A process-global fault
+          flag can be set by a faulting grandchild and must not classify its
+          healthy parent as failed. */
+       if (sys_waitpid((int)id,&child_status,0)!=(long)id)
+          child_status = 1;
+       printf("execp: waitpid exit pid=%d status=%d\n", (int)id,
+              child_status);
+       dex32_child_faulted = child_status != 0;
 
-         /* Load synchronously from the caller. The historic process_dispatcher
-            kthread path can starve under software scheduling while the console
-            spins on pd_ok(). */
-         id = dex32_loader(fname, buf, userspace, mode, params,
-                           showpath(temp), current_process);
-
-        if (!id || (int)id == -1){
-             printf("execp: failed to start %s\n", fname);
-             free(buf);
-             printf("ELFCRIT leave %s pid=%d (execp fail)\n", fname, (int)getprocessid());
-             sync_leavecrit(&elf_map_crit);
-             return 0;
-          }
-          free(buf);
-          printf("ELFCRIT leave %s pid=%d (execp id=%d)\n", fname, (int)getprocessid(), (int)id);
-          sync_leavecrit(&elf_map_crit);
-
-         printf("execp: started pid=%d, waiting\n", (int)id);
-          fg_setmykeyboard(id);
-          int child_status = 0;
-          dex32_child_faulted = 0;
-          printf("execp: waitpid enter pid=%d\n", (int)id);
-          /* Consume the direct child's retained status. A process-global fault
-             flag can be set by a faulting grandchild and must not classify its
-             healthy parent as failed. */
-          if (sys_waitpid((int)id,&child_status,0)!=(long)id)
-             child_status = 1;
-          printf("execp: waitpid exit pid=%d status=%d\n", (int)id,
-                 child_status);
-         dex32_child_faulted = child_status != 0;
-
-         fg_setmykeyboard(getprocessid());
-         if (dex32_child_faulted) {
-            printf("execp: child faulted\n");
-            return 0;
-         }
-         return id;
-    };
- };
+       fg_setmykeyboard(getprocessid());
+       if (dex32_child_faulted) {
+          printf("execp: child faulted\n");
+          return 0;
+       }
+       return id;
+    }
+}
 
 int exec(char *fname, DWORD mode, char *params){
    DWORD id;

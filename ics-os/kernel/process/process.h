@@ -71,6 +71,13 @@
 #define PS_ATTB_UNLOADABLE  2
 #define PS_ATTB_BLOCKED     4
 #define PS_ATTB_THREAD      8
+/* Set on a self-exiting (or remotely killed) user PCB the instant it stops
+   being eligible to run.  Unlike UNLOADABLE, which is also set on permanent
+   kernel/idle PCBs, DYING marks a PCB that is about to be torn down, so the
+   scheduler must never claim it.  Set before on_cpu is cleared (with a full
+   barrier) so no other CPU can observe "unclaimed + in the ready list" for a
+   zombie whose private PML4 is about to be freed. */
+#define PS_ATTB_DYING       16
 
 //defines the PIDs of the SCHEDULER and the scheduler
 #define SYSPID_KERNEL   0
@@ -319,7 +326,19 @@ typedef struct _PCB386 {
        exiting process must not leave its owner token in a crit, or every
        later acquire spins forever. */
     sync_sharedvar *held_crits[16];
-    int held_crit_n;
+      int held_crit_n;
+      volatile int crits_freed;
+      /* 1 while this process is in the sync_entercrit spin loop WAITING for a
+         crit it does not hold. The no-preempt guard (scheduler.c) must NOT pin
+         a process that is itself waiting on a lock: pinning a nested spinner
+         starves the lock's actual owner (which is runnable in the ready queue)
+         and deadlocks the whole system (the SMP io_devlock deadlock). A holder
+         that is doing useful work under a crit (crit_wait==0) is still pinned. */
+      volatile int crit_wait;
+
+   /* Lock-free self-exit reclaim list. After dequeue, next/before belong to
+      the scheduler; this pointer is only used once the PCB is a zombie. */
+   struct _PCB386 *zombie_next;
 
 }PCB386;
 

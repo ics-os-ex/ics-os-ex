@@ -90,18 +90,23 @@ void GPFhandler64(struct gpf_info *fi, unsigned long saved_rax, unsigned long sa
         }
     }
     (void)saved_rax;
-    (void)saved_rcx;
-    if (current_process && current_process->processid != 0) {
-         /* User-process fault: recover like the page-fault path. exc_recover()
-            sets dex32_child_faulted and calls exit(1), which kills the faulted
-            child and context-switches to its parent, abandoning this wrapper's
-            stack frame (the gpfwrapper iretq is never reached). The parent's
-            waitpid then sees the crash instead of the child spinning. */
-         serial_puts("\nGPF64: user fault -> killing process, resuming parent\n");
-        gpf_busy = 0;   /* allow a later fault (e.g. the fallback run) to dump */
-        exc_recover();
-        /* not reached: exc_recover() -> exit(1) switched away */
-     }
+     (void)saved_rcx;
+     /* A GPF on a KERNEL thread (ACCESS_SYS) is a genuine kernel bug. The old
+        discriminator (processid != 0) misclassified kernel threads such as
+        ap_work (pid 16) as user processes and called exc_recover() -> exit(1),
+        killing the thread while it held ready_lock and wedging every CPU.
+        Only true user processes (ACCESS_USER) may be killed-and-resumed. */
+     if (current_process && current_process->accesslevel == ACCESS_USER) {
+          /* User-process fault: recover like the page-fault path. exc_recover()
+             sets dex32_child_faulted and calls exit(1), which kills the faulted
+             child and context-switches to its parent, abandoning this wrapper's
+             stack frame (the gpfwrapper iretq is never reached). The parent's
+             waitpid then sees the crash instead of the child spinning. */
+          serial_puts("\nGPF64: user fault -> killing process, resuming parent\n");
+         gpf_busy = 0;   /* allow a later fault (e.g. the fallback run) to dump */
+         exc_recover();
+         /* not reached: exc_recover() -> exit(1) switched away */
+      }
 
     serial_puts("\nGPF64: kernel fault -> halt\n");
     while (1) {}

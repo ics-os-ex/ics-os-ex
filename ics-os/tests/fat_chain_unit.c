@@ -29,7 +29,7 @@ int main(void)
 {
     unsigned int eoc = 0x0FFFFFF8u;   /* FAT32 end-of-chain marker */
 
-    printf("TAP version 13\n1..10\n");
+    printf("TAP version 13\n1..14\n");
 
     /* --- valid step ---------------------------------------------------- */
     check("a valid in-range next cluster continues the walk",
@@ -60,6 +60,21 @@ int main(void)
           fat_chain_step(1u, eoc, 0u, 1u) == FCH_OK);
     check("maxent 0: next pointer 2 is corrupt",
           fat_chain_step(2u, eoc, 0u, 1u) == FCH_CORRUPT);
+
+    /* --- FAT numbering: N data clusters occupy ids 2 .. N+1 ----------- */
+    {
+        unsigned int eoc16 = 0xFFFFu;
+        unsigned int count = 8119u;
+        unsigned int max_id = count + 1u; /* 8120 */
+        check("last FAT cluster id (count+1) is in range",
+              fat_chain_step(max_id, eoc16, max_id, 100u) == FCH_OK);
+        check("one past last cluster id is corrupt (not EOC)",
+              fat_chain_step(max_id + 1u, eoc16, max_id, 100u) == FCH_CORRUPT);
+        check("full-volume chain length equal to max id is allowed",
+              fat_chain_step(50u, eoc16, max_id, max_id) == FCH_OK);
+        check("chain longer than max id is a loop",
+              fat_chain_step(50u, eoc16, max_id, max_id + 1u) == FCH_LOOP);
+    }
 
     (void)g_n;
     return g_ok ? 0 : 1;

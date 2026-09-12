@@ -4225,3 +4225,619 @@ coverage: `test-usb-storage` (UHCI, shares the CORE_IMG change) and
 system GRUB 2.12 emits the framebuffer info tag correctly on every path once the
 video modules are present. Building GRUB from source would only buy a
 version-pinned reproducible test image; deferred unless we want that.
+
+### 13:30 — **Removed legacy `msvcrt.dll` + `ramdisk.dll` from startup and dist image**
+
+While validating the rebuilt 14 GB dist image for real-laptop testing, booting it
+showed the PE loader (`kernel/module/pe_module.c:306`, `importpatch`) printing
+~62,000 `Warning: N. Cannot resolve '<Symbol>'` lines for `msvcrt.dll`. The DLL is
+only 32 KB with a *null* Import Address Table Directory, yet the loader walked
+past the end of the import table (`importpatch` does its thunk/name RVA math
+against the ImageBase `base` rather than the actual load address) — a pre-existing
+PE-loader defect, not a regression. At serial speed the flood delayed reaching the
+shell by several minutes, which would make the laptop test unusable.
+
+Since the in-OS toolchain is ELF64 (no PE runtime) and the kernel now provides
+`/ramdisk` natively (`kernel/filesystem/ramdisk.c`, auto-mounted at boot via
+`ramdisk_init()`/`ramdisk_mount()` in `kernel32.c:825/928`), both legacy PE DLLs
+are obsolete. Removed:
+- `loadmod /icsos/lib1/{msvcrt,ramdisk}.dll` and the now-redundant
+  `mount fat ramdisk /ramdisk` from `base/autoexec.bat` and
+  `base/dist-autoexec.bat` (kept the `/ramdisk` seeding of the SDK runtime objects,
+  which the kernel still provides).
+- Excluded both DLLs from the `tmp/lib1/` staging in `Makefile` (`prep_image`), so
+  `lib1/` is empty in the image; both are marked obsolete/legacy in comments.
+
+**Validation:** rebuilt `ics-os-dist.img` (14000 MiB). Boot test (QEMU IDE, 90 s):
+`serial console ready` + `FBCONSOLE_PASS` + `Root mount [OK]` +
+`ramdisk: mounted at /ramdisk` + `ICS-OS Distribution` banner + shell running
+(`sh.exe` SYSCALLs). **0** `Cannot resolve` warnings; shell reached in seconds.
+
+Committed `34f3375` (3 source files: Makefile, autoexec.bat, dist-autoexec.bat),
+pushed to `ics-os-v2`. Image ready to flash:
+`sudo dd if=ics-os-dist.img of=/dev/sdX bs=4M status=progress conv=fsync`.
+
+**Remaining (separate):** the `importpatch` RVA/base defect in `pe_module.c` is
+still present and would re-flood any future PE module load; the exit-time
+`bridges_link` use-after-free from the gcc driver is also still open.
+
+### 16:30 — **N150 laptop instant-reboot: added early-boot diagnostics (cli + markers + fault IDT)**
+
+**Symptom.** On a real Intel N150 laptop, GRUB prints
+`error: serial port 'com0' isn't found. Loading ICS-OS (multiboot2)...` and the
+machine reboots in <1 s — blank screen, no serial, no VGA markers. Firmware mode
+(BIOS vs UEFI) on the laptop is unknown.
+
+**Reproduction.** Not reproducible in *any* tested emulator — QEMU TCG/KVM × BIOS/UEFI
+and VirtualBox BIOS/UEFI all boot to the shell cleanly. So the crash is
+real-firmware-specific.
+
+**Root-cause suspects (ranked).**
+1. **Stale-IDT interrupt window (top).** Between `_start` and `setdefaulthandlers()`
+   (`kernel32.c:398`) there is no kernel IDT. `program8259()` (`kernel32.c:395`) can
+   unmask the PIC timer in that window; if IF is left set by firmware, a timer tick
+   hits a stale 32-bit IDT gate → `#GP` → `#DF` → triple fault → instant reboot.
+   Emulators leave the PIC/LAPIC quiet; real firmware may not.
+2. Framebuffer tag misparse — **ruled out** (verified tag type 8 + layout against GRUB
+   2.12 `multiboot2.h`: u64 addr @8, pitch @16, w @20, h @24, bpp @28, size 38).
+3. CPU instruction mismatch — **ruled out** (kernel builds with `-msse -msse2` only,
+   no `-march=native`/AVX; N150 has SSE2, mandatory for x86-64).
+
+**Fix (diagnostics first, since the crash is laptop-only).** In
+`kernel/startup/startup.S`:
+- `cli` at the very top of `_start` — closes the stale-IDT interrupt window before any
+  risky work. Safe: the scheduler re-enables interrupts later (`cpu_idle()` does
+  `sti;hlt` in `stdlib/time.c:445`, plus `cpu/smp.c` and `process/sync.c:177`).
+- Multiboot2 framebuffer tag parsed in 32-bit `multiboot_entry` into early globals
+  (`early_fb_addr/pitch/width/height/bpp`) so the handler can paint the firmware
+  framebuffer (visible under UEFI, where 0xb8000 VGA text is not shown).
+- **Early diagnostic IDT** installed in 64-bit `long_mode_start` right after stack
+  setup, before zeroing BSS / SYSCALL MSRs. 256 per-vector **stubs**
+  (`efstub_base + N*16`, each `push N; jmp early_fault_common`) + one common handler
+  that prints `EF <vector> r=<rip>` to 0xb8010 (VGA) and paints a 32×32 red block to
+  the framebuffer, then hangs. This turns a silent triple fault into a visible
+  vector + faulting RIP on both BIOS and UEFI.
+- Fine-grained VGA progress markers 1–6: entry, page tables, LME, early IDT, SSE/CR0/CR4,
+  BSS zeroed. The last lit marker localizes where the real hardware dies.
+
+**Asm bugs caught while implementing** (all fixed): `movq` is invalid in 32-bit mode
+(split the u64 addr into two `movl`); x86 has no memory-to-memory `mov` (route the tag
+fields through `%eax`); `early_idtr` holds non-zero values so it moved out of `.bss`
+into `.data` (only the all-zero `early_idt` stays in `.bss`); and the first IDT fill
+pointed all entries straight at the handler while the handler expected a *pushed*
+vector — fixed by the 256 stubs (verified via `objdump`: stub N = `push N`, 16-byte
+stride, region 0x100350→0x101350 ends exactly at `early_fault_common`).
+
+**Validation (no regression).** Rebuilt the **minimum 128 MiB** `ics-os-usb.img`
+(no 14 GB toolchain needed — the crash is pre-userspace). All four emulator gates pass
+on that image: `test-ide-thumbdrive` (QEMU BIOS), `test-usb-uefi` (QEMU UEFI),
+`test-vbox-usb-image` (VirtualBox BIOS), `test-vbox-usb-image-efi` (VirtualBox UEFI) —
+each reaches `serial console ready` + `Root mount [OK]` + `FBCONSOLE_PASS` with no GPF,
+so the early IDT did not fire.
+
+**Deliverable for the laptop.** `ics-os/ics-os-usb.img` (128 MiB,
+md5 `9711134132d1cb071c7b4065311c2f91`). Flash with
+ `sudo dd if=ics-os-usb.img of=/dev/sdX bs=4M status=progress conv=fsync`. If it still
+ reboots, the screen will now show either the last lit marker (1–6) or the early-fault
+ line `EF <vec> r=<rip>` (plus a red block under UEFI) — that pins the fault vector and
+ RIP and tells us which of the ranked causes is real.
+
+### 17:35 — **N150: flash showed no markers → added 32-bit pre-long-mode diagnostic IDT**
+
+**Result of the flash.** The laptop still shows only
+`error: serial port 'com0' isn't found. Loading ICS-OS (multiboot2)...` then reboots —
+no markers 1–6, no `EF <vec> r=<rip>` line, no red block.
+
+**Inference.** Marker `'1'` is pre-existing and is written very early in 32-bit
+`multiboot_entry`, and the machine *reboots* rather than *hangs*. The 64-bit early IDT
+handler hangs on any fault, so it clearly never ran. The fault is therefore either in
+32-bit protected mode (before long mode), or in the tiny `_start` window before the
+64-bit IDT is installed, or `0xb8000` is invisible because the laptop boots UEFI.
+
+**Fix — a 32-bit early diagnostic IDT covering the pre-long-mode window.** In
+`kernel/startup/startup.S`:
+- `early_idt32` (2048 B, `.bss`) + `early_idtr32` (`.data`, limit 2047, base
+  `early_idt32`).
+- 256 32-bit stubs at `efstub32_base`, each exactly 16 bytes:
+  `mov $N,%eax; push %eax; jmp early_fault32; .align 16` → stub N is at
+  `efstub32_base + N*16`.
+- 32-bit handler `early_fault32`: reads the vector at `[esp+0]` (pushed by the stub),
+  EIP at `[esp+4]` or `[esp+8]` (faults 8/10/12/13/14 carry an error code), prints
+  `EF32 <vec> eip=<eip>` to 0xb8010 (VGA, BIOS-visible) and paints a 32×32 red block to
+  the firmware framebuffer (when it is below 4 GiB, UEFI-visible), then hangs.
+- Installed at the **very top of `_start`**, right after `cli` and before any risky
+  memory write. The fill loop first saves Multiboot EAX/EBX to `0x9000`/`0x9004` (the
+  loop reuses `%eax`/`%ebx`), then writes 256 gates — selector = the **current CS**
+  (always a valid code segment in the bootloader's GDT), type `0x8e` — and does
+  `lidt early_idtr32`.
+
+**Asm care.** `mov $N,%eax` is a uniform 5 bytes, so the stubs keep a fixed 16-byte
+stride (a `push $N` would be 2 or 5 bytes and break the stride). The EIP offset depends
+on whether the fault vector carries an error code. A second latent bug was caught and
+fixed in **both** handlers: the framebuffer block paint used `loop` for the inner column
+loop, but `x86 loop` always decrements `ECX` — the column counter was in a different
+register, so the paint count was wrong. Rewrote both the 32-bit and 64-bit block paints
+to use `dec`/`jnz` for the inner (column) loop and `loop`/`ECX` for the outer (row)
+loop, holding the red pixel in a register not clobbered by the pitch read.
+
+**Verification.** Built the kernel. `nm`: `efstub32_base`=0x100230, `early_fault32`=
+0x101230 (delta 0x1000 = 256×16). `objdump` of stubs 0/200/255 confirms the 16-byte
+stride and `mov $N; push; jmp early_fault32`. A raw-byte check of `_start` confirms the
+correct 32-bit encodings (`a3 00 90 00 00` = `mov [0x9000],EAX`;
+`8d 1d 00 50 19 00` = `lea EBX,[0x195000]` = `early_idt32`). Note: `objdump -d` decodes
+the whole 64-bit `.text` section in 64-bit mode, so it garbles these 32-bit portions
+(showing `movabs` / RIP-relative) — a display artifact only, the bytes are correct.
+
+**Validation (no regression).** All four emulator gates still PASS on the rebuilt image:
+`test-ide-thumbdrive` (QEMU BIOS), `test-usb-uefi` (QEMU UEFI), `test-vbox-usb-image`
+(VirtualBox BIOS), `test-vbox-usb-image-efi` (VirtualBox UEFI) — so the 32-bit IDT
+install does not disturb normal boot.
+
+**Laptop retest (this build).** The machine **stopped rebooting** and now **hangs on a
+blank screen** (same GRUB messages flash, then nothing). That is the 32-bit early-fault
+handler catching a fault and hanging (`cli;hlt`) — but its output was not visible: it
+prints to `0xb8000` VGA text (invisible under UEFI, where GRUB uses the GOP framebuffer)
+and to the firmware framebuffer (which was still `0` because the fault fires **before**
+the framebuffer tag was parsed). Inference: the fault is in the 32-bit window **before**
+framebuffer parsing, almost certainly under UEFI.
+
+**Fix (make the framebuffer available as early as possible).** In `startup.S`:
+- Moved the Multiboot2 framebuffer-tag parse out of `multiboot_entry` and into `_start`,
+  **immediately after `lidt`** — it is now the *first* thing that dereferences the
+  multiboot info pointer, so `early_fb_*` is set before any later 32-bit code can fault.
+- Added `.paint_fb_marker32`: right after the parse, `_start` paints a **32×32 green
+  block** at the top-left of the firmware framebuffer. Under UEFI this is the only visible
+  surface, so a green block = "framebuffer is alive / fb parsed OK". A later early fault
+  repaints that same spot **red**. Correct 3-byte pixel writes for the 24 bpp case.
+- Fixed a latent 24 bpp bug in **both** the 32-bit and 64-bit fault handlers: the inner
+  pixel loop did `movl`/`mov` (4 bytes) but advanced 3 bytes, smearing each 24-bit pixel
+  into the next. Both now write exactly 3 bytes (`movb` + `movw`).
+
+**Validation (no regression).** All four emulator gates PASS on the rebuilt image:
+`test-ide-thumbdrive` (QEMU BIOS), `test-usb-uefi` (QEMU UEFI), `test-vbox-usb-image`
+(VirtualBox BIOS), `test-vbox-usb-image-efi` (VirtualBox UEFI).
+
+**Deliverable for the laptop.** `ics-os/ics-os-usb.img` (128 MiB,
+md5 `591c95fe747d040a97f84b9bd0e4c35f`). Flash with
+`sudo dd if=ics-os-usb.img of=/dev/sdX bs=4M status=progress conv=fsync`.
+
+**Next (needs the laptop).** Re-flash and report which of these appears top-left:
+a **green block** (framebuffer alive → the fault is *after* fb parsing, so the red
+`EF32`/`EF` repaint + EIP/RIP will follow), a **red block** (early fault after fb
+parse), or **still blank** (framebuffer not accessible in 32-bit, or the fault is at/before
+the info-pointer dereference). Also confirm BIOS vs UEFI from the boot menu/setup.
+
+### 23:45 — **Pivot: minimal Linux UEFI diagnostic image to capture N150 GOP ground truth**
+
+**Why pivot.** The ICS-OS early-boot markers were not observable on the laptop
+(no serial, `0xb8000` invisible under UEFI, GOP framebuffer likely >4 GiB). Instead of
+keeping to guess at the 32/64-bit fault, build a known-good Linux UEFI image that boots
+the *same* GRUB→FAT path on the N150 and reports the exact firmware framebuffer
+parameters, then **persist the report onto the thumbdrive** so it can be read on a host
+PC (the laptop has no serial). This gives the ground truth the ICS-OS fix needs
+(fb base address, pitch/padding, mode, whether the base is above 4 GiB).
+
+**Toolchain blocker + fix.** A 64-bit 6.8 kernel forces `HAVE_OBJTOOL`
+(`arch/x86/Kconfig:256: select HAVE_OBJTOOL if X86_64`) → `OBJTOOL` → `libelf`
+(`gelf.h`). The host has the runtime `libelf1t64` (`/usr/lib/.../libelf-0.190.so`) but
+not `libelf-dev`, and there is no sudo. Solved without sudo: `apt-get download
+libelf-dev`, `ar x` + `tar --zstd -xf` to pull out `gelf.h`/`libelf.h`, created
+`/tmp/opencode/uefidbg/libelf/{include,lib}` with a `libelf.so` symlink to the system
+`libelf-0.190.so` and a hand-written `libelf.pc`, then built with
+`PKG_CONFIG_PATH=/tmp/opencode/uefidbg/libelf/lib/pkgconfig`. objtool now compiles,
+links, and runs (system `libelf.so.1` is in a standard path).
+
+**Mistakes caught.**
+- `make allnoconfig` left `CONFIG_X86_64` **unset** → the first kernel was 32-bit,
+  which cannot exec the 64-bit busybox (`/init` ENOENT) and shows
+  `efi: No EFI runtime due to 32/64-bit mismatch`. All early QEMU diagnostic boots were
+  invalid until the config was rebuilt as x86_64.
+- GRUB in EFI mode passes initrd via `EFI_LOAD_FILE2`, which the kernel did not reliably
+  pick up ("No working init found"). Fix: **embed** the initramfs in the kernel via
+  `CONFIG_INITRAMFS_SOURCE` (no `initrd` line in `grub.cfg`).
+- `console=efifb` is wrong: `efifb` is a framebuffer device, not a console. Use
+  `console=tty0` (framebuffer console) + `console=ttyS0,115200` (QEMU serial capture).
+- `/init` fb parsing: `virtual_size` is comma-separated (`1280,800`) but was parsed with
+  `cut -dx`; and `smem_start`/`smem_size` sysfs are **empty for an efifb MMIO fb**.
+  Fixed: parse width/height on `,`, and fall back to the `efifb:` dmesg lines
+  (`framebuffer at 0x…`, `using Nk`, `mode is WxHxB`, `linelength=…`) for the base
+  address, size, and pitch.
+
+**Image.** GPT + ESP(FAT, label `DIAG`) at `/tmp/opencode/uefidbg/`, built by
+`build-img.sh` (FAT built in a temp file then `dd`'d into the partition; 8.3 names only,
+no LFN). Files: `/EFI/BOOT/BOOTX64.EFI` (GRUB 2.12 x86_64-efi), `/EFI/BOOT/grub.cfg`,
+`/vmlinuz` (6.8 x86_64, embedded initramfs). `/init` waits for `fb0`, dumps fb params +
+e820 + CPU + PCI + EFI info to `/diag.txt`, **mounts the FAT partition and copies the
+report to `DIAG.txt`** (and `EFI/BOOT/DIAG.txt`), prints it to tty0/ttyS0, then stays up.
+
+**QEMU/OVMF verification (q35, virtio).** Full path confirmed: 64-bit kernel boots (no
+mismatch), `efifb` binds (`framebuffer at 0x80000000, mode 1280x800x32, linelength=5120`),
+report prints correctly (`fb base 0x80000000 … below 4 GiB`, `pitch 5120 == width*bpp/8`,
+no padding), `DIAG.txt` lands on the partition, no panic. QEMU's fb is below 4 GiB, so
+the >4 GiB path is only exercised on the real N150.
+
+**Deliverable.** `/tmp/opencode/uefidbg/diag-final.img` (48 MiB, md5
+`dd27e8855f9d2de42c4b456b70b4ffca`). Flash to the thumbdrive:
+`sudo dd if=diag-final.img of=/dev/sdX bs=4M status=progress conv=fsync`, boot the N150
+from it (UEFI), let it sit, power off, and read `DIAG.txt` from the drive on a host PC.
+
+**Next (needs the laptop).** Flash and read `DIAG.txt`. The key answers it will give:
+the GOP **fb base physical address** (is it above 4 GiB?), the **pitch/linelength**
+(padding?), and the exact **mode**. That tells us exactly what the ICS-OS UEFI
+handoff must map and how.
+
+## 2026-09-09 (Manila, UTC+8)
+
+### 10:10 — **N150: framebuffer-only C crash diagnostics (stage markers + fault banners)**
+
+**Why.** The 09-08 early-boot diagnostics (32/64-bit diagnostic IDTs, VGA markers 1-6)
+showed **nothing** on the N150 flash. That is expected under UEFI: the `0xb8000` VGA
+markers are not shown, and the early **assembly** `early_fb_*` parse produces garbage —
+verified in QEMU, the `.paint_fb_marker64` hex dump came out
+`00000400 00000300 00001003 00000403 00000303 00000023` (addr/pitch/bpp) instead of the
+real `0xfd000000 / 4096 / 32`. So the early red-block paint cannot target the real GOP
+framebuffer. The reliable fb is the one the **C path** derives from the Multiboot2 tag
+(`fbconsole_boot_init`: `addr=0xfd000000` in QEMU; the real `1920x1080` on the N150).
+So the new diagnostics are C-side, driven by that correct fb, and run from `main()` /
+the real fault handlers (active once we are in `main()`), which is where the laptop
+most likely dies (QEMU boots to the shell fine, so the crash is past `main()` entry).
+
+**What was added.**
+- `fbdbg_*()` helpers in `hardware/vga/fbconsole.c` (+ prototypes in `fbconsole.h`),
+  reusing the working console's `fb_draw_glyph`/`g_8x16_font`/`fb_color`, no-op when
+  `fb_base == 0`:
+  - `fbdbg_stage(n, name)` — white-on-magenta badge at **row 24**: `STAGE <nn>: <name>`.
+  - `fbdbg_info(str)` — yellow-on-blue line at **row 0** (fb geometry + `active=`).
+  - `fbdbg_fault(vec, name, rip, cr2)` — red-on-black banner at **rows 0-6**:
+    `ICS-OS KERNEL FAULT <vec> <name>` / `rip=… cr2=…` / `HALT`. One-shot via a static
+    guard so a fault cascade paints exactly once.
+- **Stage markers** in `kernel32.c`: `fbdbg_stage(1,"IDT installed")` after
+  `setdefaulthandlers()`, `(2,"mem_init + fb deferred")`, `(3,"console up")` after
+  `fg_setforeground()`, and `dex32_startup()` stages **4-16** (CPU info, ext mgr, dev
+  mgr, alloc, vtd, ports, pci/nic, api, kbd/mouse, lapic/smp, process mgr, APs
+  started, taskswitcher). Plus `fbdbg_info("FB <w>x<h> bpp=.. pitch=.. active=..")`
+  right after `fbconsole_boot_init()`.
+- **Fault banners** in `hardware/exceptions.c`: kernel-context `#GP`
+  (`fbdbg_fault(13,"GPF",…)` in `GPFhandler64`), `#DF` (`fbdbg_fault(8,"DF",…)` in
+  `exc_doublefault`), and kernel `#PF` (`fbdbg_fault(14,"PF",…)` in `exc_recover`).
+  Only kernel-context **fatal** paths banner; recoverable user faults and the
+  `#NM`/FPU path do not.
+
+**Mistake caught.** I first re-enabled the disabled `call .paint_fb_marker64` in
+`startup.S` (early 64-bit green block). It **broke the QEMU boot** — the serial trace
+stopped at `STUVWY` followed by the garbage hex dump above. Reproduced on both
+`test-boot` (128M/2cpu) and the previously-passing 16G/4cpu config, so it was not a
+memory/config artifact. Root cause: the early-assembly `early_fb_*` values are garbage,
+so the paint either no-ops or faults. **Reverted** the call to `nop`. Lesson: do not
+trust the early-assembly fb parse; the C-path `fbconsole_boot_init` is the correct
+framebuffer source.
+
+**Verification.**
+- `make -C kernel bzImage` clean (only the usual RWX load-segment warning).
+- `make test-boot` **PASS**: trace `STUVWX`, `FBCONSOLE: 1024x768 bpp=32 pitch=4096
+  addr=0xfd000000`, `FBCONSOLE_PASS`, `Root mount [OK]`, `SMP: 2 CPUs`, no GPF.
+- `make usb` → rebuilt `ics-os-usb.img` (128 MiB, md5 `d88e128514259d3975cb9d4ea4284372`).
+- QEMU IDE boot of the USB image (16G/4cpu): `serial console ready` + `FBCONSOLE_PASS`
+  + `Root mount [OK]` + `SMP: 4 CPUs` + `shell online`. The `fbdbg_*` paints are
+  framebuffer-only (not serial), so they don't appear in the log; the clean boot
+  confirms they are fault-free.
+
+**How to read it on the N150 panel** (no serial needed):
+- Bottom row (row 24) shows the last `STAGE <nn>: <name>` badge reached — localizes
+  the boot step that died.
+- If a kernel fault fires, rows 0-6 show a red banner with the vector, name, `rip=`,
+  and `cr2=` — localizes the fault itself.
+- Row 0 (before the console takes over) shows the fb geometry + `active=`.
+
+**Deliverable.** `ics-os/ics-os-usb.img` (128 MiB). Flash:
+`sudo dd if=ics-os-usb.img of=/dev/sdX bs=4M status=progress conv=fsync`, boot the N150,
+and photograph the panel. The `STAGE nn` badge + (if any) red `KERNEL FAULT` banner
+pin the crash point and the faulting RIP/CR2.
+
+**Next (needs the laptop).** One N150 boot to capture the panel. The stage badge names
+the last init step reached; the fault banner (vector/rip/cr2) names the fault. That
+converts "GRUB then black" into a concrete RIP to debug.
+
+### 13:00 — **SMP=4 self-host cert: `PS_ATTB_DYING` self-exit fix lands; cert now hangs on an `io_devlock` I/O deadlock (not a fault)**
+
+**Objective.** Continue `test-selfhost-cert-parallel` (SMP=4) until it reaches
+`GCC_SELF_CERT_PASS`, keeping `test-boot` green.
+
+**The original silent triple fault is FIXED.** The prior run died with no output at all
+(no `DBLFLT`, no `ZFREE_LIVE_PML4`) — a silent reset. Root cause was a self-exit TOCTOU
+race: `self_exit_current()` set `PS_ATTB_UNLOADABLE` *before* `on_cpu=0`, so another CPU
+could still `ps_findprocess()` the dying PCB and free its live PML4 under it. The fix:
+- `process.h`: `#define PS_ATTB_DYING 16` (dedicated flag; **not** reusing
+  `PS_ATTB_UNLOADABLE`, which is also set on the permanent idle/kernel PCBs and is
+  special-cased by the scheduler).
+- `sched_runnable_here()` rejects `PS_ATTB_DYING`.
+- `self_exit_current()` sets `PS_ATTB_DYING`, `__sync_synchronize()`, then `on_cpu=0`,
+  *then* `PS_ATTB_UNLOADABLE`.
+- `kill_process()` defers a live victim to self-exit via `sigterm` instead of freeing a
+  live PML4.
+- Added `zfree_pml4_liveness_check()` before `userpd_free()` in the ZFREE path.
+
+`make -C kernel bzImage` clean; `make test-boot` **PASS** (`test-boot PASS`).
+
+**The cert now hangs (no fault).** Rerun `timeout 620 make
+test-selfhost-cert-parallel CERT_TIMEOUT=600` → `EXIT=2` (timeout), no
+`GCC_SELF_CERT_PASS`, no `DBLFLT`, no `ZFREE_LIVE_PML4`. Guest log
+`/tmp/icsos-gccself.log` (3825 lines) ends in sustained spin-watchdog spam. So the
+silent fault is gone; what remains is a **livelock/deadlock**, not a crash.
+
+**Freeze signature (decoded from the watchdog).**
+- First watchdog `sc_total=643`; the system then progressed cleanly to `sc_total=1700`
+  (no watchdog lines) and froze in the `1700..1848` window. Distinct watchdog
+  `sc_total`: `180 184 643 702 1700 1722 1765 1809 1848`.
+- Frozen processes: `gcc.exe` pid 29 (kernel rip, `last_sc=49/b2` = delfile→**spawn**),
+  `cc1.exe` pids 37/38/39 (user rip `0x10b01d3`, constant, `last_sc=40`=fgets).
+- A kernel crit is contended: `sync: spin crit=0x3b2218 owner=0x1e self=0x22/0x25`
+  (≈464 spin cycles). `sync_owner_token()=(pid&0x7FFFFF)+1`, so `owner=0x1e`→pid 29
+  (**gcc** owns the crit), spinners pid 33/36.
+- `crit=0x3b2218` = `iomgr/iosched.c:38` `io_devlock[10]` (base `0x3b21a0`,
+  `sync_sharedvar`=12 B, offset `0x78`→index 10).
+- Frame pool is **not** exhausted (`free=710415/728285`, no `POOL EMPTY`), and the kheap
+  is fine (`khop=3 khst=0` = completed free). So the earlier mmap/frame-pool hypothesis
+  is **rejected**: `frame_alloc()` returns 0 (does not spin) and there is ample free RAM.
+
+**Root-cause area (static analysis).** gcc is in `sys_spawn`→`spawn_load`→
+`elf64_stream_load()` (streaming cc1's 18 MiB ELF page-by-page via `fseek`+`fread`), and
+it owns `io_devlock[10]`. The device lock is taken by the **synchronous** I/O path:
+`dex32_requestIO()` (`iomgr/iosched.c:316`) → `bio_submit_sync()` (`:400-402`) does
+`iomgr_lockdev(dev); iomgr_execjob(&req); iomgr_unlockdev(dev)` **in the caller's
+context**. So the *submitting user process* (gcc) holds the per-device lock while the
+block transfer runs. Under SMP=4 that lock is shared with the disk_mgr and the cc1
+readers; if the transfer stalls, gcc pins `io_devlock[10]` and every other I/O on device
+10 spins. The `cpu_idle` rip reported for gcc (`0x113351`, inside `cpu_idle`,
+`time.c:442` `sti;hlt`) is **not** from the PIO path — `reg_pio_data_in`
+(`ataioreg.c:622`) uses `WAIT400NS`/`sub_atapi_delay` (the old `delay(10)` was removed,
+see the comment at `ataioreg.c:46`) and has a command timeout, so it cannot halt forever.
+That rip is most likely **stale** (captured at the last context switch) and should not be
+taken as gcc's live instruction.
+
+**Where I stopped.** Static analysis pinpoints the contended object (`io_devlock[10]`),
+the owner (gcc, in `elf64_stream_load`'s `fread`), the synchronous lock-holding I/O path
+(`bio_submit_sync`), and the spinners (pid 33/36). It does **not** yet prove *why* the
+transfer never completes (lost IRQ? device 10 left mid-transfer by the disk_mgr? a
+read/write re-entrancy on the same device? a lost wake on the submitter's completion
+wait?). Pinning that needs runtime state that static reading cannot give.
+
+**Next (needs a rebuild with instrumentation, then a QEMU run).**
+1. In `sync_entercrit()`, when the spin diagnostic fires, also print the **owner's
+   pid**, and if the crit is inside `io_devlock[]`, the **deviceid**; and print the
+   caller's `cursyscall[]`, `krsp`, and a short kernel stack walk so the *owner's*
+   call chain (not just a stale rip) is captured.
+2. In `bio_submit_sync()` / `iomgr_execjob()`, log enter/leave with `deviceid`, pid,
+   `lba`, `numblocks`, and result — to see whether gcc's transfer on device 10 ever
+   returns, or whether the disk_mgr interposes on the same device and leaves it
+   mid-transfer.
+3. Identify device 10 (`devmgr` registration order) and pids 33/36 (which files/paths
+   they are reading) from the instrumented log.
+4. Then fix the actual cause (likely: don't hold `io_devlock` across the blocking
+   transfer in the submitter, or serialize the submitter's completion wait with the
+   disk_mgr's per-device access so a stalled transfer cannot pin the device lock).
+
+**Status.** `test-boot` green; `test-selfhost-cert-parallel` (SMP=4) still **fails by
+ timeout** (livelock on `io_devlock[10]`), not by fault. The `PS_ATTB_DYING` self-exit
+ fix is real progress (silent triple fault → diagnosable livelock) but the cert is **not
+ yet complete**.
+
+ ### 14:20 — **The `io_devlock[10]` deadlock is the framebuffer console: per-char MMIO render pins the device lock**
+
+ **Instrumentation pinned the owner.** Added a transient ENTER/LEAVE trace to
+ `bio_submit_sync()` (`iomgr/iosched.c`): `biosync ENTER/LEAVE #seq dev=.. pid=.. op=..
+ lba=.. nb=..`. Rebuilt, `test-boot` still PASS, reran the cert. The guest log (3293
+ lines) ends on the **last unmatched** I/O:
+ ```
+ biosync ENTER #642 dev=10 pid=34 op=1 lba=8879 nb=2   (no matching LEAVE)
+ ```
+ `op=1` = `BIO_READ` (`iomgr/bio.h`), and the WATCHDOG line at the same instant is
+ `pid=34 '/icsos/apps/gcc.exe'` — so **gcc** is the one holding `io_devlock[10]` inside
+ a *read* on device 10, and it never reaches the LEAVE.
+
+ **The rip is not the I/O path — it is the framebuffer console.** The watchdog samples
+ gcc's kernel rip repeatedly and it *varies* (`0x10821a 0x10827a 0x1082b0 0x1083f1
+ 0x113351`), so gcc is spinning through code, not parked in one wait. Symbolizing those
+ addresses against `Kernel64.sym`:
+ - `0x10821a/0x10827a/0x1082b0/0x10829e` → `fb_put_pixel` (`hardware/vga/fbconsole.c:48`)
+ - `0x1083f1/0x108434` → `fb_draw_glyph` (`fbconsole.c:76`)
+ - `0x113351` → `cpu_idle` (`stdlib/time.c:442`, `sti;hlt`)
+
+ So gcc is stuck **drawing to the MMIO framebuffer**, not in the ATA PIO path. The read
+ #642 completed (or is irrelevant); what pins `io_devlock[10]` is the *console render*
+ that gcc is blocked in while still holding the lock.
+
+ **Why it is minutes, not milliseconds.** `Dex32PutC` (`console/dex_DDL.c:236`) renders
+ every output char directly to the linear framebuffer:
+ - `Dex32PutChar` for the char → `fbconsole_cell_render` → 128 `fb_put_pixel` MMIO writes
+ - a trailing `Dex32PutChar` for a **space** at `curx+1` → another 128 MMIO writes
+ - `Dex32UpdateCursor` → `fbconsole_cursor_to` → reblit old cursor cell (128) + draw new
+   cursor cell (128) MMIO writes
+ ≈ **512 MMIO writes per character**, plus a **full 256,000-write
+ `fbconsole_screen_refresh()`** on every DDL switch (`Dex32SetActiveDDL`) and every
+ bottom-row scroll (`Dex32NextLn`). In QEMU each MMIO write to the VGA region is a VM-exit,
+ so a single character is milliseconds and a screen refresh is on the order of *minutes*.
+ A process that is blocked inside that render while holding `io_devlock[10]` pins the
+ device lock for the duration, and every other reader/writer of device 10 (the cc1
+ processes, `disk_mgr`) spins on the same crit — exactly the `sync: spin
+ crit=0x3b2218 owner=0x1e` signature. My `biosync` per-IO `printf` amplified it (one extra
+ console line per I/O), which is why the instrumented run deadlocked even sooner.
+
+ **Scope of the fix.** The `FBCONSOLE_PASS` gate is a **one-shot** `fbconsole_selftest()`
+ (`kernel32.c:516`, boot time) that renders specific cells and reads them back directly;
+ it does *not* depend on the live per-char path. So making the **live** render opt-in
+ (selftest-only) keeps `FBCONSOLE_PASS` green while removing the per-char MMIO cost from
+ the console hot path. The proper long-term fix is a **deferred/dirty-region blit**
+ (shadow text buffer is already maintained; blit the changed cells from a low-priority
+ context on a `ticks` cadence, `stdlib/time.c` 200 Hz) so a real display still tracks the
+ console without ever blocking a lock holder. That follow-up is tracked below.
+
+ **Changes made (this step).**
+ 1. Removed the transient `biosync` ENTER/LEAVE trace from `bio_submit_sync()` (it was a
+    diagnostic that also flooded the console).
+ 2. `fbconsole.c`: added `fb_live_render` (default **off**) + `fbconsole_set_live_render()`.
+    `fbconsole_cell_render`, `fbconsole_screen_refresh`, and `fbconsole_cursor_to` now
+    no-op (no MMIO) unless live render is enabled, so the console hot path is fast.
+ 3. `fbconsole_selftest()` turns live render **on** for the duration of the test (and
+    restores it), so `FBCONSOLE_PASS` is unchanged.
+
+ **Validation.** `make -C kernel bzImage` clean. Re-run `make test-boot` (must keep
+ `FBCONSOLE_PASS`), then `make test-selfhost-cert-parallel`.
+
+ **Next.**
+ 1. Confirm `test-boot` still prints `FBCONSOLE_PASS` (selftest path intact).
+ 2. Confirm the cert no longer deadlocks on `io_devlock[10]` (the console is no longer the
+    lock holder); watch for `GCC_SELF_CERT_PASS` or a *different* hang.
+ 3. Implement the deferred/dirty-region framebuffer blit (low-priority, `ticks`-drained)
+    so a real display tracks the console without blocking lock holders; keep the selftest
+    as the `FBCONSOLE_PASS` oracle.
+
+## 2026-09-12 (Manila, UTC+8)
+
+### 06:30 — SMP=4 GCC self-host: collect progress and resume the parallel cert
+
+**Current problem:** `test-selfhost-cert-parallel` has never printed `GCC_SELF_CERT_PASS`.
+Host-seeded `test-kbuild` is green. SMP=1 cert is unblocked (sbrk span fix, 0 PF64) but
+is a multi-hour serial build. SMP=4 last hung on `io_devlock` because gcc rendered the
+framebuffer while holding the device lock; live FB blit is now default-off. That hang
+was not re-proven after the blit change.
+
+**Activity now:**
+1. Replace the single `zombie_free` slot with a CAS stack so concurrent self-exits
+   cannot leak PCBs/PML4s.
+2. Close files in `self_exit_current` *before* taking `processmgr_busy` to avoid
+   `io_devlock` ↔ process-manager lock inversion under `make -j4`.
+3. Drop per-exit/per-switch `printf` diagnostics that flood serial during the cert.
+
+**Bounded cert (CERT_TIMEOUT=720, first run):** `GCC_SELF_JOBS 4`, make started, then
+`ZFREE_LIVE_PML4 same_zombie=1` — BSP freed make.exe's PML4 while CPU 1 was still on
+that PCB (`PF64 rip=0x200010078c`). Enqueue was happening before `context_load`.
+
+**Fix:** per-CPU `pending_zombie` published only after `current_process` is the
+successor, with `ctx_load_in_progress` held until CR3/RSP switch; reclaim skips live
+PML4s. Also stripped SYSCALL/SCHEDSEL/ELFCRIT serial spam.
+
+**Second run:** cc1 ELF loaded, then timer-IRQ watchdog dumped RAW frames/KHEAP from
+gcc's user stack (`PF64 cr2=0x3f0092f4 rip=sync_entercrit`, `cr4=0x20` garbage).
+Cooperative mode *expects* no-yield; the dump is the fault. Watchdog reduced to a
+quiet serial line.
+
+**Third run (CERT_TIMEOUT=900):** QEMU lasted the full 15 minutes (no instant
+reset). `make -j4` created dirs and spawned `gcc -c ... alias.c`. Then `RLBAD` on
+an AP idle CPU followed by `PF64` inside `scheduler()` (`rip=0x15d36c`,
+`cr2=0x20024fdbc0`). A trial that still ran the scheduler for kernel/idle tasks
+under cooperative mode is reverted: timer preemption stays fully off for
+stage-1, with `zombie_drain()` still running on the BSP tick.
+
+### 07:05 — Ready-list RLBAD / scheduler PF64
+
+**Current problem:** bounded parallel cert reaches `gcc -c alias.c` then
+`RLBAD` and `PF64` inside `scheduler()` walking `next` (`cr2` like `0x3000004c3`).
+
+**Cause:** `sched_dequeue` was not idempotent and did not clear `next`/`before`.
+`self_exit` set `on_cpu=-1` *before* dequeue, so `kill_process` treated the PCB
+as off-CPU, dequeued it a second time through stale neighbors, and freed a node
+still in the ring. `sched_findprocess` walked the ring without `ready_lock`.
+
+**Fix:** dequeue while still claimed; `kill_process` ignores `DYING`; dequeue
+updates `sched_phead`, rejects double-remove, and nulls links; enqueue rejects
+an already-linked PCB; walks are locked and hop-bounded.
+
+**Activity now:** rebuild, `test-boot`, `test-stress`, bounded `test-selfhost-cert-parallel`.
+
+### 07:20 — DIAGLOCK / vfs_busy pairing / overlapping ELF stress
+
+**Current problem:** after the ready-list fix, a 180s parallel cert got several `gcc -c`
+jobs then `sync: warning critical section released by non-owner! crit=0x3babd8`
+(`vfs_busy`), `PF64` in `spin_lock` with grafted high bytes, then a DIAGLOCK storm
+on a **user-stack** address (`crit=0x3fff8cf8`) that hung the serial path.
+
+**Activity now:**
+1. Remove TEMP DIAGLOCK/RQDUMP. Reject `sync_sharedvar*` outside kernel BSS/heap
+   (`SYNCBAD`) so a wild crit pointer cannot be walked from the timer path.
+2. Nested VFS helpers no longer re-enter `vfs_busy` via `file_ok()`; they use
+   `file_ok_locked()` so `fclose`/`vfs_file_get` cannot extra-leave a lock owned
+   by another process. Recursion count on `wait` is atomic.
+3. `stressproc` forks a burst of helpers that each `posix_spawn` hello.exe so
+   ELF stream-load overlaps the way `make -j4` overlaps gcc/cc1 loads.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`. Cooperative timer preemption stays off.
+
+### 07:45 — bounded cert: no PF64; `pc_busy` non-owner leave
+
+**Gates:** `make test-boot` PASS. `make test-stress` PASS (overlap phase is 4×2 fork+spawn;
+a first 8-wide fork burst exhausted the 256 MiB `userpd` pool).
+
+**Bounded `test-selfhost-cert-parallel CERT_TIMEOUT=180`:** `GCC_SELF_JOBS 4`, mkdir tree,
+four `gcc -c` units start. **No PF64/GPF64/DIAGLOCK/SYNCBAD.** Then:
+
+`sync: warning ... crit=0x3ac998` — this is **`pc_busy`** in `blkcache.o` (not `vfs_busy`).
+Leave from `blkcache_get`; owner pid 25, leaver pid 34. Syscall count froze.
+
+**Hypothesis:** `smp_cpu_id()` returns 0 when LAPIC MMIO is not readable under a
+user PML4, so an AP enters/leaves crits as the BSP process.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 07:50 — `smp_cpu_id` via IA32_TSC_AUX
+
+**Fix:** publish the logical CPU id in `IA32_TSC_AUX` at BSP init and AP slot
+claim; `smp_cpu_id()` uses `RDTSCP` when CPUID advertises it. LAPIC match is
+fallback only.
+
+**Gates:** `test-boot` PASS, `test-smp` PASS (`SMP_RESULT cpuid cpu=1..3`),
+`test-stress` PASS.
+
+**Bounded cert (stdio serial, 180s):** still not closed. Four `gcc -c` jobs
+start, then `GPF64 err=0xe470 rip=0x17451f` inside `reschedwrapper` /
+`tlbshootdownwrapper` on gcc, make fails `alias.o`, leftover **`kheap_crit`**
+(`0x3ba820`) non-owner leave, irqsave waiters spin. Syscall count stuck at
+1914. Correct CPU ids likely deliver TLB/resched IPIs that the old “everything
+is CPU 0” path skipped.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 10:20 — Do not preempt user tasks from IPI_RESCHEDULE
+
+**Cause:** `smp_reschedule_ipi` called `taskswitch()` on CPUs running user gcc.
+That is a software context switch on a live interrupt frame; `context_switch`
+forces IF=1 before `iretq` (`GPF64 err=0xe470` in `reschedwrapper`).
+
+**Fix:** IPI `taskswitch()` only for idle/`ACCESS_SYS`. User processes return
+through `iretq`. New jobs still run on idle CPUs or after the parent
+`waitpid`/`taskswitch`. `test-smp` work-steal stays kernel threads.
+
+**Validation:** `test-boot` PASS, `test-smp` PASS, `test-stress` PASS.
+
+**Bounded `CERT_TIMEOUT=180`:** **no GPF64/PF64/non-owner leave.** Four-wide
+cc1/as pipeline wrote **94** `GCC_DRIVER_OK` objects. Syscall count climbed
+(~7k → ~149k). Then the 16 MiB `/ramdisk` hit `cluster 8119` (`fat: Out of
+space`); truncated `/ramdisk/.gccdrv.*.s` made `as` fail on `gimple-low.o`.
+`/work` still had space.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 11:00 — FAT last-cluster bound; gccdriver temps on `/work`
+
+**Cause:** gccdriver wrote `.gccdrv.PID.s` on the 16 MiB `/ramdisk`. `make -j4`
+filled it (`next=8120 > max=8119`). `/work` itself still had space. Separately,
+`fat_chain_step` used cluster *count* as the max **id**, so the last ramdisk
+cluster looked corrupt.
+
+**Fix:** walker passes `count+1`; TAP tests cover 8119/8120. gccdriver uses
+`/work/.gccdrv.PID.{s,o}` when `/work/apps/cc1.exe` exists (cert), else
+`/ramdisk` (`gccdrv` smoke). Do **not** keep a 2 GiB FAT32 cert `/work`: that
+experiment PF/GPF'd in gcc on the first `-c` jobs. Stay on 1 GiB FAT16.
+
+**Gates:** `make test-fatchain-unit` PASS (14), `make test-gccdriver` PASS
+(tools fall back to `/icsos/apps` + `/ramdisk` temps), `make test-boot` PASS,
+`make test-stress` PASS.
+
+**Bounded `CERT_TIMEOUT=180`:** temps are on `/work` (`tooldir=/work/apps
+tmpdir=/work`). No ramdisk `Out of space`, no GPF64/PF64. Four objects
+(`auto-inc-dec` … `bt-load`) then `as` rejected `/work/.gccdrv.60.s` as
+truncated (`q $global_trees,%rax` instead of `movq`). `make` waited; three
+cc1s froze in syscall `09/b6` with **flat** `sc=9926`. Concurrent virtio FAT
+writes of large `.s` files are the next blocker — not ramdisk capacity.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.

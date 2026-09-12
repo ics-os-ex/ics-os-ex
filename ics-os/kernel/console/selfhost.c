@@ -860,10 +860,10 @@ static int gccselfhost_run(void)
        if (jobs < 1) jobs = 1;
        if (jobs > 8) jobs = 8;
        sprintf(gcmd,
-                "/icsos/apps/make.exe -f /icsos/gccsrc/Selfhost.mk -j%d all",
-                jobs);
-       printf("GCC_SELF_JOBS %d\n", jobs);
-       if (!user_execp("/icsos/apps/make.exe", 0, gcmd)) {
+                 "/work/apps/make.exe -f /work/gccsrc/Selfhost.mk -j%d all",
+                 jobs);
+        printf("GCC_SELF_JOBS %d\n", jobs);
+        if (!user_execp("/work/apps/make.exe", 0, gcmd)) {
           printf("GCC_SELF_CERT_FAIL make bootstrap\n");
           return 0;
        }

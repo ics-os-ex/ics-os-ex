@@ -70,6 +70,7 @@ Useful individual targets (from `ics-os/`):
 | `test-virtio` | QEMU virtio-blk DMA; MSI-X completions; `VIRTIO_BLK_OK` + `VIRTIO_IRQ_OK` |
 | `test-ext4` | ext4 virtio-blk read/create/write; guest marker plus host `e2fsck`/`debugfs` validation of the post-test image |
 | `test-spawn` | `posix_spawn` + `waitpid` of `hello.exe` (`SPAWN_PASS`); FAT `/work` on virtio (`WORK_DISK_PASS`) |
+| `test-stress` | SMP=4 spawn/exit/reap + short fork+ELF overlap (`STRESSPROC_PASS`); no GPF/PF |
 | `test-fork` | COW fork ABI/isolation, fast path, text protection, OOM, inherited fd, exit/wait, and delayed reaping |
 | `test-fork-matrix` | COW fork pressure gate on `-smp 1/2/4/8` |
 | `test-make` | In-OS TinyCC builds GNU make 3.82 onto `/work`; `make -f t.mk` spawns `hello.exe` (`MAKE_PASS`) |
@@ -167,7 +168,7 @@ Properly index these files as needed in a file called reference.md
 
 ## Development blog
 
-Use development_blog.md as your diary of activities, what was done, difficulties faced and solutions to problems. Organize this by hour and date.
+Use development_blog.md as your diary of activities, what was done, difficulties faced and solutions to problems. Organize this by hour and date, place the latest entry at the top of the blog.
 
 Make sure it contains the current problem and the activity currently being performed to solve it.
 

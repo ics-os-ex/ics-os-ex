@@ -228,6 +228,25 @@ void time_incrementtime()
           wd_ticks[me] = 0;
          };
       wd_ticks[me]++;
+      /* Cooperative cert expects long no-yield user compiles.  The old
+         watchdog printed multi-page RAW/KHEAP dumps from the timer IRQ and
+         itself faulted (PF64 while dumping gcc's user stack).  One quiet
+         serial line every ~20s is enough to see progress. */
+      if (wd_ticks[me] < 2000 || (wd_ticks[me] % 2000) != 0)
+         return;
+      if (current_process) {
+         char wline[192];
+         sprintf(wline,
+                 "WATCHDOG cpu=%d pid=%d '%s' no-yield=%lu sc=%lu last=%02x/%02x\n",
+                 me, current_process->processid, current_process->name,
+                 wd_ticks[me], diag_sc_count,
+                 (unsigned)current_process->cursyscall[0],
+                 (unsigned)current_process->cursyscall[1]);
+         serial_puts(wline);
+      }
+      return;
+
+#if 0
       if (wd_ticks[me] < 500)
          return;
       if ((wd_ticks[me] - 500) % 2000 != 0)
@@ -380,6 +399,7 @@ void time_incrementtime()
                         v, wd_kind(v)==1 ? "K" : "U");
              }
          }
+#endif
     };
 
  //the timer handler used by the task switcher

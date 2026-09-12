@@ -5,25 +5,25 @@
 # the output directories are created once by the `prepare` target before any
 # concurrent job runs.
 
-ROOT ?= /icsos/gccsrc
+ROOT ?= /work/gccsrc
 OUT ?= /work
 ifeq ($(origin CC),default)
-CC := /icsos/apps/gcc.exe
+CC := /work/apps/gcc.exe
 endif
 ifeq ($(origin AS),default)
-AS := /icsos/apps/as.exe
+AS := /work/apps/as.exe
 endif
 ifeq ($(origin AR),default)
-AR := /icsos/apps/ar.exe
+AR := /work/apps/ar.exe
 endif
 ifeq ($(origin LD),default)
-LD := /icsos/apps/ld.exe
+LD := /work/apps/ld.exe
 endif
-CP ?= /icsos/apps/cp.exe
-MKDIR ?= /icsos/apps/mkdir.exe
-RM ?= /icsos/apps/rm.exe
-SEED ?= /icsos/seed
-LDSCRIPT ?= /icsos/apps/ldscripts/elf_x86_64.xc
+CP ?= /work/apps/cp.exe
+MKDIR ?= /work/apps/mkdir.exe
+RM ?= /work/apps/rm.exe
+SEED ?= /work/seed
+LDSCRIPT ?= /work/apps/ldscripts/elf_x86_64.xc
 TOOLPREFIX ?=
 
 OBJ := $(OUT)/gccobj

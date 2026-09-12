@@ -228,8 +228,13 @@ skips the mount so `test-boot` stays green.
 
 Host side for `test-spawn`: `mkfs.vfat -F 16` a **512 MiB** image, attach
 like the posixio virtio disk. 512 MiB is enough for spawn tests and a later
-trimmed binutils + make tree. GCC 4.7 itself needs a bigger image in a
-later round.
+trimmed binutils + make tree.
+
+`test-selfhost-cert` keeps a **1 GiB FAT16** virtio `/work` for sources and
+`.o` output. gccdriver scratch (`.s`/`.o`) must live on `/work` too: the 16 MiB
+`/ramdisk` fills under `make -j4` (`fat: Out of space` at cluster 8119,
+truncated `.s`). The chain walker must treat the last cluster id (`count+1`)
+as valid.
 
 FAT 8.3 still bites some GCC names even with LFN on create; that is a later
 FS issue.

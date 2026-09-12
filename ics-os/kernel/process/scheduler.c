@@ -45,12 +45,18 @@ void sched_wake_process(PCB386 *process)
 static int sched_runnable_here(PCB386 *ptr) {
    int me = smp_cpu_id();
    if (ptr->waiting)
-      return 0;
-   if (ptr->status & PS_ATTB_BLOCKED)
-      return 0;
-   /* Claimed by another CPU */
-     if (ptr->on_cpu >= 0 && ptr->on_cpu != me)
-        return 0;
+       return 0;
+    if (ptr->status & PS_ATTB_BLOCKED)
+       return 0;
+    /* A self-exiting zombie is still in the ready list between the moment its
+       CPU clears on_cpu and the moment ps_dequeue() removes it.  It must never
+       be claimed in that window, or another CPU would context_load a PML4 the
+       BSP is about to free (silent triple fault). */
+    if (ptr->status & PS_ATTB_DYING)
+       return 0;
+    /* Claimed by another CPU */
+      if (ptr->on_cpu >= 0 && ptr->on_cpu != me)
+         return 0;
      if (ptr->cpu_affinity >= 0 && ptr->cpu_affinity != me)
        return 0;
    /* Only the owning CPU may select its idle thread. */
@@ -66,10 +72,36 @@ PCB386 *scheduler(PCB386 *lastprocess){
    int best_prio;
    int me = smp_cpu_id();
 
-   if (!lastprocess)
+   if (!lastprocess || !lastprocess->next || !lastprocess->before)
       lastprocess = sched_phead;
-   if (!lastprocess)
+   if (!lastprocess || !lastprocess->next || !lastprocess->before)
       return lastprocess;
+
+   /* A process that holds a crit (sync_entercrit) must not be descheduled
+      while it does so: descheduling a lock holder (e.g. an IPI_RESCHEDULE
+      waking a CPU whose current process is blocked in device I/O under
+      io_devlock) strands the crit in the run queue, and every other CPU that
+      needs that crit spins forever -- the SMP=4 self-host io_devlock
+      deadlock.  Holders here are never in the ready walk for themselves, so
+      returning lastprocess keeps the holder on its CPU until it leaves the
+      crit.  (The timer path is already cooperative in selfhost mode; this
+      also covers the voluntary/IPI switch paths.)
+
+      Guard against returning a holder that is not actually runnable (a DYING
+      zombie or a blocked process): in those cases fall through to the normal
+      ready walk instead of pinning a dead process to the CPU. */
+   /* crit_wait: lastprocess is itself SPINNING to acquire a crit (it holds
+       other crits from the outer level, but is blocked on this one).  Pinning
+       it here would starve the crit's actual owner (runnable in the ready
+       queue) and deadlock the system -- the SMP io_devlock deadlock.  Do NOT
+       pin a waiter; fall through to the ready walk so the owner gets a CPU.
+       A holder doing real work under a crit (crit_wait==0) is still pinned, so
+       mid-critical-section preemption protection is preserved. */
+    if (lastprocess->held_crit_n > 0
+        && !(lastprocess->status & (PS_ATTB_DYING | PS_ATTB_BLOCKED))
+        && !lastprocess->waiting
+        && !lastprocess->crit_wait)
+       return lastprocess;
 
    /* ready_lock is held with interrupts disabled: scheduler() runs from
       the timer IRQ (IF=0) and from voluntary taskswitch/waitpid paths
@@ -78,39 +110,99 @@ PCB386 *scheduler(PCB386 *lastprocess){
    { DWORD fl; storeflags(&fl); stopints();
    spin_lock(&ready_lock);
 
-   start = lastprocess->next;
-   ptr = start;
-   best = 0;
-   best_prio = -1;
+   /* Bounded ready-list integrity validator (victim-vs-source probe for the
+       first-switch wild-rip corruption). Runs under ready_lock + IF=0, so any
+       corruption it finds was produced OUTSIDE the lock: either by a
+       dequeue/free that did not hold ready_lock, or by a wild write into a
+       PCB/heap. Reports the exact node + bad field once, then continues (the
+       walk below will still fail safely via the GPF64 kernel-fault halt). */
+    {
+       static volatile unsigned long rl_bad = 0;
+       if (rl_bad < 8) {
+          PCB386 *n = lastprocess;
+          int hops = 0;
+          int bad = 0;
+          /* A legal PCB lives in the kernel heap (>= 0x100000) or is the
+             static sPCB. next/before must round-trip (n->next->before == n)
+             and stay in the same world. status must not be wild. */
+          while (hops < 256) {
+             PCB386 *nx = n->next;
+             PCB386 *bf = n->before;
+             if (!nx || !bf || (uintptr)nx < 0x100000 || (uintptr)bf < 0x100000) { bad = 1; break; }
+             if (nx->before != n || bf->next != n) { bad = 1; break; }
+             if (n->status & 0xFFFF0000) { bad = 1; break; }
+             n = nx;
+             if (n == lastprocess) break;
+             hops++;
+          }
+          if (bad) {
+             rl_bad++;
+             char lb[192];
+             char nm[12];
+             int k = 0;
+             const char *s = lastprocess->name ? lastprocess->name : "?";
+             while (s[k] && k < 11) { nm[k] = s[k]; k++; }
+             nm[k] = 0;
+             sprintf(lb, "RLBAD cpu=%d last=%s lastp=0x%llx next=0x%llx before=0x%llx status=0x%x hops=%d\n",
+                     me, nm,
+                     (unsigned long long)(uintptr)lastprocess,
+                     (unsigned long long)(uintptr)lastprocess->next,
+                     (unsigned long long)(uintptr)lastprocess->before,
+                     (unsigned)lastprocess->status, hops);
+             serial_puts(lb);
+          }
+       }
+    }
+    start = lastprocess->next;
+    if (!start) {
+       spin_unlock(&ready_lock);
+       restoreflags(fl);
+       return lastprocess;
+    }
+    ptr = start;
+    best = 0;
+    best_prio = -1;
 
    /* Pass 1: find maximum priority among runnable tasks; tick down sleepers. */
-   do {
-      if ((ptr->status&PS_ATTB_BLOCKED) &&
-          deadline_expired(ticks,ptr->wait_deadline)) {
-         ptr->wait_deadline=0;
-         ptr->status&=~PS_ATTB_BLOCKED;
-      }
-      if (ptr->waiting) {
-         ptr->waiting--;
-      } else if (sched_runnable_here(ptr)) {
-         if ((int)ptr->priority > best_prio) {
-            best = ptr;
-            best_prio = (int)ptr->priority;
+   {
+      int hops = 0;
+      do {
+         PCB386 *nx;
+         if ((ptr->status&PS_ATTB_BLOCKED) &&
+             deadline_expired(ticks,ptr->wait_deadline)) {
+            ptr->wait_deadline=0;
+            ptr->status&=~PS_ATTB_BLOCKED;
          }
-      }
-      ptr = ptr->next;
-   } while (ptr != start);
+         if (ptr->waiting) {
+            ptr->waiting--;
+         } else if (sched_runnable_here(ptr)) {
+            if ((int)ptr->priority > best_prio) {
+               best = ptr;
+               best_prio = (int)ptr->priority;
+            }
+         }
+         nx = ptr->next;
+         if (!nx || hops++ > 512)
+            break;
+         ptr = nx;
+      } while (ptr != start);
+   }
 
    /* Pass 2: among that priority, pick the next after lastprocess (RR). */
-    if (best) {
+    if (best && lastprocess->next) {
+       int hops = 0;
        ptr = lastprocess->next;
        do {
+          PCB386 *nx;
           if (sched_runnable_here(ptr)
               && (int)ptr->priority == best_prio) {
              best = ptr;
              break;
           }
-          ptr = ptr->next;
+          nx = ptr->next;
+          if (!nx || hops++ > 512)
+             break;
+          ptr = nx;
        } while (ptr != lastprocess->next);
        /* Claim before unlock so another CPU cannot pick the same task. */
        best->on_cpu = me;
@@ -119,20 +211,6 @@ PCB386 *scheduler(PCB386 *lastprocess){
     spin_unlock(&ready_lock);
     restoreflags(fl); }
 
-    if (best && best != lastprocess) {
-       static volatile unsigned long schedsel_user_count = 0;
-       if (best->accesslevel == ACCESS_USER && schedsel_user_count < 96) {
-           char sb[160];
-           schedsel_user_count++;
-           sprintf(sb, "SCHEDSEL cpu=%d n=%lu last=%s best=%s prio=%d on=%d bptr=0x%llx lptr=0x%llx\n",
-                   me, (unsigned long)schedsel_user_count,
-                   lastprocess ? lastprocess->name : "?",
-                   best->name, (int)best->priority, (int)best->on_cpu,
-                   (unsigned long long)(uintptr)best,
-                   (unsigned long long)(uintptr)lastprocess);
-           serial_puts(sb);
-        }
-    }
     return best ? best : lastprocess;
 };
 
@@ -162,40 +240,57 @@ void sched_enqueue(PCB386 *process){
 
    { DWORD fl; storeflags(&fl); stopints();
    spin_lock(&ready_lock);
-	 
-   //no processes in memory yet?
+
+   /* Already linked: a second insert would splice the ring and leave the
+      old neighbors pointing at a node that is about to be overwritten. */
+   if (process->next && process->before &&
+       process->next->before == process && process->before->next == process) {
+      spin_unlock(&ready_lock);
+      restoreflags(fl);
+      return;
+   }
+
    if (sched_phead==0){
       sched_phead = process;
-      //fill up phead's connections
       sched_phead->next = sched_phead;
       sched_phead->before = sched_phead;
    }else{
-      //Use insert at head method
       temp = sched_phead->next;
-      //fill up phead's connections
       sched_phead->next = process;
-
-      //fill up process's connections
       process->next = temp;
       process->before = sched_phead;
-
-   //fill up temp's connections
-   temp->before = process;
+      temp->before = process;
    };
    spin_unlock(&ready_lock);
    restoreflags(fl); }
    smp_reschedule_others();
 };
 
-//removes a process with the specified pid from a doubly-linked list process queue
 int sched_dequeue(PCB386 *ptr){
+   int was_queued = 0;
    { DWORD fl; storeflags(&fl); stopints();
    spin_lock(&ready_lock);
-   ptr->before->next=ptr->next;
-   ptr->next->before=ptr->before;
+   if (ptr && ptr->next && ptr->before &&
+       ptr->next->before == ptr && ptr->before->next == ptr) {
+      was_queued = 1;
+      if (ptr->next == ptr) {
+         if (sched_phead == ptr)
+            sched_phead = 0;
+      } else {
+         ptr->before->next = ptr->next;
+         ptr->next->before = ptr->before;
+         if (sched_phead == ptr)
+            sched_phead = ptr->next;
+      }
+      ptr->next = 0;
+      ptr->before = 0;
+   } else if (ptr) {
+      ptr->next = 0;
+      ptr->before = 0;
+   }
    spin_unlock(&ready_lock);
    restoreflags(fl); }
-   return 1;
+   return was_queued;
 };
 
 /*Unlike sched_listprocess, sched_findprocess should return the pointer
@@ -209,17 +304,24 @@ PCB386 *sched_findprocess(int pid){
 
    storeflags(&cpuflags);
    stopints();
+   spin_lock(&ready_lock);
+   head_ptr = sched_phead;
+   ptr = head_ptr;
 
    if (head_ptr) {
+      int hops = 0;
       do{
          if (ptr->processid == pid) {
             retval = ptr;
             break;
          };
          ptr = ptr ->next;
+         if (!ptr || hops++ > 512)
+            break;
        } while (ptr != head_ptr);
    }
-    
+
+   spin_unlock(&ready_lock);
    restoreflags(cpuflags);
    return retval;
 };
@@ -239,10 +341,11 @@ int sched_listprocess(PCB386 *process_buf, DWORD size_per_item, int items){
    int i = 0;
    PCB386 *head_ptr = sched_phead, *ptr;
     
-   ptr = head_ptr;
-    
    storeflags(&cpuflags);
    stopints();
+   spin_lock(&ready_lock);
+   head_ptr = sched_phead;
+   ptr = head_ptr;
 
    if (head_ptr) {
       do{
@@ -253,10 +356,13 @@ int sched_listprocess(PCB386 *process_buf, DWORD size_per_item, int items){
             else
                break;
          };
-         ptr = ptr ->next; i++;                                            
+         ptr = ptr ->next; i++;
+         if (!ptr || i > 512)
+            break;
       } while (ptr != head_ptr);
    }
-    
+
+   spin_unlock(&ready_lock);
    restoreflags(cpuflags);
     
    return i;

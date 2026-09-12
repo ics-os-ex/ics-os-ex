@@ -219,8 +219,12 @@ DWORD pfoccured = 0; /*set this to reset the pf_handler PCB, usually set by
    (double-kill) the same pid. Only the check-and-clear is held; kill_process()
    and the self-exit teardown run outside the lock. */
 static spinlock_t sigterm_lock;
-static PCB386 *zombie_free;
+static PCB386 *zombie_head;
+static PCB386 *pending_zombie[MAX_CPUS];
 static void self_exit_current(void);
+static int zfree_pml4_liveness_check(PCB386 *z);
+static void zombie_enqueue(PCB386 *z);
+static void zombie_drain(void);
 
 /* When set, newly created user processes (and their fork children) are not
    pinned to the BSP so the scheduler may spread them across all online CPUs.
@@ -900,9 +904,11 @@ DWORD dex32_asyncproc(saveregs *r,void *entrypoint,char *name,DWORD stacksize){
    temp->accesslevel=ACCESS_SYS;
    temp->owner=1;
    temp->knext=knext;
-   temp->pagedirloc=pagedir1;
-   memset(temp,0,sizeof(saveregs));
-   temp->regs.EIP=(DWORD)entrypoint;
+    temp->pagedirloc=pagedir1;
+    memset(temp,0,sizeof(saveregs));
+    temp->held_crit_n=0;
+    temp->crits_freed=0;
+    temp->regs.EIP=(DWORD)entrypoint;
    temp->stackptr=malloc(stacksize);
    temp->regs.ESP=(DWORD)(temp->stackptr+stacksize-4);
    temp->stackptr=(void*)temp->regs.ESP;
@@ -1193,14 +1199,35 @@ DWORD kill_process(DWORD processid){
 
       if (! (ptr->status & PS_ATTB_UNLOADABLE) ){
 
-          PCB386 *parent;
+           PCB386 *parent;
 
-          /* A blocked victim may still own crits it acquired before it
-             blocked. Release them before teardown so closeallfiles() and the
-             heap do not spin on a dead owner. Running victims cannot be safely
-             touched here; self_exit_current() handles that path. */
-          if (ptr->on_cpu < 0)
-             sync_release_process_crits(ptr, (ptr->processid & 0x007FFFFF) + 1);
+           /* self_exit_current owns teardown of a DYING PCB.  After it
+              clears on_cpu but before dequeue, a remote kill used to treat
+              the victim as off-CPU, dequeue a second time with stale
+              next/before, and free the live PCB (RLBAD / PF64 in scheduler). */
+           if (ptr->status & PS_ATTB_DYING) {
+              sync_leavecrit(&processmgr_busy);
+              return 1;
+           }
+
+           /* A victim that is live on another CPU must self-exit there. */
+           if (ptr->on_cpu >= 0) {
+              ptr->status |= PS_ATTB_DYING;
+              sync_leavecrit(&processmgr_busy);
+              {
+                 spin_irq_flags_t f = spin_lock_irqsave(&sigterm_lock);
+                 if (!sigterm)
+                    sigterm = ptr->processid;
+                 spin_unlock_irqrestore(&sigterm_lock, f);
+              }
+              return 1;
+           }
+
+           /* A blocked victim may still own crits it acquired before it
+              blocked. Release them before teardown so closeallfiles() and the
+              heap do not spin on a dead owner. */
+           if (ptr->on_cpu < 0)
+              sync_release_process_crits(ptr, (ptr->processid & 0x007FFFFF) + 1);
 
           kill_children(processid);                             //kill children processes first
 
@@ -1288,12 +1315,6 @@ DWORD kill_process(DWORD processid){
          };
          
          {
-             unsigned long kf_ptr = (unsigned long)(uintptr)ptr;
-             int kf_pid = ptr->processid;
-             unsigned long kf_params = (unsigned long)(uintptr)ptr->parameters;
-             unsigned long kf_stdout = (unsigned long)(uintptr)ptr->stdout;
-             unsigned long kf_mem = (unsigned long)(uintptr)ptr->meminfo;
-             int kf_status = ptr->status;
              //free command line arguments
              if (ptr->parameters!=0)
                 free(ptr->parameters);
@@ -1308,8 +1329,6 @@ DWORD kill_process(DWORD processid){
              free(ptr);
 
              sync_leavecrit(&processmgr_busy);
-             printf("KFREE ptr=0x%lx pid=%d params=0x%lx stdout=0x%lx mem=0x%lx status=0x%x\n",
-                    kf_ptr, kf_pid, kf_params, kf_stdout, kf_mem, kf_status);
           }
 
           //process successfully killed
@@ -2061,19 +2080,6 @@ void ps_switchto(PCB386 *process){
        }
     }
 
-     {
-         static volatile unsigned long switch_user_count = 0;
-         if (process->accesslevel == ACCESS_USER && switch_user_count < 96) {
-           char swb[128];
-           switch_user_count++;
-           sprintf(swb, "SWITCH cpu=%d n=%lu prev=%s next=%s rip=0x%llx\n",
-                   me, (unsigned long)switch_user_count,
-                   prev ? prev->name : "?", process->name,
-                   (unsigned long long)process->ctx.rip);
-           serial_puts(swb);
-        }
-     }
-
      if (prev && prev != process)
        context_switch(&prev->ctx, &process->ctx, &prev->on_cpu);
      else
@@ -2102,6 +2108,140 @@ static void waitpid_notify_parent(PCB386 *parent)
    }
 }
 
+/* Concurrent self-exits used to overwrite a single zombie_free slot and leak
+   earlier PCBs/PML4s. Push onto a CAS stack; the BSP steals the whole list. */
+static void zombie_enqueue(PCB386 *z)
+{
+   PCB386 *old;
+
+   if (!z)
+      return;
+   do {
+      old = zombie_head;
+      z->zombie_next = old;
+   } while (!__sync_bool_compare_and_swap(&zombie_head, old, z));
+}
+
+static int zombie_still_live(PCB386 *z)
+{
+   int i;
+
+   if (!z)
+      return 0;
+   for (i = 0; i < cpu_count; i++) {
+      if (!cpus[i].online)
+         continue;
+      if (cpus[i].current == z)
+         return 1;
+      if (ctx_load_in_progress[i]) {
+         /* CR3/RSP of CPU i may still be this PCB until context_load finishes. */
+         if (pending_zombie[i] == z)
+            return 1;
+      }
+   }
+   return 0;
+}
+
+static void zombie_reclaim(PCB386 *z)
+{
+   if (!z)
+      return;
+   if (zombie_still_live(z)) {
+      zombie_enqueue(z);
+      return;
+   }
+#ifdef __x86_64__
+   {
+      extern DWORD *pagedir1;
+      if (!(z->status & PS_ATTB_THREAD)
+           && userpd_is_private(z->pagedirloc)) {
+          if (zfree_pml4_liveness_check(z)) {
+             zombie_enqueue(z);
+             return;
+          }
+          userpd_free((u64 *)(uintptr)z->pagedirloc);
+          z->pagedirloc = pagedir1;
+       }
+   }
+#endif
+    if (z->meminfo) {
+       process_mem *m = z->meminfo;
+       while (m) {
+          process_mem *n = m->next;
+          free(m);
+          m = n;
+       }
+       z->meminfo = 0;
+    }
+    if (z->parameters) {
+       free(z->parameters);
+       z->parameters = 0;
+    }
+    if (z->stdout) {
+       free(z->stdout);
+       z->stdout = 0;
+    }
+    free(z);
+}
+
+static void zombie_drain(void)
+{
+   PCB386 *z, *n;
+   int i;
+
+   if (smp_cpu_id() != 0)
+      return;
+   for (i = 0; i < cpu_count && i < MAX_CPUS; i++) {
+      z = pending_zombie[i];
+      if (!z)
+         continue;
+      if (ctx_load_in_progress[i] || cpus[i].current == z)
+         continue;
+      if (__sync_bool_compare_and_swap(&pending_zombie[i], z, 0))
+         zombie_enqueue(z);
+   }
+   for (;;) {
+      z = zombie_head;
+      if (!z)
+         return;
+      if (!__sync_bool_compare_and_swap(&zombie_head, z, 0))
+         continue;
+      while (z) {
+         n = z->zombie_next;
+         z->zombie_next = 0;
+         zombie_reclaim(z);
+         z = n;
+      }
+      return;
+   }
+}
+
+/* Regression detector for the SMP self-exit race that silently triple-faulted
+   SMP=4 self-host certification.  Fires when we are about to free a zombie's
+   private PML4 while some CPU is CURRENTLY running a process that still uses
+   that same directory -- the exact condition that used to leave a CPU walking
+   freed frames.  The PS_ATTB_DYING guard in sched_runnable_here()/
+   self_exit_current() should make this unreachable, so a hit means the guard
+   regressed.  Marker only:    the DYING guard is the real fix. */
+static int zfree_pml4_liveness_check(PCB386 *z)
+{
+    int i;
+    for (i = 0; i < cpu_count; i++) {
+        PCB386 *c = cpus[i].current;
+        if (!cpus[i].online || !c)
+            continue;
+        if (c->pagedirloc == z->pagedirloc) {
+            char zb[192];
+            sprintf(zb, "ZFREE_LIVE_PML4 zpid=%d zpagedir=0x%x live_pid=%d cpu=%d same_zombie=%d\n",
+                    (int)z->processid, z->pagedirloc,
+                    (int)c->processid, i, (c == z));
+            serial_puts(zb);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void self_exit_current(void)
 {
    PCB386 *dying = current_process;
@@ -2113,9 +2253,12 @@ static void self_exit_current(void)
    if (!dying)
        return;
 
+  /* Close files before processmgr_busy so teardown I/O cannot invert with
+     bio_submit_sync (io_devlock then processmgr) under SMP=4 -j4. */
+  posix_fd_close_all(dying);
+  closeallfiles(dying->processid);
+
   sync_entercrit(&processmgr_busy);
-    posix_fd_close_all(dying);
-    closeallfiles(dying->processid);
 
    parent = ps_findprocess(dying->owner);
    if (parent != (PCB386 *)-1 && parent != dying) {
@@ -2148,25 +2291,29 @@ static void self_exit_current(void)
          readyprocess = &sPCB;
    }
 
-   dying->on_cpu = -1;
-      dying->status |= PS_ATTB_UNLOADABLE;
-      {
-        int se_pid = dying->processid;
-       unsigned long se_z = (unsigned long)(uintptr)dying;
-       unsigned long se_params = (unsigned long)(uintptr)dying->parameters;
-       unsigned long se_stdout = (unsigned long)(uintptr)dying->stdout;
-       int se_status = dying->status;
-       ps_dequeue(dying);
-        zombie_free = dying;
+   /* Mark DYING, dequeue while still claimed (on_cpu == me), then drop
+      on_cpu.  kill_process must not observe on_cpu < 0 for a PCB that is
+      still in the ready ring. */
+    dying->status |= PS_ATTB_DYING;
+    dying->status |= PS_ATTB_UNLOADABLE;
+    __sync_synchronize();
+    ps_dequeue(dying);
+    dying->on_cpu = -1;
         sync_leavecrit(&processmgr_busy);
+        /* Held-crit sweep MUST run before the PCB is published to the
+           zombie list: the BSP reclaims zombies in schedule_from_timer()
+           without processmgr_busy, so publishing first lets the BSP
+           free(dying) while we still read dying->held_crits[]. */
         sync_release_process_crits(dying, (dying->processid & 0x007FFFFF) + 1);
-        printf("SELFEXIT pid=%d z=0x%lx params=0x%lx stdout=0x%lx status=0x%x\n",
-               se_pid, se_z, se_params, se_stdout, se_status);
-    }
    stopints();
      current_process = readyprocess;
      readyprocess->on_cpu = me;
      fpu_restore(&readyprocess->fpu);
+     /* Publish the zombie only after this CPU's current_process is the
+        successor, and keep ctx_load_in_progress set until context_load
+        finishes CR3/RSP so the BSP cannot free the live PML4. */
+     ctx_load_in_progress[me] = 1;
+     pending_zombie[me] = dying;
      context_load(&readyprocess->ctx);
   }
 
@@ -2196,8 +2343,10 @@ void schedule_from_timer(void){
        preemptive SMP. */
     {
          if (!voluntary && selfhost_cooperative_ready &&
-            selfhost_stage1_cmdline())
+            selfhost_stage1_cmdline()) {
+          zombie_drain();
           return;
+         }
     }
 
    /* If context_load is in progress, the new task's context has been
@@ -2219,43 +2368,9 @@ void schedule_from_timer(void){
    }
 #endif
 
-   /* Finish deferred free from a prior self-exit (safe once off that stack).
-      Only the BSP frees zombies to avoid a cross-CPU free race. */
-   if (zombie_free && smp_cpu_id() == 0) {
-      PCB386 *z = zombie_free;
-      zombie_free = 0;
-#ifdef __x86_64__
-      /* Self-exit (schedule_from_timer) dequeues without kill_process()
-         so it can leave the dying stack. Reclaim the private PML4 here,
-         now that CR3 and RSP belong to another task. */
-      if (!(z->status & PS_ATTB_THREAD)
-          && userpd_is_private(z->pagedirloc)) {
-         userpd_free((u64 *)(uintptr)z->pagedirloc);
-         z->pagedirloc = pagedir1;
-      }
-#endif
-      printf("ZFREE z=0x%lx pid=%d pagedir=0x%x params=0x%lx stdout=0x%lx mem=0x%lx status=0x%x oncpu=%d\n",
-               (unsigned long)(uintptr)z, z->processid,
-               z->pagedirloc,
-               (unsigned long)(uintptr)z->parameters,
-               (unsigned long)(uintptr)z->stdout,
-               (unsigned long)(uintptr)z->meminfo, z->status,
-               z->on_cpu);
-       if (z->meminfo) {
-          process_mem *m = z->meminfo;
-          while (m) {
-             process_mem *n = m->next;
-             free(m);
-             m = n;
-          }
-          z->meminfo = 0;
-       }
-       if (z->parameters) free(z->parameters);
-       z->parameters = 0;
-       if (z->stdout) free(z->stdout);
-       z->stdout = 0;
-       free(z);
-   }
+   /* Finish deferred frees from prior self-exits (safe once off that stack).
+      Only the BSP reclaims so we never free a PCB from the dying CPU. */
+   zombie_drain();
 
    cursched = (devmgr_scheduler_extension*)extension_table[CURRENT_SCHEDULER].iface;
    if (!cursched || !cursched->scheduler)
@@ -2287,18 +2402,6 @@ void schedule_from_timer(void){
     if (!readyprocess || readyprocess == current_process)
        return;
 
-    {
-       static volatile unsigned long rptr_user_count = 0;
-       if (readyprocess->accesslevel == ACCESS_USER && rptr_user_count < 96) {
-          char rb[160];
-          rptr_user_count++;
-          sprintf(rb, "RSEL n=%lu rptr=0x%llx cptr=0x%llx\n",
-                  (unsigned long)rptr_user_count,
-                  (unsigned long long)(uintptr)readyprocess,
-                  (unsigned long long)(uintptr)current_process);
-          serial_puts(rb);
-       }
-    }
     current_process->totalcputime++;
     ps_switchto(readyprocess);
 }
