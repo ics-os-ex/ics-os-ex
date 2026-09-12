@@ -32,6 +32,7 @@
 #include "../dextypes.h"
 #include "../stdlib/time.h"
 #include "../process/sync.h"
+#include "vfs_grow.h"
 
 //defines constants for the attribute bits - (influenced by UNIX)
 #define FILE_DIRECTORY  0x200

@@ -71,6 +71,7 @@ Useful individual targets (from `ics-os/`):
 | `test-ext4` | ext4 virtio-blk read/create/write; guest marker plus host `e2fsck`/`debugfs` validation of the post-test image |
 | `test-spawn` | `posix_spawn` + `waitpid` of `hello.exe` (`SPAWN_PASS`); FAT `/work` on virtio (`WORK_DISK_PASS`) |
 | `test-stress` | SMP=4 spawn/exit/reap + short fork+ELF overlap (`STRESSPROC_PASS`); no GPF/PF |
+| `test-fatwrite` | SMP=4 concurrent FAT16 `/work` writers+readers (`FATWR_PASS`); no truncated patterns |
 | `test-fork` | COW fork ABI/isolation, fast path, text protection, OOM, inherited fd, exit/wait, and delayed reaping |
 | `test-fork-matrix` | COW fork pressure gate on `-smp 1/2/4/8` |
 | `test-make` | In-OS TinyCC builds GNU make 3.82 onto `/work`; `make -f t.mk` spawns `hello.exe` (`MAKE_PASS`) |
@@ -78,6 +79,7 @@ Useful individual targets (from `ics-os/`):
 | `test-vim` | FEAT_TINY vim ELF64 TUI; non-interactive `vim --version` prints the real banner + exits cleanly |
 | `test-dup` | Runtime `dup(2)` (`0xC5`) self-test: dup'd tty fd allocable+closable; dup'd file fd write read back through the original (`DUPT_PASS`) |
 | `test-partition-unit` | Host-native TAP unit tests for partition-layer logic: IEEE CRC-32 vectors/chunking and ATA LBA28/LBA48 capacity decode (`tests/partition_unit.c`) |
+| `test-vfsgrow-unit` | Host-native TAP for VFS `vfs_units_covering` (exact cluster-size grow; `tests/vfs_grow_unit.c`) |
 | `test-integration` | `test-boot` + `test-smp` + `test-exec` |
 
 Do **not** use QEMU `-kernel` for the ELF64 image; boot via GRUB `multiboot2` (ISO/USB helpers in the Makefile).

@@ -46,6 +46,10 @@ static void fat_wait_io(DWORD hdl)
 int fat_deviceid;
 static sync_sharedvar fat_volume_busy[MAXDEVICES];
 
+/* Serializes FAT metadata, the shared fatcache[] buffer, and volume I/O.
+   Hold across fat_wait_io() (which may taskswitch). Nested acquire by the
+   same owner is allowed. Readers that skip this lock can loadfat() into a
+   cache buffer a writer is still walking, which truncates guest files. */
 static void fat_lock_volume(int id)
 {
    if (id >= 0 && id < MAXDEVICES)
@@ -345,7 +349,8 @@ void loadfat(BPB *bpbblock,void *fat,int id)
  * (loadfile12EX2 / writefile12EX2) even though data I/O never modifies it;
  * for a 1 MiB file that is ~256 full FAT reloads (each the whole 2 MiB FAT).
  * Cache the FAT per device in RAM and invalidate only when the on-disk FAT
- * changes (update_fats) so the next access reloads it.
+ * changes (update_fats) so the next access reloads it. Callers must hold
+ * fat_lock_volume(id): the returned pointer aliases a shared buffer.
  */
 #define FATCACHE_MAXDEVS 4
 typedef struct {
@@ -491,6 +496,8 @@ int fat_loaddirectoryfromcluster(DWORD start_clust,char **buf,int id)
          char *dirbuf;
          
          BPB bpbblock;
+
+         fat_lock_volume(id);
          
          #ifdef DEBUG_FAT12
          printf("loaddirectoryfromcluster called..");
@@ -510,7 +517,11 @@ int fat_loaddirectoryfromcluster(DWORD start_clust,char **buf,int id)
          loadfat(&bpbblock,fat,id);
          };
          
-         if (cluster==0) return 0;
+         if (cluster==0) {
+            if (fat!=0) free(fat);
+            fat_unlock_volume(id);
+            return 0;
+         }
          
          //figure out the size of the directory by going through the FAT cluster
          //chain and performing some math which is:
@@ -557,6 +568,7 @@ int fat_loaddirectoryfromcluster(DWORD start_clust,char **buf,int id)
          *buf = dirbuf;
          
          if (fat!=0) free(fat);
+         fat_unlock_volume(id);
          
          #ifdef DEBUG_FAT12
          printf("done.\n");
@@ -883,10 +895,15 @@ DWORD fat_getbytesperblock(int id)
 
 void fat_getfileblocks(file_PCB *f,DWORD *sectinfo,int id)
 {
-   BPB  *buf=(BPB*)malloc(512);
+   BPB  *buf;
    fatdirentry *buf2=0;
    vfs_node *fp=f->ptr;
-   // printf("fat_getfileblocks() called...\n");
+   fat_lock_volume(id);
+   buf=(BPB*)malloc(512);
+   if (!buf) {
+      fat_unlock_volume(id);
+      return;
+   }
    readBPB(buf,id);
    // printf("obtaining directory information\n");
    if (f!=0)
@@ -895,8 +912,8 @@ void fat_getfileblocks(file_PCB *f,DWORD *sectinfo,int id)
    if (buf2)
       fillsectorinfo(buf2,buf,sectinfo,id);
    free(buf);
-   
-;};
+   fat_unlock_volume(id);
+};
 
 //returns the number of sectors occupied by a directory
 DWORD getdirsectorsize(fatdirentry *dir,BPB *bpbblock,int func,BYTE *fat,int id)
@@ -1056,15 +1073,27 @@ DWORD update_dirs_fats(BPB *bpbblock,BYTE *fat,vfs_node *tdir,int id)
 
 int fat_getsectorsizeEX(vfs_node *f,int id)
 {
-   BPB  *buf=(BPB*)malloc(512);
+   BPB  *buf;
    vfs_node *parentdir=(vfs_node*)f->path;
    BYTE *fat = 0;
    DWORD sectors=0;
    int i;
+
+   fat_lock_volume(id);
+   buf=(BPB*)malloc(512);
+   if (!buf) {
+      fat_unlock_volume(id);
+      return 0;
+   }
    
    readBPB(buf,id);
    
    fat=(BYTE*)malloc(fat_sectors_per_fat(buf)*512);//allocate memory for FAT
+   if (!fat) {
+      free(buf);
+      fat_unlock_volume(id);
+      return 0;
+   }
    for (i=0;i<fat_sectors_per_fat(buf);i++)
    {
       DWORD handle=dex32_requestIO(id,IO_READ,buf->num_boot_sectors+i,1,(void*)(fat+i*512));
@@ -1076,6 +1105,7 @@ int fat_getsectorsizeEX(vfs_node *f,int id)
    sectors=getdirsectorsize(desc,buf,2,fat,id);
    free(buf);
    free(fat);
+   fat_unlock_volume(id);
    return sectors;
 ;};
 
@@ -2054,11 +2084,16 @@ int writefile12EX2(fatdirentry *dir,BPB *bpbblock,char *buf,int se,int start,int
       
 DWORD fat_openfileEX(vfs_node *f,char *bufr,int start,int end,int id)
 {
-   BPB    *bpbblock=(BPB*)malloc(512);
-   //perform the read
-   
+   BPB    *bpbblock;
    fatdirentry   *dir=0;
    int found=0,size=0,i;
+
+   fat_lock_volume(id);
+   bpbblock=(BPB*)malloc(512);
+   if (!bpbblock) {
+      fat_unlock_volume(id);
+      return 0;
+   }
    readBPB(bpbblock,id);
    
    if (f!=0)
@@ -2068,13 +2103,13 @@ DWORD fat_openfileEX(vfs_node *f,char *bufr,int start,int end,int id)
    {
       if (!loadfile12EX2(dir,bpbblock,bufr,1,start,end,id))
       {
-         //error while loading the file
-         
          free(bpbblock);
+         fat_unlock_volume(id);
          return 0;
       };
    };
 free(bpbblock);
+fat_unlock_volume(id);
 return size;
 };
 

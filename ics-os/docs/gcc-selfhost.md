@@ -234,7 +234,10 @@ trimmed binutils + make tree.
 `.o` output. gccdriver scratch (`.s`/`.o`) must live on `/work` too: the 16 MiB
 `/ramdisk` fills under `make -j4` (`fat: Out of space` at cluster 8119,
 truncated `.s`). The chain walker must treat the last cluster id (`count+1`)
-as valid.
+as valid. Concurrent reads and writes on `/work` must hold `fat_lock_volume`
+(`make test-fatwrite`). `vfs_directwrite` grows with `vfs_units_covering`
+(ceil), not `size/unit+1`. Page-cache lookup scans the whole table when a
+line was placed outside the 8-slot hash probe.
 
 FAT 8.3 still bites some GCC names even with LFN on create; that is a later
 FS issue.

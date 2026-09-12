@@ -157,7 +157,13 @@ and a chain that has taken more steps than that id is a loop. In
 both failure cases the walk stops and returns 0 (the read fails closed) instead
 of spinning or reading out of bounds. Do not re-introduce an unbounded `while`
 over `obtain_next_cluster()`; if you change the walk, add a case to
-`tests/fat_chain_unit.c` (`make test-fatchain-unit`).
+`tests/fat_chain_unit.c` (`make test-fatchain-unit`). Every FAT data path
+(`fat_openfileEX`, directory load, write, grow) must take `fat_lock_volume`
+for that device: `fatcache[]` is a shared buffer, and `fat_wait_io()` may
+taskswitch. Unlocked readers racing a writer truncated in-OS `.s` files
+(`make test-fatwrite`). `vfs_directwrite` uses `vfs_units_covering` (ceil)
+not `size/unit+1`. The 4 KiB page cache `pc_lookup` must find a line even
+when `pc_claim` placed it outside the 8-slot hash probe (`kernel/iomgr/blkcache.c`).
 
 Kernel builds are versioned and the kernel log is inspectable. `kernel/Makefile`
 generates `kernel/build_info.h` (release id, git short hash, dirty flag, UTC

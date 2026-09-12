@@ -224,7 +224,10 @@ TLB shootdown.
 `make test-virtio` greps the allocated-vector marker, `VIRTIO_BLK_OK`, and
 `VIRTIO_IRQ_OK`.
 If sector 0 looks like FAT, the kernel mounts `vblk` at `/work` and prints
-`work: mounted` (skipped on a zeroed disk).
+`work: mounted` (skipped on a zeroed disk). All FAT read and write paths on
+that volume take `fat_lock_volume` so the shared FAT cache is not walked while
+another CPU `loadfat()`s into it. `pc_lookup` must find a page-cache line even
+if `pc_claim` stored it outside the 8-slot hash probe (`make test-fatwrite`).
 
 ## Memory map
 

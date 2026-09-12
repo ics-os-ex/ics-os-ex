@@ -31,7 +31,7 @@ HOSTG_RTFLAGS := -m64 -std=gnu89 -w -nostdlib -fno-builtin -static -ffreestandin
 vmdex:
 	make -C kernel/
 
-.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-ide-thumbdrive
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-fatwrite test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-ide-thumbdrive
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -57,6 +57,11 @@ test-fatchain-unit:
 	@mkdir -p /tmp/icsos-tests
 	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/fat_chain_unit.c -o /tmp/icsos-tests/fat_chain_unit
 	@/tmp/icsos-tests/fat_chain_unit
+
+test-vfsgrow-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/vfs_grow_unit.c -o /tmp/icsos-tests/vfs_grow_unit
+	@/tmp/icsos-tests/vfs_grow_unit
 
 # Deterministic 64 MiB GPT disk (slot 0: 32 MiB FAT32, slot 1: 16 MiB ext4).
 ics-os-gpt.img: scripts/mkgpt.sh
@@ -887,6 +892,37 @@ test-stress: kernel/Kernel64.bin apps/stressproc.exe apps/hello.exe
 	@! grep -aq "STRESSPROC_FAIL" /tmp/icsos-stress.log
 	@! grep -aqE "PF64 |GPF64 " /tmp/icsos-stress.log
 	@echo "test-stress PASS"
+
+apps/fatwr.exe: contrib/fatwr/fatwr.c contrib/fatwr/Makefile
+	$(MAKE) -C contrib/fatwr install
+
+# Concurrent FAT16 virtio /work writers + readers. Catches unlocked
+# fat_openfileEX racing fatcache[] (truncated .s under make -j4).
+test-fatwrite: kernel/Kernel64.bin apps/fatwr.exe
+	@$(MAKE) -C kernel all
+	@echo "Building Multiboot2 ISO for concurrent FAT write test..."
+	@mkdir -p /tmp/icsos-fatwr-iso/boot/grub /tmp/icsos-fatwr-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-fatwr-iso/vmdex
+	@cp apps/fatwr.exe /tmp/icsos-fatwr-iso/apps/fatwr.exe
+	@printf '%s\n' 'fatwr.exe' 'reboot' > /tmp/icsos-fatwr-iso/autoexec.bat
+	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
+		> /tmp/icsos-fatwr-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-fatwr.iso /tmp/icsos-fatwr-iso >/dev/null 2>&1
+	@echo "Formatting 512 MiB FAT16 virtio work disk..."
+	@truncate -s 512M /tmp/icsos-fatwr-work.img
+	@mkfs.vfat -F 16 -s 32 /tmp/icsos-fatwr-work.img >/dev/null
+	@echo "Running concurrent FAT write test (KVM, smp 4)..."
+	@-timeout 120 stdbuf -oL $(QEMU_X64) -enable-kvm -cpu host -smp 4 -nographic -no-reboot -m 256M \
+		-cdrom /tmp/icsos-fatwr.iso -boot d \
+		-drive file=/tmp/icsos-fatwr-work.img,if=none,id=vd0,format=raw \
+		-device virtio-blk-pci,drive=vd0,disable-legacy=on \
+		< /dev/null > /tmp/icsos-fatwr.log 2>&1
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-fatwr.log
+	@grep -aq "work: mounted" /tmp/icsos-fatwr.log
+	@grep -aq "FATWR_PASS" /tmp/icsos-fatwr.log
+	@! grep -aq "FATWR_FAIL" /tmp/icsos-fatwr.log
+	@! grep -aqE "PF64 |GPF64 " /tmp/icsos-fatwr.log
+	@echo "test-fatwrite PASS"
 
 apps/forktest.exe: contrib/forktest/forktest.c contrib/forktest/Makefile
 	$(MAKE) -C contrib/forktest install

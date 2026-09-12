@@ -186,13 +186,10 @@ int vfs_directwrite(char *buf, int itemsize, int n, file_PCB* fhandle)
                 bytes_per_allocation_unit = bridges_call(fs,&fs->getbytesperblock,fhandle->ptr->memid);
                 if (bytes_per_allocation_unit == 0)
                     return 0;
-                totalblocks=fhandle->ptr->size/bytes_per_allocation_unit+1;
-                neededblocks=(start+size)/bytes_per_allocation_unit+1;
-
-                if (fhandle->ptr->size==0)
-                {
-                    totalblocks=0;
-                };
+                totalblocks=vfs_units_covering(fhandle->ptr->size,
+                                               (unsigned int)bytes_per_allocation_unit);
+                neededblocks=vfs_units_covering(start+size,
+                                                (unsigned int)bytes_per_allocation_unit);
 
                 if (neededblocks>totalblocks) //more blocks needed so we request for one
                 {

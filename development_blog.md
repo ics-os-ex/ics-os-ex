@@ -1,5 +1,50 @@
 # Development blog
 
+## 2026-09-12 (Manila, UTC+8)
+
+### 15:53 — Concurrent `/work` writes: grow math + page-cache lookup
+
+**Cause:** `test-fatwrite` left zeros at offset 81920 (start of a 16 KiB
+cluster) on a concurrent writer. Two bugs: (1) `vfs_directwrite` used
+`size/unit+1`, so an exact cluster multiple looked like it already had the
+next unit and skipped `addsectors`; (2) `pc_claim` can place a dirty line
+outside the 8-slot hash neighborhood, then `pc_lookup` missed it and a later
+read filled zeros from disk.
+
+**Fix:** `vfs_units_covering` (ceil) + host `test-vfsgrow-unit`; `pc_lookup`
+falls back to a full 512-line scan. FAT volume lock on reads stays.
+
+**Gates:** `test-vfsgrow-unit` PASS, `test-fatwrite` PASS, `test-boot` PASS,
+`test-stress` PASS, `test-posixio` PASS.
+
+**Bounded `CERT_TIMEOUT=180`:** 39× `GCC_DRIVER_OK`, temps on `/work`, **no**
+GPF/PF/`Out of space`/truncated `.s`. Syscall count climbed (~8k→~25k+). Wall
+clock cut the run during `cgraph.c`. Not closure.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 11:21 — Checkpoint pushed; FAT volume lock for concurrent `/work` I/O
+
+**Checkpoint:** `f6ecc0e` on `ex/ics-os-v2` (SMP CPU id, IPI user skip, FAT last
+cluster, gccdriver `/work` temps, `test-stress`). Ignored `*.d`/`j.img` session
+notes.
+
+**Next:** parallel cert truncated `/work/.gccdrv.60.s` (`movq` → `q`) then froze
+`sc`. Cause: `fat_openfileEX` / directory load skipped `fat_lock_volume` while
+writers held it across `fat_wait_io()` yields, so readers `loadfat()`'d into the
+shared `fatcache[]` buffer a writer was still walking.
+
+**Fix:** take the volume lock on FAT reads (open, directory, getsectorsize,
+getfileblocks). Guest gate: `make test-fatwrite` (4 writers + 2 readers, 512 KiB
+patterns on virtio FAT16 `/work`).
+
+**test-fatwrite:** still **FAIL**. Sequential `/work/seed.dat` verifies; concurrent
+`/work/fw2.dat` is 512 KiB but byte 81920 is 0 (start of a 16 KiB cluster).
+Writer-writer still races after the read lock. `test-stress` re-run after the
+lock.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
 ## 2026-09-04 (Manila, UTC+8)
 
 ### 14:00 — GCC self-host: `as` OOM root-caused; SDK `malloc` slab allocator fix

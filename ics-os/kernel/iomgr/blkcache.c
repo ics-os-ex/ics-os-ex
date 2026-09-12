@@ -132,8 +132,10 @@ static int pc_slot(int deviceid, u64 index)
 static pc_page *pc_lookup(int deviceid, u64 index)
 {
    int s = pc_slot(deviceid, index);
-   int probe;
+   int probe, i;
    DWORD device_generation=devmgr_get_generation(deviceid);
+
+   /* Fast path: linear probe of the hash neighborhood. */
    for (probe = 0; probe < 8; probe++) {
       int idx = (s + probe) % PC_NPAGES;
       if ((pc_tab[idx].flags & PC_UPTODATE) &&
@@ -142,6 +144,20 @@ static pc_page *pc_lookup(int deviceid, u64 index)
                                          device_generation) &&
           pc_tab[idx].index == index)
          return &pc_tab[idx];
+   }
+   /*
+    * pc_claim may place a line anywhere in the table when the 8-slot
+    * neighborhood is full of dirty pages (full scan for a clean victim).
+    * A lookup that only probes 8 slots then misses, refills zeros from
+    * disk, and drops concurrent 16 KiB cluster writes (fatwr offset 81920).
+    */
+   for (i = 0; i < PC_NPAGES; i++) {
+      if ((pc_tab[i].flags & PC_UPTODATE) &&
+          pc_tab[i].deviceid == deviceid &&
+          blkcache_device_key_is_current(pc_tab[i].device_generation,
+                                         device_generation) &&
+          pc_tab[i].index == index)
+         return &pc_tab[i];
    }
    return 0;
 }
