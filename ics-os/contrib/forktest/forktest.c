@@ -14,6 +14,57 @@ static int fail(const char *reason)
    return 1;
 }
 
+/* fork() while the syscall's saved-register + iretq frame straddles a page
+   boundary.  The child resumes through fork_child_return, which does POP_ALL
+   then iretq over 160 bytes at the recorded user RSP; userpd_clone_cow() used
+   to make only the page holding the rax slot private to the child, so when the
+   frame spanned two pages the tail page -- holding the child's RIP, CS and
+   RFLAGS -- stayed COW-shared with a parent that immediately reused that stack.
+   The child then iretq'd over reused values and jumped into the low page,
+   reported as "UD64 rip=0x207" (RFLAGS popped as RIP) and killed mid-compile
+   during the -j4 GCC bootstrap.  Walking RSP across a whole page in 16-byte
+   steps guarantees the straddling alignments are hit, so this fails for the
+   original cause rather than waiting for a lucky stack layout. */
+static int fork_straddle_one(int depth)
+{
+   volatile char pad[16];
+   int status=-1;
+   int pid;
+
+   pad[0]=(char)depth;
+   if (depth > 0)
+      return fork_straddle_one(depth-1);
+
+   pid=fork();
+   if (pid<0)
+      return -1;
+   if (pid==0)
+      _exit(77);
+   if (waitpid(pid,&status,0)!=pid || status!=77)
+      return -2;
+   return (int)pad[0];
+}
+
+static int fork_straddle_page(void)
+{
+   int depth;
+   int rc;
+
+   for (depth=0; depth<272; depth++) {
+      rc=fork_straddle_one(depth);
+      if (rc==-1) {
+         printf("FORK_FAIL straddle-fork depth=%d\n",depth);
+         return -1;
+      }
+      if (rc==-2) {
+         printf("FORK_FAIL straddle-wait depth=%d\n",depth);
+         return -1;
+      }
+   }
+   printf("FORK_STRADDLE_PASS depths=%d\n",depth);
+   return 0;
+}
+
 static int run_oom_test(void)
 {
    int status=-1;
@@ -109,6 +160,8 @@ int main(int argc,char **argv)
       return fail("single-owner");
    printf("FORK_COW_PASS shared-write=13 single-owner=%d\n",fork_data);
    printf("FORK_STRESS_PASS count=%d\n",FORK_STRESS_CHILDREN);
+   if (fork_straddle_page()<0)
+      return 1;
    printf("FORK_PASS\n");
    return 0;
 }

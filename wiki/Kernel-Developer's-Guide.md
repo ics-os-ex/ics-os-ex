@@ -142,7 +142,56 @@ not `taskswitch()` a user process (IRQ-frame software switch GPFs in
 `reschedwrapper`); idle/kernel threads may still switch so work-steal stays
 valid. COM1 output is protected by an IRQ-safe SMP lock;
 machine-consumed tests must emit one atomic `SMP_RESULT` record with
-`serial_puts()` instead of parsing concurrent `printf()` prose. Sparse APIC IDs,
+`serial_puts()` instead of parsing concurrent `printf()` prose. User SDK
+`printf`/`vprintf` must stay bounded (`sdk/tccsdk.c`): a 1024-byte stack
+`vsprintf` smashes RIP and shows as `GPF64 err=0` (noncanonical `ret`, not
+a segment-index fault). COM1 output from kernel C uses register-only UART
+TX (`uart_com1_putc`) in registers only. IRQ/syscall C runs on a per-process
+kheap stack (`irq_kstack_enter`); RSP is switched with RDTSCP before that C
+runs. That switch is stateless: `IRQ_KSTACK_ENTER` stays when the interrupted
+RSP is already on `[kstack_base, kstack_top)` or on `MEM_CPUIRQ`; it switches
+to the process kstack only from the user stack
+(`MEM_USER_STACK_GUARD`..`MEM_USER_STACK`). A claimed user whose RSP is some
+other kernel stack (publish-before-switch, leftover `current`) stays on
+that stack — resetting `kstack_top` from there smashes the saved syscall
+`iretq` frame (`PF64 rip=0x100000001000` on `gcc.exe`). Each wrapper reads
+its own `PUSH_ALL` frame from `%r13`, and `IRQ_KSTACK_LEAVE` restores `%r13`.
+A nesting counter or a PCB-held restore pointer makes a nested `#PF`/`#GP`
+`iretq` from the wrong frame (`GPF64 rip=0x8 cs=0x206`). `PCB.on_cpu` is the
+single-owner claim for a PCB and every claim must be a CAS
+(`scheduler`/`ps_switchto`/`self_exit_current` do not share a lock); never
+publish `current_process` for an unclaimed task, or two CPUs end up sharing one
+IRQ kstack. `irq_kstack_enter` prints `KSTACK-FOREIGN` when that happens, and
+`make test-stress-user-smp` is the gate. The last-resort successor in
+`self_exit_current` must be this CPU's own idle task: `&sPCB` is a single global
+PCB with one stack, so two CPUs falling back to it resume one context on one
+stack. Any shared-stack bug shows up as a 64-bit stack slot whose high half
+holds another CPU's 32-bit `smp_cpu_id()` result — a return address read back as
+`0x1_xxxxxxxx`, usually faulting in the serial path with `rdi = &uart1`.
+
+A task spinning in `sync_entercrit` must never outrank the lock's owner. User
+processes get `priority = 1` and kernel threads keep `0`, so comparing raw
+priority let a spinning user process win every `scheduler()` pass while the
+BSP-pinned holder starved — the `make -j4` self-host deadlock.
+`sched_eff_prio` ranks a `crit_wait` task at the floor, and the cooperative
+early return in `schedule_from_timer` skips it too. That makes `crit_wait`
+exactness load-bearing: `sync_entercrit` does the CAS, clears `crit_wait`, sets
+`var->wait` and calls `sync_track_hold` in one interrupts-off region, because a
+holder still flagged as a waiter is demoted while owning a hot lock. To debug a
+lock hang, read the `CRITHANG hop=N ... wants=...` wait-for chain and the
+`CRITCYCLE` line, which distinguishes a lock-order inversion from starvation;
+resolve crit addresses with `nm -n kernel/Kernel64.sym`. `make
+test-fatwrite-coop` reproduces the closure's scheduling regime without kexec.
+
+Experience from the user-on-AP / GCC self-host campaign — why the
+faulting RIP is almost never the bug, which failures are ordinary SMP,
+and which are architecture (same-privilege IRQs, per-process kstacks,
+`current`-sampled crit tokens) — is in
+`ics-os/docs/smp-debugging-hardness.md`. Prefer a new gate that fails
+the original cause over another cert loop.
+
+Do not load the kernel PML4 while RSP
+still points at a user-private page. `getphys64` must walk the full CR2 through `KDIRECT`. Sparse APIC IDs,
 MADT/x2APIC discovery, NUMA, and CPU hotplug are not implemented and must not be
 claimed.
 

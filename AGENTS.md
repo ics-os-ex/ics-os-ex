@@ -71,7 +71,10 @@ Useful individual targets (from `ics-os/`):
 | `test-ext4` | ext4 virtio-blk read/create/write; guest marker plus host `e2fsck`/`debugfs` validation of the post-test image |
 | `test-spawn` | `posix_spawn` + `waitpid` of `hello.exe` (`SPAWN_PASS`); FAT `/work` on virtio (`WORK_DISK_PASS`) |
 | `test-stress` | SMP=4 spawn/exit/reap + short fork+ELF overlap (`STRESSPROC_PASS`); no GPF/PF |
+| `test-stress-user-smp` | Same churn with `user-smp` so children run on APs; regression gate for the one-PCB-one-CPU claim invariant (two CPUs sharing an IRQ kstack) and for lost `waitpid` statuses |
+| `test-apuser` | `user-smp` cmdline; 3 SSE/red-zone workers on APs (`APUSER_PASS` + `USER_RUN cpu=[1-7]`); bad-pointer child is killed without halting (`APUSER_PF_RECOVER_OK`) |
 | `test-fatwrite` | SMP=4 concurrent FAT16 `/work` writers+readers (`FATWR_PASS`); no truncated patterns |
+| `test-fatwrite-coop` | Same writers under `coop-smp` (user processes on APs, no timer preemption of a running user tool — the self-host closure's scheduling regime); asserts no `CRITHANG`/`WATCHDOG`, so it fails on a lock hang rather than on a missing success marker |
 | `test-fork` | COW fork ABI/isolation, fast path, text protection, OOM, inherited fd, exit/wait, and delayed reaping |
 | `test-fork-matrix` | COW fork pressure gate on `-smp 1/2/4/8` |
 | `test-make` | In-OS TinyCC builds GNU make 3.82 onto `/work`; `make -f t.mk` spawns `hello.exe` (`MAKE_PASS`) |
@@ -80,6 +83,7 @@ Useful individual targets (from `ics-os/`):
 | `test-dup` | Runtime `dup(2)` (`0xC5`) self-test: dup'd tty fd allocable+closable; dup'd file fd write read back through the original (`DUPT_PASS`) |
 | `test-partition-unit` | Host-native TAP unit tests for partition-layer logic: IEEE CRC-32 vectors/chunking and ATA LBA28/LBA48 capacity decode (`tests/partition_unit.c`) |
 | `test-vfsgrow-unit` | Host-native TAP for VFS `vfs_units_covering` (exact cluster-size grow; `tests/vfs_grow_unit.c`) |
+| `test-smpclaim-unit` | Host-native TAP for the one-PCB-one-CPU claim/publish protocol, crit nest tokens, and `irq_kstack_dest` (process kstack top only from the user stack; `tests/smp_claim_unit.c`) |
 | `test-integration` | `test-boot` + `test-smp` + `test-exec` |
 
 Do **not** use QEMU `-kernel` for the ELF64 image; boot via GRUB `multiboot2` (ISO/USB helpers in the Makefile).
@@ -131,10 +135,10 @@ the GCC self-host and Multiboot2/QEMU acceptance gates.
 
 - **SysV AMD64 ABI** in kernel C and IRQ wrappers (`irqwrap.S`). After `PUSH_ALL`, saved `rax` is at offset **112**, not `0` (that slot is `r15`).
 - **DEX `int 0x30` ABI** still uses `rax/rbx/rcx/rdx/rsi/rdi` for syscall args; the wrapper maps them to SysV for `api_syscall`. Args are **pointer-width** (`api_arg_t`).
-- **Identity map** covers low 4GiB; do not rebuild classic 2-level user PTs for that range on x86_64. PCI MMIO pages need PCD|PWT (`mmio_mark_uncacheable`); `dex32_restore_identity_map` reapplies those bits.
+- **Identity map** covers low 4GiB; do not rebuild classic 2-level user PTs for that range on x86_64. PCI MMIO pages need PCD|PWT (`mmio_mark_uncacheable`); `dex32_restore_identity_map` reapplies those bits. User private PML4s keep only 0–4MiB and 32–128MiB in PD0; do not load the kernel CR3 while RSP still points at a user stack (those pages are not in `pagedir1`). IRQ/syscall wrappers copy the frame onto a per-process kheap stack (`irq_kstack_enter`) before C; `fork` must use `irq_user_rsp`, not the kstack copy. `getphys64` walks the full CR2 through `KDIRECT`.
 - **Memory map** is `kernel/memory/memlayout.h`. Kernel image must stay below 4MiB (user ELF). Frame stack follows `bssEnd`. Do not invent a new fixed PA; add a reserved range so `mempop` skips it.
-- **SMP**: APs load the kernel GDT (`ap_load_kernel_gdt`), use LAPIC timer vector **0x41**, claim tasks with `on_cpu`, and honor `cpu_affinity`. Console / `fg_mgr` / user processes are BSP-pinned today.
-- **Serial** is the headless oracle. Prefer `serial_puts` / putc mirroring for QEMU `-nographic` tests.
+- **SMP**: APs load the kernel GDT (`ap_load_kernel_gdt`), use LAPIC timer vector **0x41**, claim tasks with `on_cpu`, and honor `cpu_affinity`. Console / `fg_mgr` / user processes are BSP-pinned today. Why SMP bugs take days, and which of them are design rather than "SMP is hard", is in `ics-os/docs/smp-debugging-hardness.md`.
+- **Serial** is the headless oracle. Prefer `serial_puts` / putc mirroring for QEMU `-nographic` tests. COM1 TX is `uart_com1_putc` (port I/O in registers only); a C `uart_dev*` reload from the user stack #PF'd in `uart_putc_raw` during `make -j4`.
 - **GCC is the supported kernel compiler.** `make test-kbuild` proves that host-seeded GCC/binutils executables running in ICS-OS can build and kexec the kernel. Do not call ICS-OS fully self-host capable until an in-OS-rebuilt GCC compiles the kernel and the generated kernel passes the post-kexec capability suite. x86_64 TinyCC remains optional.
 
 ## Coding conventions

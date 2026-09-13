@@ -178,6 +178,12 @@ void time_incrementtime()
      extern volatile int selfhost_cooperative_ready;
       extern volatile unsigned long diag_sc_count;
       extern int smp_cpu_id(void);
+      extern int smp_idle_guard_check(int id);
+
+      /* Idle tasks run all IRQ/scheduler C on their own small stack; check the
+         guard words below it so an overflow is named here instead of silently
+         scribbling on the neighbouring CPU's idle stack (see smp.c). */
+      smp_idle_guard_check(smp_cpu_id());
       extern volatile int kheap_diag_op[8];
         extern volatile int kheap_diag_state[8];
         extern volatile int kheap_diag_pid[8];
@@ -235,13 +241,20 @@ void time_incrementtime()
       if (wd_ticks[me] < 2000 || (wd_ticks[me] % 2000) != 0)
          return;
       if (current_process) {
-         char wline[192];
+         extern volatile unsigned long sync_wait_var[8];
+         extern volatile int sync_wait_owner[8];
+         extern volatile unsigned long sync_wait_spins[8];
+         char wline[256];
          sprintf(wline,
-                 "WATCHDOG cpu=%d pid=%d '%s' no-yield=%lu sc=%lu last=%02x/%02x\n",
+                 "WATCHDOG cpu=%d pid=%d '%s' no-yield=%lu sc=%lu last=%02x/%02x rip=0x%lx "
+                 "crit=0x%lx critowner=%d critspins=%lu held=%d critwait=%d\n",
                  me, current_process->processid, current_process->name,
                  wd_ticks[me], diag_sc_count,
                  (unsigned)current_process->cursyscall[0],
-                 (unsigned)current_process->cursyscall[1]);
+                 (unsigned)current_process->cursyscall[1],
+                 wd_frame_cpu[me][15],
+                 sync_wait_var[me], sync_wait_owner[me], sync_wait_spins[me],
+                 current_process->held_crit_n, current_process->crit_wait);
          serial_puts(wline);
       }
       return;

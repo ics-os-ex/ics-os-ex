@@ -72,6 +72,7 @@ static const mem_range mem_reserved[] = {
    { MEM_KERNEL_LOAD,      MEM_KERNEL_LIMIT,    "kernel" },
    { MEM_USER_ELF_BASE,    MEM_USER_ELF_END,    "user-elf" },
    { MEM_KEXEC_STAGE,      MEM_KEXEC_STAGE_END, "kexec-stage" },
+   { MEM_CPUIRQ_BASE,      MEM_CPUIRQ_END,      "cpu-irq-stack" },
    { MEM_KHEAP_BASE,       MEM_KHEAP_END,       "kheap" },
      { MEM_USER_WIN_BASE,    MEM_USER_WIN_END,    "user-windows" },
     /* The private-PD0 user stack VA [MEM_USER_STACK_GUARD, MEM_USER_STACK)
@@ -208,6 +209,14 @@ int frame_retain(u64 phys)
 
    if (!frame_ready || phys == 0 || (phys & 0xFFFULL))
       return 0;
+   /* Reserved frames (kernel image, kheap, identity windows) are permanently
+      mapped and never enter the pool, so they carry no reference count.
+      frame_release() already ignores them; retaining one must likewise succeed
+      as a no-op.  Failing here aborted userpd_clone_cow() -- an intermittent
+      fork() == -1 with "RETAIN-FREE phys=0x100000" -- whenever a user PD held
+      a 4KiB leaf for low identity memory instead of the usual 2MiB page. */
+   if (mem_is_reserved((unsigned long)phys))
+      return 1;
    idx = phys >> 12;
    if (idx >= sizeof(frame_refs))
       return 0;
@@ -718,47 +727,47 @@ void dex32_restoreints(DWORD flags){
 };
 
 
-DWORD getphys(DWORD vaddr,DWORD *pagedir){
+DWORD getphys64(unsigned long long va, DWORD *pagedir){
 #ifdef __x86_64__
-   /* Walk the real 4-level (or 2MiB-PS) tables. The old stub always
-      returned identity|present, so a genuine not-present user PF was
-      treated as a protection fault; the dump path then faulted under
-      the user CR3 and double-faulted. */
-   unsigned long long va = (unsigned long long)(unsigned)vaddr;
+   /* Walk the real 4-level (or 2MiB-PS) tables through KDIRECT so the
+      walk works when the faulting CR3 is a user private PML4 (identity
+      holes in PD0).  Do not truncate VA to 32 bits: CR2 0xb000000000
+      became getphys(0) and looked present. */
    u64 *pml4, *pdpt, *pd, *pte;
    u64 pe, de, be, e;
    int pmi, pi, bi, gi;
 
    if (!pagedir)
       return 0;
-   pml4 = (u64 *)pagedir;
+   pml4 = (u64 *)KDIRECT((u64)(uintptr)pagedir);
    pmi = (int)((va >> 39) & 0x1FF);
    pe = pml4[pmi];
    if (!(pe & 1))
       return 0;
    if (pe & 0x80)
       return (DWORD)((pe & 0x000FFFFFFFFF000ULL) | (va & 0x7FFFFFFFFFULL) | (pe & 0xFFFULL));
-   pdpt = (u64 *)(pe & 0x000FFFFFFFFF000ULL);
+   pdpt = (u64 *)KDIRECT(pe & 0x000FFFFFFFFF000ULL);
    pi = (int)((va >> 30) & 0x1FF);
    de = pdpt[pi];
    if (!(de & 1))
       return 0;
    if (de & 0x80)
       return (DWORD)((de & 0x000FFFFFFFFF000ULL) | (va & 0x3FFFFFFFULL) | (de & 0xFFFULL));
-   pd = (u64 *)(de & 0x000FFFFFFFFF000ULL);
+   pd = (u64 *)KDIRECT(de & 0x000FFFFFFFFF000ULL);
    bi = (int)((va >> 21) & 0x1FF);
    be = pd[bi];
    if (!(be & 1))
       return 0;
    if (be & 0x80)
       return (DWORD)((be & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFFULL) | (be & 0xFFFULL));
-   pte = (u64 *)(be & 0x000FFFFFFFFF000ULL);
+   pte = (u64 *)KDIRECT(be & 0x000FFFFFFFFF000ULL);
    gi = (int)((va >> 12) & 0x1FF);
    e = pte[gi];
    if (!(e & 1))
       return 0;
    return (DWORD)((e & 0x000FFFFFFFFF000ULL) | (e & 0xFFFULL));
 #else
+   DWORD vaddr=(DWORD)va;
    DWORD dirindex=(vaddr&0xFFC00000) >> 22;
    DWORD pageindex=(vaddr&0x3FF000) >> 12;
    DWORD *pagetbl;
@@ -773,6 +782,10 @@ DWORD getphys(DWORD vaddr,DWORD *pagedir){
    ret=pg[pageindex];
    return ret;
 #endif
+};
+
+DWORD getphys(DWORD vaddr,DWORD *pagedir){
+   return getphys64((unsigned long long)(unsigned)vaddr, pagedir);
 };
 
 DWORD getpagetablephys(DWORD vaddr,DWORD *pagedir){
@@ -2298,6 +2311,18 @@ u64 *userpd_clone_cow(u64 *parent, unsigned long long private_vaddr)
    u64 *child_pml4, *child_pdpt, *child_pd;
    DWORD flags;
    int bi, gi;
+   /* The child resumes through fork_child_return, which does POP_ALL then
+      iretq over the frame at private_vaddr: 15 saved registers (120 bytes)
+      followed by the same-privilege hardware frame (RIP/CS/RFLAGS, 24 bytes).
+      User ELFs still enter with kernel CS, so iretq does not pop SS:RSP.
+      The whole 144 bytes must be private to the child, not just the page
+      holding the rax slot the caller zeroes -- when the frame straddles a
+      page boundary the tail page stayed COW-shared and the child could iretq
+      over values the parent had already reused, which lands in the low page
+      as UD64 rip=<RFLAGS>.  Copy one extra qword so a 5-word frame is covered
+      too if ring-3 iretq is enabled later. */
+   const unsigned long long frame_first = private_vaddr & ~0xFFFULL;
+   const unsigned long long frame_last  = (private_vaddr + 0xA0ULL) & ~0xFFFULL;
 
    if (!userpd_is_private(parent))
       return 0;
@@ -2341,7 +2366,8 @@ u64 *userpd_clone_cow(u64 *parent, unsigned long long private_vaddr)
             continue;
          va = ((unsigned long long)bi << 21)
             | ((unsigned long long)gi << 12);
-          if ((va & ~0xFFFULL) == (private_vaddr & ~0xFFFULL)
+          if ((va & ~0xFFFULL) == frame_first
+             || (va & ~0xFFFULL) == frame_last
              || (va >= MEM_USER_STACK - 0x100000ULL
                 && va < MEM_USER_STACK)
              || (va >= MEM_SYSCALL_STACK
@@ -2353,8 +2379,13 @@ u64 *userpd_clone_cow(u64 *parent, unsigned long long private_vaddr)
             child_pte[gi] = private_phys | (entry & ~phys_mask);
             continue;
          }
-         if (!frame_retain(entry & phys_mask))
+         if (!frame_retain(entry & phys_mask)) {
+            printf("COW_RETAIN_FAIL va=0x%llx phys=0x%llx pte=0x%llx\n",
+                   (unsigned long long)va,
+                   (unsigned long long)(entry & phys_mask),
+                   (unsigned long long)entry);
             goto fail;
+         }
          child_pte[gi] = entry;
       }
    }
@@ -2374,7 +2405,8 @@ u64 *userpd_clone_cow(u64 *parent, unsigned long long private_vaddr)
          u64 entry = child_pte[gi];
           unsigned long long va = ((unsigned long long)bi << 21)
                            | ((unsigned long long)gi << 12);
-          if ((va & ~0xFFFULL) == (private_vaddr & ~0xFFFULL)
+          if ((va & ~0xFFFULL) == frame_first
+             || (va & ~0xFFFULL) == frame_last
              || (va >= MEM_USER_STACK - 0x100000ULL
                 && va < MEM_USER_STACK)
              || (va >= MEM_SYSCALL_STACK

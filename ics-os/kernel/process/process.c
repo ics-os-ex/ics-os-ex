@@ -26,6 +26,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "completion.h"
+#include "irq_kstack.h"
 #include "../vfs/posixfd.h"
 
 extern unsigned int ticks;
@@ -36,6 +37,99 @@ extern unsigned long freed_pml4_count(void);
 extern int freed_pml4_contains(u64 pml4);
 
 static void waitpid_notify_parent(PCB386 *parent);
+
+/* Retained-child-status queue lock.
+ *
+ * The exit paths append to parent->waitq_* from whatever CPU the child died
+ * on, while the parent compacts the same array in sys_waitpid.  Doing that
+ * without exclusion lost statuses under `-smp 4` with user_procs_smp: the
+ * parent's compaction loop overwrote the slot a remote exit had just
+ * appended, and the parent then reported ECHILD for a child it had already
+ * reaped (gccdriver "waitpid /work/apps/as.exe failed" in the parallel
+ * self-host cert).
+ *
+ * This is deliberately NOT processmgr_busy.  That crit is held across
+ * closeallfiles(), freeprocessmemory(), and smp_tlb_shootdown(), which waits
+ * for a shootdown IPI ack from every other CPU; spinning on it with
+ * interrupts masked deadlocks, and spinning on it with taskswitch() puts a
+ * scheduler switch inside the waitpid poll loop.  waitq_lock is only ever
+ * held for a bounded array update with no calls out. */
+static spinlock_t waitq_lock;   /* BSS: zero == unlocked */
+
+/* Append an exited child's status to its parent's queue and drop the parent's
+   live-child count.  Returns 0 when the queue is full (status dropped). */
+int waitq_publish(PCB386 *parent, int child_pid, int child_status)
+{
+   spin_irq_flags_t f;
+   int ok = 0;
+
+   if (!parent)
+      return 0;
+   f = spin_lock_irqsave(&waitq_lock);
+   if (parent->nlive > 0)
+      parent->nlive--;
+   if (parent->waitq_n < WAITQ_MAX) {
+      parent->waitq_pid[parent->waitq_n] = child_pid;
+      parent->waitq_st[parent->waitq_n] = child_status;
+      parent->waitq_n++;
+      ok = 1;
+   }
+   spin_unlock_irqrestore(&waitq_lock, f);
+   if (!ok) {
+      char b[96];
+      sprintf(b, "WAITQ FULL parent=%d child=%d n=%d\n",
+              (int)parent->processid, child_pid, WAITQ_MAX);
+      serial_puts(b);
+   }
+   return ok;
+}
+
+/* Remove one matching retained status (pid == -1 matches any).  Returns 1 when
+   one was reaped. */
+int waitq_reap(PCB386 *me, int pid, int *out_pid, int *out_st)
+{
+   spin_irq_flags_t f;
+   int i, got = 0;
+
+   if (!me)
+      return 0;
+   f = spin_lock_irqsave(&waitq_lock);
+   for (i = 0; i < me->waitq_n; i++) {
+      if (pid == -1 || me->waitq_pid[i] == pid) {
+         *out_pid = me->waitq_pid[i];
+         *out_st = me->waitq_st[i];
+         me->waitq_n--;
+         for (; i < me->waitq_n; i++) {
+            me->waitq_pid[i] = me->waitq_pid[i + 1];
+            me->waitq_st[i] = me->waitq_st[i + 1];
+         }
+         got = 1;
+         break;
+      }
+   }
+   spin_unlock_irqrestore(&waitq_lock, f);
+   return got;
+}
+
+/* Read-only "does this parent already hold a status for pid" probe used by the
+   legacy dex32_waitpid path. */
+int waitq_has(PCB386 *me, int pid)
+{
+   spin_irq_flags_t f;
+   int i, got = 0;
+
+   if (!me)
+      return 0;
+   f = spin_lock_irqsave(&waitq_lock);
+   for (i = 0; i < me->waitq_n; i++) {
+      if (me->waitq_pid[i] == pid) {
+         got = 1;
+         break;
+      }
+   }
+   spin_unlock_irqrestore(&waitq_lock, f);
+   return got;
+}
 
 #define EVENT_WAIT_BUCKETS 32
 static wait_queue_t event_wait_queues[EVENT_WAIT_BUCKETS];
@@ -520,16 +614,160 @@ static int fork_has_other_threads(PCB386 *parent)
    return found;
 }
 
+#define IRQ_KSTACK_SIZE  0x20000
+
+int pcb_alloc_irq_kstack(PCB386 *p)
+{
+   void *s;
+   if (!p)
+      return 0;
+   s=malloc(IRQ_KSTACK_SIZE);
+   if (!s)
+      return 0;
+   p->kstack_base=s;
+   p->kstack_top=((u64)(uintptr)s+IRQ_KSTACK_SIZE)&~15ULL;
+   p->irq_user_rsp=0;
+   p->irq_kframe=0;
+   return 1;
+}
+
+void pcb_free_irq_kstack(PCB386 *p)
+{
+   if (!p || !p->kstack_base)
+      return;
+   free(p->kstack_base);
+   p->kstack_base=0;
+   p->kstack_top=0;
+   p->irq_user_rsp=0;
+   p->irq_kframe=0;
+}
+
+/* Called by IRQ_KSTACK_ENTER once RSP is already on the kstack; rdi is this
+   entry's PUSH_ALL pointer (kept in %r13 for the whole handler).  The wrapper
+   needs no return value: the switch and the restore are both done in asm.
+   All this records is the outermost (user-stack) frame, which fork needs in
+   order to build the child's iretq frame. */
+void irq_kstack_enter(u64 current_rsp)
+{
+   extern volatile int ctx_load_in_progress[MAX_CPUS];
+   PCB386 *p=current_process;
+   int me;
+
+   /* Kernel SSE stores must not take #NM here; lazy FPU is not used. */
+   __asm__ volatile ("clts");
+
+   /* Tripwire for the shared-stack corruption class: every legitimate RSP in
+      this system lives in the identity-mapped low 4GiB, so a non-zero high half
+      means the slot we just came through was overwritten with something else --
+      typically another CPU's 32-bit value landing in a 64-bit slot's upper
+      dword.  Catching it here names the entry instead of letting it surface
+      later as an unrelated #PF on a wild address. */
+   if ((current_rsp>>32)!=0) {
+      static volatile unsigned long wildrsp_cnt=0;
+      if (++wildrsp_cnt<=8) {
+         char b[192];
+         sprintf(b,"KSTACK-WILDRSP cpu=%d pid=%d rsp=0x%lx top=0x%lx acc=%d\n",
+                 smp_cpu_id(),p?(int)p->processid:-1,
+                 (unsigned long)current_rsp,
+                 (unsigned long)(p?p->kstack_top:0),
+                 p?p->accesslevel:-1);
+         serial_puts(b);
+      }
+   }
+
+   if (!p || p->accesslevel!=ACCESS_USER || !p->kstack_top)
+      return;
+
+   /* A PCB is claimed by exactly one CPU (on_cpu).  If this CPU is about to
+      run kernel C on a kstack whose task is claimed elsewhere, two CPUs share
+      one stack and each will overwrite the other's frames.  That corruption is
+      otherwise indistinguishable from heap damage, so name it explicitly. */
+   me=smp_cpu_id();
+   if (p->on_cpu>=0 && p->on_cpu!=me) {
+      static volatile unsigned long foreign_cnt=0;
+      if (++foreign_cnt<=8) {
+         char b[144];
+         sprintf(b,"KSTACK-FOREIGN cpu=%d owner=%d pid=%d rsp=0x%lx top=0x%lx\n",
+                 me,p->on_cpu,(int)p->processid,
+                 (unsigned long)current_rsp,(unsigned long)p->kstack_top);
+         serial_puts(b);
+      }
+      /* Do not record irq_user_rsp or reuse this PCB's kstack: the owner is
+         still running it.  The wrapper has moved us onto this CPU's
+         irq_safe_stack.  Leave current pointing at p: this CPU may still be
+         executing it until the next real context_switch, and retargeting
+         current to idle here would save that execution into the idle ctx. */
+      return;
+   }
+
+   /* A nested entry was already running on the kstack; it must not overwrite
+      the user frame recorded by the entry that came off the user stack. */
+   if (current_rsp>=(u64)(uintptr)p->kstack_base && current_rsp<p->kstack_top)
+      return;
+
+   /* From here we are switching RSP to kstack_top for a FRESH entry, so we are
+      about to reuse the top of the stack.  KSTACK-FOREIGN above only catches a
+      stale on_cpu; it misses the case that actually corrupts frames, where
+      on_cpu is -1 or already reassigned but another CPU still has this PCB as
+      its `current` and is therefore still executing on this same stack.  Two
+      CPUs starting fresh frames at the same kstack_top overwrite each other,
+      which surfaces as a 64-bit stack slot whose high half holds the other
+      CPU's 32-bit smp_cpu_id() result.  Record who owns the stack and who is
+      running the task, so the offending transition is identifiable. */
+   {
+      int j;
+      for (j=0;j<cpu_count && j<MAX_CPUS;j++) {
+         if (j==me || !cpus[j].online)
+            continue;
+         if ((PCB386 *)cpus[j].current!=p)
+            continue;
+         {
+            static volatile unsigned long shared_cnt=0;
+            if (++shared_cnt<=8) {
+               char b[224];
+               sprintf(b,"KSTACK-SHARED cpu=%d other=%d pid=%d on_cpu=%d "
+                         "status=0x%x aff=%d rsp=0x%lx top=0x%lx "
+                         "ctxload=%d/%d\n",
+                       me,j,(int)p->processid,p->on_cpu,
+                       (unsigned)p->status,p->cpu_affinity,
+                       (unsigned long)current_rsp,(unsigned long)p->kstack_top,
+                       ctx_load_in_progress[me],ctx_load_in_progress[j]);
+               serial_puts(b);
+            }
+         }
+      }
+   }
+
+   p->irq_user_rsp=current_rsp;
+   p->irq_kframe=current_rsp;
+}
+
+/* irqwrap.S IRQ_KSTACK_ENTER walks these offsets without a C helper. */
+static char irqwrap_offchk_cpu[(sizeof(cpu_local)==48 &&
+   __builtin_offsetof(cpu_local,current)==16 &&
+   __builtin_offsetof(cpu_local,kernel_stack)==32)?1:-1];
+static char irqwrap_offchk_pcb[(
+   __builtin_offsetof(PCB386,accesslevel)==0x4b8 &&
+   __builtin_offsetof(PCB386,on_cpu)==0xc84 &&
+   __builtin_offsetof(PCB386,kstack_base)==0xc88 &&
+   __builtin_offsetof(PCB386,kstack_top)==0xc90)?1:-1];
+static char irqwrap_userstack_chk[(
+   MEM_USER_STACK_GUARD==0x3FD00000UL &&
+   MEM_USER_STACK==0x40000000UL)?1:-1];
+volatile char *irqwrap_offchk_use=&irqwrap_offchk_cpu[0];
+volatile char *irqwrap_offchk_use2=&irqwrap_offchk_pcb[0];
+volatile char *irqwrap_offchk_use3=&irqwrap_userstack_chk[0];
+
 long user_fork_frame(u64 *frame)
 {
    PCB386 *parent=current_process;
    PCB386 *child=0;
    u64 *child_pml4=0;
    u64 *child_rax;
+   u64 user_frame;
    DWORD flags,entry_flags;
 
    storeflags(&entry_flags);
-   startints();
 
    if (!parent || parent->accesslevel!=ACCESS_USER
        || (parent->status&PS_ATTB_THREAD)
@@ -541,22 +779,48 @@ long user_fork_frame(u64 *frame)
       return -11;
    }
 
+   /* Prefer the wrapper's PUSH_ALL pointer (this syscall). irq_user_rsp is
+      only a fallback: it can still name a prior timer frame, and a child
+      that iretq's that frame is 16 bytes off -- RIP reads as RFLAGS
+      (UD64 rip=0x207). Keep interrupts off until the child's copy of this
+      frame exists so a nested timer cannot clobber it mid-clone. */
+   user_frame=(u64)(uintptr)frame;
+   if (user_frame < (u64)MEM_USER_STACK - 0x100000ULL
+       || user_frame + 0x90ULL > (u64)MEM_USER_STACK) {
+      u64 alt=parent->irq_user_rsp;
+      if (alt >= (u64)MEM_USER_STACK - 0x100000ULL
+          && alt + 0x90ULL <= (u64)MEM_USER_STACK)
+         user_frame=alt;
+      else {
+         restoreflags(entry_flags);
+         return -13;
+      }
+   }
+   parent->irq_user_rsp=user_frame;
+
    child_pml4=userpd_clone_cow((u64 *)(uintptr)parent->pagedirloc,
-                               (unsigned long long)(uintptr)frame);
+                               (unsigned long long)user_frame);
    if (!child_pml4) {
       restoreflags(entry_flags);
       return -12;
    }
    child_rax=(u64 *)userpd_resolve(child_pml4,
-                                   (unsigned long long)(uintptr)frame+112);
+                                   (unsigned long long)user_frame+112);
    if (!child_rax)
       goto nomem;
    *child_rax=0;
+
+   startints();
 
    child=(PCB386 *)malloc(sizeof(PCB386));
    if (!child)
       goto nomem;
    memset(child,0,sizeof(PCB386));
+   if (!pcb_alloc_irq_kstack(child)) {
+      free(child);
+      child=0;
+      goto nomem;
+   }
    spin_init(&child->fd_lock);
 
    child->regs=parent->regs;
@@ -593,7 +857,7 @@ long user_fork_frame(u64 *frame)
     child->on_cpu=-1;
 
     child->ctx.rip=(u64)(uintptr)fork_child_return;
-   child->ctx.rsp=(u64)(uintptr)frame;
+   child->ctx.rsp=user_frame;
    child->ctx.rflags=0x202;
    child->ctx.cs=SYS_CODE_SEL;
    child->ctx.ss=SYS_DATA_SEL;
@@ -628,6 +892,7 @@ fail:
    freeprocessmemory_metadata(child->meminfo);
    if (child->parameters)
       free(child->parameters);
+   pcb_free_irq_kstack(child);
    free(child);
 nomem:
    userpd_free(child_pml4);
@@ -739,6 +1004,12 @@ DWORD createprocess(
 
    PCB386 *temp=(PCB386*)malloc(sizeof(PCB386));      //allocate the PCB for the process
    memset(temp,0,sizeof(PCB386));                     //Initialize by zeroing it out
+#ifdef __x86_64__
+   if (!pcb_alloc_irq_kstack(temp)) {
+      free(temp);
+      return 0;
+   }
+#endif
    spin_init(&temp->fd_lock);
    fpu_init_default(&temp->fpu);
    temp->before=current_process;                      //add it after the current process 
@@ -1252,13 +1523,10 @@ DWORD kill_process(DWORD processid){
          parent = ps_findprocess(ptr->owner);
            if (parent != (PCB386 *)-1) {
               parent->childwait = 0;
-              if (parent->nlive > 0)
-                 parent->nlive--;
-              if (parent->waitq_n < WAITQ_MAX) {
-                 parent->waitq_pid[parent->waitq_n] = (int)ptr->processid;
-                 parent->waitq_st[parent->waitq_n] = ptr->exit_status;
-                 parent->waitq_n++;
-              }
+              /* Publish the status BEFORE ps_dequeue() below: sys_waitpid
+                 treats "PCB no longer findable" as proof that a status has
+                 already been queued. */
+              waitq_publish(parent, (int)ptr->processid, ptr->exit_status);
               if (parent != ptr)
                  waitpid_notify_parent(parent);
            }
@@ -1277,6 +1545,9 @@ DWORD kill_process(DWORD processid){
 
           if (ptr->accesslevel == ACCESS_SYS)                   //deallocate the stack pointer
              free(ptr->stackptr);
+#ifdef __x86_64__
+          pcb_free_irq_kstack(ptr);
+#endif
             
          /* 
           * Perform memory garbage collection if necessary
@@ -1585,18 +1856,13 @@ int dex32_waitpid(int pid,int status){
     (void)status;
     while (1) {
        PCB386 *self = current_process;
-       int i;
        /* If the child is already in our waitq it has exited.  Its PCB is
           only reclaimed on a later timer pass (deferred zombie free), so
           ps_findprocess() would still return the live (zombie) PCB and we
           would keep re-switching into a dead process forever.  Return now
           instead of re-entering the zombie. */
-       if (self != (PCB386*)-1) {
-          for (i = 0; i < self->waitq_n; i++) {
-             if (self->waitq_pid[i] == pid)
-                return 0;
-          }
-       }
+       if (self != (PCB386*)-1 && waitq_has(self, pid))
+          return 0;
        PCB386 *p = ps_findprocess(pid);
        if (p == (PCB386*)-1)
           return 0;
@@ -1815,10 +2081,15 @@ void ps_set_affinity(int pid, int cpu){
    `ret`) would otherwise re-enter ps_switchto via schedule_from_timer
    and clobber the in-flight task's saved ctx (live RIP/RSP overwrites
    the seeded entry point).  The guard is per-CPU so SMP is safe. */
-static volatile int ps_switchto_in_progress[MAX_CPUS];
+volatile int ps_switchto_in_progress[MAX_CPUS];
 static volatile int voluntary_switch[MAX_CPUS];
  volatile int ctx_load_in_progress[MAX_CPUS];
  volatile int selfhost_cooperative_ready;
+/* Test hook: apply the self-host cooperative user scheduling regime without
+   booting an actual stage-1 closure kernel, so QA can reproduce that regime
+   (see the "coop-smp" cmdline in kernel32.c).  It deliberately does NOT feed
+   selfhost_stage1_cmdline(), which also governs AP parking around kexec. */
+ volatile int sched_coop_user_force;
 
 
 /* Safe page-presence walk for bounded context diagnostics.  This runs under
@@ -1985,9 +2256,84 @@ void ctx_load_check(cpu_context *ctx)
     }
 }
 
+static int ps_pcb_advertised_elsewhere(PCB386 *p, int me)
+{
+   int j;
+   if (!p)
+      return 0;
+   for (j = 0; j < cpu_count && j < MAX_CPUS; j++) {
+      if (j == me || !cpus[j].online)
+         continue;
+      if ((PCB386 *)cpus[j].current == p)
+         return 1;
+   }
+   return 0;
+}
+
+static int ps_pcb_running_elsewhere(PCB386 *p, int me)
+{
+   int j;
+   if (!p)
+      return 0;
+   for (j = 0; j < cpu_count && j < MAX_CPUS; j++) {
+      if (j == me || !cpus[j].online)
+         continue;
+      if ((PCB386 *)cpus[j].current != p)
+         continue;
+      /* A stale current pointer (this PCB advertised after the CPU
+         switched away, or after a leftover on_cpu claim) must not block
+         migration: test-fatwrite-coop hung with vfs_busy held by pid 31
+         on_cpu=3 while CPU 3 ran the waiter, because the old "any
+         current==p" check kept unclaiming the holder.  Treat the other
+         CPU as live only if it still claims the PCB, or it released
+         on_cpu but has not published a successor. */
+      if (p->on_cpu == j || p->on_cpu < 0)
+         return 1;
+   }
+   return 0;
+}
+
+PCB386 *ps_find_by_cr3(unsigned long cr3)
+{
+   PCB386 *head, *p;
+   int hops = 0;
+   u64 want = (u64)cr3 & ~0xFFFULL;
+
+   if (!want)
+      return 0;
+   if (current_process &&
+       (((u64)(uintptr)current_process->pagedirloc) & ~0xFFFULL) == want)
+      return current_process;
+   head = sched_gethead();
+   p = head;
+   if (!head)
+      return 0;
+   do {
+      if (p && (((u64)(uintptr)p->pagedirloc) & ~0xFFFULL) == want)
+         return p;
+      p = p->next;
+   } while (p && p != head && ++hops < 512);
+   return 0;
+}
+
+static void ps_publish_current(int me, PCB386 *task)
+{
+   if (me >= 0 && me < MAX_CPUS)
+      cpus[me].current = task;
+   __sync_synchronize();
+}
+
+/* Drop a scheduler CAS that this CPU has not yet published as current. */
+static void ps_unclaim_if_unused(PCB386 *process, PCB386 *prev, int me)
+{
+   if (process && process != prev && process->on_cpu == me)
+      process->on_cpu = -1;
+}
+
 void ps_switchto(PCB386 *process){
-   PCB386 *prev = current_process;
    int me = smp_cpu_id();
+   PCB386 *prev = (me >= 0 && me < MAX_CPUS) ? (PCB386 *)cpus[me].current
+                                             : current_process;
    extern int lapic_send_ipi(u32 apic_id, u32 vector);
 
    if (!process)
@@ -1996,18 +2342,33 @@ void ps_switchto(PCB386 *process){
       return; /* already switching — a nested call from IRQ would corrupt ctx */
    ps_switchto_in_progress[me] = 1;
 
-   /* Do not run a task still live on another CPU — wait for it to be released. */
-   if (process != prev) {
+   /* Always require the claim, including process==prev.  Skipping that left
+      current advertising a PCB whose on_cpu was already -1 or another CPU,
+      so the next remote CAS migrated it while this CPU kept executing it
+      (KSTACK-SHARED pid=fatwr). */
+   if (process->on_cpu != me) {
       int spins = 0;
-      while (process->on_cpu >= 0 && process->on_cpu != me) {
+      if (process == prev && process->on_cpu >= 0) {
+         ps_switchto_in_progress[me] = 0;
+         return;
+      }
+      while (process != prev && process->on_cpu >= 0 && process->on_cpu != me) {
          int other = process->on_cpu;
          if (other >= 0 && other < cpu_count && cpus[other].online)
             lapic_send_ipi(cpus[other].apic_id, IPI_RESCHEDULE);
          __asm__ __volatile__("pause");
          if (++spins > 1000000) {
+            ps_unclaim_if_unused(process, prev, me);
             ps_switchto_in_progress[me] = 0;
             return;
          }
+      }
+      /* Do not CAS while another CPU still advertises this PCB: it may
+         have dropped on_cpu and still be executing.  A leftover
+         advertisement with on_cpu already == me is handled below. */
+      if (process->on_cpu < 0 && ps_pcb_advertised_elsewhere(process, me)) {
+         ps_switchto_in_progress[me] = 0;
+         return;
       }
       if (process->on_cpu < 0 &&
           !__sync_bool_compare_and_swap(&process->on_cpu,-1,me)) {
@@ -2047,12 +2408,39 @@ void ps_switchto(PCB386 *process){
       can observe the destination PCB while RSP/CR3 still belong to prev and
       save that mixed state into the destination context. */
    stopints();
-   current_process = process;
+   /* Re-verify the claim under the interrupt-off window.  Publishing a task
+      this CPU does not own makes the next IRQ pick up that task's IRQ kstack
+      (or user stack) while its real owner is still running it. */
+   if (process->on_cpu != me || ps_pcb_running_elsewhere(process, me)) {
+      ps_unclaim_if_unused(process, prev, me);
+      ps_switchto_in_progress[me] = 0;
+      startints();
+      return;
+   }
+   /* Write this CPU's slot with the id captured above.  current_process
+      calls smp_cpu_id() again; under a user CR3 a LAPIC fallback can
+      return 0 and publish the destination on the BSP slot instead. */
+   ps_publish_current(me, process);
+   /* One USER_RUN per CPU, and only when leaving kernel/idle so CR3 is
+      still the identity map. Logging every steal flooded COM1 (~20k lines)
+      and serial_puts used LAPIC MMIO under a user CR3. */
+   if (process->accesslevel == ACCESS_USER &&
+       (!prev || prev->accesslevel != ACCESS_USER)) {
+      static int user_run_seen[MAX_CPUS];
+      if (me >= 0 && me < MAX_CPUS && !user_run_seen[me]) {
+         char line[80];
+         user_run_seen[me] = 1;
+         sprintf(line, "USER_RUN cpu=%d pid=%d\n", me,
+                 (int)process->processid);
+         serial_puts(line);
+      }
+   }
    fpu_restore(&process->fpu);
 
-   /* Assembly disables interrupts before saving or loading CR3/RSP. The
-      destination RFLAGS restore re-enables them after the handoff is coherent. */
-   ps_switchto_in_progress[me] = 0;
+   /* Leave ps_switchto_in_progress set until context_load clears it.  Clearing
+      it here let a timer on this CPU re-enter the scheduler while RSP/CR3
+      still belonged to prev, and let ps_switchto(prev==dest) context_load a
+      task another CPU had already claimed (KSTACK-SHARED pid=gcc). */
 
     /* Diagnostic: valid RIPs are kernel code (0x100000..0x300000) or user
        code (0x400000+).  A RIP in the 0x300000..0x400000 stack hole, or with
@@ -2081,9 +2469,9 @@ void ps_switchto(PCB386 *process){
     }
 
      if (prev && prev != process)
-       context_switch(&prev->ctx, &process->ctx, &prev->on_cpu);
+       context_switch(&prev->ctx, &process->ctx, &prev->on_cpu, me);
      else
-       context_load(&process->ctx);
+       context_load(&process->ctx, me);
 };
 
 
@@ -2263,32 +2651,63 @@ static void self_exit_current(void)
    parent = ps_findprocess(dying->owner);
    if (parent != (PCB386 *)-1 && parent != dying) {
       parent->childwait = 0;
-      if (parent->nlive > 0)
-         parent->nlive--;
-      if (parent->waitq_n < WAITQ_MAX) {
-         parent->waitq_pid[parent->waitq_n] = (int)dying->processid;
-         parent->waitq_st[parent->waitq_n] = dying->exit_status;
-         parent->waitq_n++;
-      }
+      /* Published before the dequeue further down; see kill_process(). */
+      waitq_publish(parent, (int)dying->processid, dying->exit_status);
       waitpid_notify_parent(parent);
    }
 
+   /* Resuming the parent (or the idle task) directly is only allowed if we can
+      CLAIM it.  The old code tested parent->on_cpu and then assigned
+      on_cpu = me further down; another CPU could claim the parent in between,
+      leaving two CPUs running one PCB -- and therefore sharing one IRQ kstack
+      (KSTACK-FOREIGN). */
+   readyprocess = 0;
+   /* Only CAS from -1.  `on_cpu == me` here is a leftover claim: current
+      is the dying child, so the parent is not running on this CPU.  Taking
+      it anyway, then storing on_cpu=me below, stole a parent still live
+      on another CPU (KSTACK-SHARED after SDK_EXIT). */
    if (parent != (PCB386 *)-1 && parent != dying &&
         !(parent->status & PS_ATTB_BLOCKED) && !parent->waiting &&
-        (parent->on_cpu < 0 || parent->on_cpu == me) &&
-        (parent->cpu_affinity < 0 || parent->cpu_affinity == me))
+        (parent->cpu_affinity < 0 || parent->cpu_affinity == me) &&
+        parent->on_cpu < 0 &&
+        !ps_pcb_advertised_elsewhere(parent, me) &&
+        __sync_bool_compare_and_swap(&parent->on_cpu, -1, me) &&
+        !ps_pcb_running_elsewhere(parent, me))
        readyprocess = parent;
-   else {
+   if (!readyprocess) {
       readyprocess = (PCB386*)smp_this_cpu()->idle;
-      if (!readyprocess) {
+      if (readyprocess && readyprocess != dying
+          && readyprocess->on_cpu != me
+          && !__sync_bool_compare_and_swap(&readyprocess->on_cpu, -1, me))
+         readyprocess = 0;
+      if (!readyprocess || readyprocess == dying) {
          cursched = (devmgr_scheduler_extension*)extension_table[CURRENT_SCHEDULER].iface;
+         readyprocess = 0;
          if (cursched && cursched->scheduler)
             readyprocess = (PCB386*)bridges_link((devmgr_generic*)cursched,
                                                  &cursched->scheduler,
                                                  current_process,0,0,0,0,0);
+         if (readyprocess && readyprocess != dying
+             && readyprocess->on_cpu != me
+             && !__sync_bool_compare_and_swap(&readyprocess->on_cpu, -1, me))
+            readyprocess = 0;
       }
-      if (!readyprocess || readyprocess == dying)
-         readyprocess = &sPCB;
+      /* Last resort: this CPU's own idle task, force-claimed.  It belongs to
+         this CPU, so a stale on_cpu from a previous switch must not push us
+         onto sPCB: sPCB is a SINGLE global PCB with a single ctx.rsp, so two
+         CPUs reaching this fallback would resume one context on one stack and
+         scribble over each other.  That shows up as a 64-bit stack slot whose
+         high half is another CPU's 32-bit smp_cpu_id() result -- a return
+         address read back as 0x1_xxxxxxxx, faulting in the serial path. */
+      if (!readyprocess || readyprocess == dying) {
+         PCB386 *idle = (PCB386 *)smp_this_cpu()->idle;
+         if (idle && idle != dying) {
+            idle->on_cpu = me;
+            readyprocess = idle;
+         } else {
+            readyprocess = &sPCB;
+         }
+      }
    }
 
    /* Mark DYING, dequeue while still claimed (on_cpu == me), then drop
@@ -2306,15 +2725,28 @@ static void self_exit_current(void)
            free(dying) while we still read dying->held_crits[]. */
         sync_release_process_crits(dying, (dying->processid & 0x007FFFFF) + 1);
    stopints();
-     current_process = readyprocess;
-     readyprocess->on_cpu = me;
+     if (!readyprocess || readyprocess == dying
+         || ps_pcb_running_elsewhere(readyprocess, me)) {
+        PCB386 *idle = (PCB386 *)smp_this_cpu()->idle;
+        if (readyprocess && readyprocess != dying && readyprocess->on_cpu == me
+            && readyprocess != idle)
+           readyprocess->on_cpu = -1;
+        if (idle && idle != dying) {
+           idle->on_cpu = me;
+           readyprocess = idle;
+        } else {
+           readyprocess = &sPCB;
+           readyprocess->on_cpu = me;
+        }
+     }
+     ps_publish_current(me, readyprocess);
      fpu_restore(&readyprocess->fpu);
      /* Publish the zombie only after this CPU's current_process is the
         successor, and keep ctx_load_in_progress set until context_load
         finishes CR3/RSP so the BSP cannot free the live PML4. */
      ctx_load_in_progress[me] = 1;
      pending_zombie[me] = dying;
-     context_load(&readyprocess->ctx);
+     context_load(&readyprocess->ctx, me);
   }
 
 /*Calls the scheduler voluntarily*/
@@ -2337,13 +2769,23 @@ void schedule_from_timer(void){
     /* Long GCC cc1 runs expose a legacy timer-context race.  Stage-1
        certification (serial "selfhost-stage1" and parallel
        "selfhost-stage1-parallel") is cooperatively scheduled: spawned tools
-       run to exit, then taskswitch() resumes make or the console.  In the
-       parallel boot user tools may run on any CPU, but timer preemption of a
-       running tool is still suppressed.  The generated kernel uses normal
-       preemptive SMP. */
+       run to exit, then taskswitch() resumes make or the console.  Do not
+       preempt a running USER tool from the timer.  Idle and kernel threads
+       must still fall through and claim ready user work; returning here for
+       every task left APs parked in idle except for a one-shot IPI. */
     {
+         /* ...unless that tool is SPINNING for a crit it does not hold.  A
+            waiter makes no progress by keeping the CPU, and the crit's owner
+            may be pinned to this very CPU -- with no preemption the owner never
+            runs and the spin never ends.  That is how the -j4 bootstrap wedged
+            with mkdir.exe holding fat_volume_busy and spinning on pc_busy while
+            pc_busy's owner sat in the ready queue (CRITHANG).  scheduler()
+            already declines to pin a crit_wait task; it just never got asked. */
          if (!voluntary && selfhost_cooperative_ready &&
-            selfhost_stage1_cmdline()) {
+            (selfhost_stage1_cmdline() || sched_coop_user_force) &&
+            current_process &&
+            current_process->accesslevel == ACCESS_USER &&
+            !current_process->crit_wait) {
           zombie_drain();
           return;
          }
@@ -2354,10 +2796,14 @@ void schedule_from_timer(void){
       left set because context_load cannot clear it before `ret` without
       opening a race window.  Clear it here — the new task is already
       running, so it is safe to proceed with scheduling. */
-   if (ctx_load_in_progress[me])
+   if (ctx_load_in_progress[me] || ps_switchto_in_progress[me])
       return;
 
    if (sigwait || !current_process)
+      return;
+   /* Stale current_process: another CPU owns the PCB.  Do not walk its
+      kstack or context_load it (KSTACK-SHARED). */
+   if (current_process->on_cpu >= 0 && current_process->on_cpu != me)
       return;
 
 #ifdef __x86_64__
@@ -2438,11 +2884,14 @@ void taskswitcher(){
                                                    current_process,0,0,0,0,0);
          };
          //readyprocess=bridges_ps_scheduler(current_process);
-            
-         //set the current process to the ready process
-         current_process = readyprocess;
 
-         //give control to readyprocess, the context switch
+         /* Do NOT publish current_process here.  ps_switchto() claims the
+            task with a CAS on on_cpu and only then sets current_process; if
+            the claim fails (another CPU already runs it) it returns without
+            switching.  Publishing first left this CPU's current_process
+            pointing at a task owned by another CPU, and the next IRQ then
+            switched RSP to that task's IRQ kstack -- two CPUs on one kernel
+            stack, each overwriting the other's frames (KSTACK-FOREIGN). */
          ps_switchto(readyprocess);
 
          /*Make sure the taskwitcher was really called by the timer, since

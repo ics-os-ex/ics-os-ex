@@ -1046,7 +1046,8 @@ void virtio_blk_retire_owner(u64 owner)
 
 void virtio_blk_irq(void)
 {
-   int entered = irq_vector_enter(vblk.irq_vector, &vblk_irq_owner);
+   int entered;
+   entered = irq_vector_enter(vblk.irq_vector, &vblk_irq_owner);
    if (!entered) {
       lapic_eoi();
       return;

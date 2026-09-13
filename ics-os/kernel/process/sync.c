@@ -17,6 +17,123 @@ extern int sprintf(char *str, const char *fmt, ...);
 
 sync_sharedvar elf_map_crit;
 
+/* Live "who is stuck on which crit" record, published by the acquire spin loop
+   and read by the selfhost watchdog (stdlib/time.c).  Without it a deadlock
+   only shows as a kernel RIP inside sync_entercrit, which does not identify
+   the lock or its holder.  Per-CPU: the watchdog runs on the same CPU as the
+   spinner. */
+volatile unsigned long sync_wait_var[MAX_CPUS];
+volatile int sync_wait_owner[MAX_CPUS];
+volatile unsigned long sync_wait_spins[MAX_CPUS];
+
+static void sync_wait_publish(const sync_sharedvar *var, int held)
+{
+    int me = smp_cpu_id();
+    if (me < 0 || me >= MAX_CPUS)
+        return;
+    sync_wait_var[me] = (unsigned long)(uintptr)var;
+    sync_wait_owner[me] = held;
+    sync_wait_spins[me]++;
+}
+
+static void sync_wait_clear(void)
+{
+    int me = smp_cpu_id();
+    if (me < 0 || me >= MAX_CPUS)
+        return;
+    sync_wait_var[me] = 0;
+    sync_wait_owner[me] = 0;
+    sync_wait_spins[me] = 0;
+}
+
+static int sync_var_ok(const sync_sharedvar *var);
+
+/* Find the PCB holding a crit, given the owner token stored in var->busy.
+   Walks the ready ring read-only: taking processmgr_busy from a spin loop would
+   itself deadlock, and a hung owner is usually not `current` on any CPU. */
+static PCB386 *sync_owner_pcb(int owner)
+{
+    PCB386 *head, *p;
+    DWORD want;
+    int hops = 0;
+
+    if (owner <= 0)
+        return 0;
+    want = (DWORD)(owner - 1);
+    head = sched_gethead();
+    p = head;
+    if (!head)
+        return 0;
+    do {
+        if ((p->processid & 0x007FFFFF) == want)
+            return p;
+        p = p->next;
+    } while (p && p->before && p != head && ++hops < 512);
+    return 0;
+}
+
+/* Print the whole wait-for chain rooted at a crit we have been spinning on for
+   far too long: waiter -> crit -> owner -> the crit that owner wants -> ...
+   A per-CPU watchdog snapshot cannot show this, because every owner past the
+   first hop is descheduled and therefore not `current` anywhere.  If the chain
+   returns to a process already seen, the locks form a cycle and no amount of
+   scheduling can break it -- that is reported as CRITCYCLE, and it is the only
+   evidence that distinguishes a lock-order inversion from CPU starvation.
+   Throttled to one report per crit. */
+static void sync_report_owner(sync_sharedvar *var, int owner)
+{
+    PCB386 *seen[8];
+    sync_sharedvar *v = var;
+    int held = owner;
+    int n = 0, i;
+    char b[256];
+
+    if (owner <= 0 || var->diag_reported)
+        return;
+    var->diag_reported = 1;
+
+    while (v && held > 0 && n < 8) {
+        PCB386 *p = sync_owner_pcb(held);
+
+        if (!p) {
+            sprintf(b, "CRITHANG hop=%d crit=0x%lx owner_token=%d ORPHANED "
+                       "(owner not in ready ring)\n",
+                    n, (unsigned long)(uintptr)v, held);
+            serial_puts(b);
+            return;
+        }
+        sprintf(b, "CRITHANG hop=%d crit=0x%lx owner=%d '%s' status=0x%x "
+                   "on_cpu=%d aff=%d waiting=%d held=%d critwait=%d "
+                   "wants=0x%lx sc=%02x/%02x rip=0x%llx\n",
+                n, (unsigned long)(uintptr)v, (int)p->processid, p->name,
+                (unsigned)p->status, p->on_cpu, p->cpu_affinity,
+                (int)p->waiting, p->held_crit_n, p->crit_wait,
+                (unsigned long)(uintptr)p->crit_wait_var,
+                (unsigned)p->cursyscall[0], (unsigned)p->cursyscall[1],
+                (unsigned long long)p->ctx.rip);
+        serial_puts(b);
+
+        for (i = 0; i < n; i++) {
+            if (seen[i] == p) {
+                sprintf(b, "CRITCYCLE crit=0x%lx closes at pid=%d '%s' "
+                           "(lock-order inversion, not CPU starvation)\n",
+                        (unsigned long)(uintptr)v, (int)p->processid, p->name);
+                serial_puts(b);
+                return;
+            }
+        }
+        seen[n++] = p;
+
+        /* Follow the chain only while this owner is itself blocked on a lock. */
+        if (!p->crit_wait || !p->crit_wait_var)
+            return;
+        v = p->crit_wait_var;
+        if (!sync_var_ok(v))
+            return;
+        held = __sync_val_compare_and_swap(&v->busy, 0, 0);
+    }
+}
+
 /* Crit objects live in kernel BSS or the kernel heap (file_PCB.io_busy).
    A user-stack pointer here is saved-context / fd-table corruption; walking
    it as sync_sharedvar (old DIAGLOCK) wedges the timer path. */
@@ -35,6 +152,45 @@ static void sync_bad_var(const char *op, const sync_sharedvar *var)
     char b[96];
     sprintf(b, "SYNCBAD %s crit=0x%lx\n", op, (unsigned long)(uintptr)var);
     serial_puts(b);
+}
+
+#define CRIT_NEST_MAX 16
+
+static void crit_nest_push(sync_sharedvar *var, int tok)
+{
+    PCB386 *p = current_process;
+    if (!p || p->crit_nest_n >= CRIT_NEST_MAX)
+        return;
+    p->crit_nest_var[p->crit_nest_n] = var;
+    p->crit_nest_tok[p->crit_nest_n] = tok;
+    p->crit_nest_n++;
+}
+
+static int crit_nest_pop(sync_sharedvar *var, int fallback)
+{
+    PCB386 *p = current_process;
+    int n;
+    if (!p)
+        return fallback;
+    n = p->crit_nest_n;
+    if (n <= 0)
+        return fallback;
+    if (p->crit_nest_var[n - 1] != var)
+        return fallback;
+    p->crit_nest_n = n - 1;
+    return p->crit_nest_tok[n - 1];
+}
+
+int sync_cpu_holds(const sync_sharedvar *var)
+{
+    PCB386 *p = current_process;
+    int i;
+    if (!var || !p)
+        return 0;
+    for (i = 0; i < p->crit_nest_n; i++)
+        if (p->crit_nest_var[i] == var)
+            return 1;
+    return 0;
 }
 
 static int sync_owner_token(void)
@@ -113,6 +269,7 @@ void sync_release_process_crits(void *pcb, int owner)
        }
     }
     p->held_crit_n = 0;
+    p->crit_nest_n = 0;
 }
 
 
@@ -120,13 +277,27 @@ void sync_release_process_crits(void *pcb, int owner)
 void sync_justwait(sync_sharedvar *var){
    int owner=sync_owner_token();
    int held;
+   unsigned long spins=0;
+   PCB386 *p=current_process;
    if (!sync_var_ok(var))
       return;
+   if (p) {
+      p->crit_wait_var = var;
+      p->crit_wait = 1;
+   }
    do {
       held=__sync_val_compare_and_swap(&var->busy,0,0);
-      if (held && held!=owner)
-         __asm__ __volatile__("pause");
-   } while (held && held!=owner);
+      if (!held || held==owner)
+         break;
+      __asm__ __volatile__("pause");
+      ++spins;
+      if ((spins & 0xFFUL) == 0)
+         taskswitch();
+   } while (1);
+   if (p) {
+      p->crit_wait = 0;
+      p->crit_wait_var = 0;
+   }
 };
 
 //attempt to enter the critical section
@@ -149,6 +320,7 @@ void sync_entercrit(sync_sharedvar *var){
 
     if (__sync_val_compare_and_swap(&var->busy,0,0)==owner) {
          __sync_add_and_fetch(&var->wait, 1);
+         crit_nest_push(var, owner);
          return;
      }
 
@@ -159,27 +331,77 @@ void sync_entercrit(sync_sharedvar *var){
         queue -- would be starved forever (the SMP io_devlock deadlock).  A
         holder doing real work under a crit never sets crit_wait and is still
         pinned, so mid-critical-section preemption protection is preserved. */
-     if (current_process)
+     if (current_process) {
+         current_process->crit_wait_var = var;
          current_process->crit_wait = 1;
+     }
 
-     while (!__sync_bool_compare_and_swap(&var->busy,0,owner)) {
+     /* Acquire, then publish "no longer waiting" and the hold, with interrupts
+        off so the whole transition is atomic against preemption on this CPU.
+        Doing it in separate steps leaves windows where our own state lies about
+        us: after the CAS but before crit_wait is cleared we are a holder still
+        flagged as a waiter, so the scheduler ranks us at the priority floor
+        (sched_eff_prio) and can starve us while we own a hot lock -- every other
+        CPU then spins on a crit whose owner is descheduled, which is exactly the
+        "owner wants the crit it holds" CRITCYCLE seen under concurrent FAT
+        writers.  Between clearing crit_wait and sync_track_hold() the reverse
+        hole exists: held_crit_n is still 0, so the no-preempt guard does not
+        recognise us as a holder either. */
+     for (;;) {
+          DWORD acq_flags;
+          int held;
+
+          storeflags(&acq_flags);
+          stopints();
+          if (__sync_bool_compare_and_swap(&var->busy,0,owner)) {
+             sync_wait_clear();
+             if (current_process) {
+                current_process->crit_wait = 0;
+                current_process->crit_wait_var = 0;
+             }
+             var->wait = 1;
+             sync_track_hold(var);
+             crit_nest_push(var, owner);
+             restoreflags(acq_flags);
+             return;
+          }
+          held = __sync_val_compare_and_swap(&var->busy,0,0);
+          restoreflags(acq_flags);
+
+          /* Re-check recursion on every pass, not just before the loop: if the
+             busy field already carries our token we own this crit and must not
+             spin for it, or we deadlock against ourselves forever (the CAS can
+             never succeed). */
+          if (held == owner) {
+             __sync_add_and_fetch(&var->wait, 1);
+             if (current_process) {
+                current_process->crit_wait = 0;
+                current_process->crit_wait_var = 0;
+             }
+             sync_wait_clear();
+             crit_nest_push(var, owner);
+             return;
+          }
+
           __asm__ __volatile__("pause");
           ++spins;
+          if ((spins & 0xFFUL) == 0)
+              sync_wait_publish(var, __sync_val_compare_and_swap(&var->busy,0,0));
+          if (spins == 20000000UL)
+              sync_report_owner(var,
+                                __sync_val_compare_and_swap(&var->busy,0,0));
           /* A pure spin can starve the lock owner on SMP: every CPU ends up
              occupied by waiters while the owner sits in the run queue.  Yield
              periodically so the scheduler can reschedule the owner.  Only do
-             this when we hold no other crits (see `nested` above). */
-          if (!nested && (spins & 0xFFUL) == 0)
+             this when we hold no other crits (see `nested` above).
+             A nested waiter still yields eventually: pinning this CPU forever
+             deadlocks outright if the owner can only run here, which is
+             strictly worse than briefly descheduling us with our outer crits
+             held. */
+          if ((spins & (nested ? 0xFFFFFUL : 0xFFUL)) == 0)
               taskswitch();
     }
-    /* Acquired.  We are no longer WAITING, so the no-preempt guard may pin us
-        again while we do work under the crit.  Clear before track_hold so the
-        guard sees (held_crit_n>0 && crit_wait==0) == a real holder. */
-     if (current_process)
-         current_process->crit_wait = 0;
-     var->wait=1;
-     sync_track_hold(var);
-    };
+}
 
 unsigned long sync_entercrit_irqsave(sync_sharedvar *var){
     unsigned long flags=0;
@@ -200,11 +422,13 @@ unsigned long sync_entercrit_irqsave(sync_sharedvar *var){
        held=__sync_val_compare_and_swap(&var->busy,0,0);
        if (held==owner) {
           __sync_add_and_fetch(&var->wait, 1);
+          crit_nest_push(var, owner);
           return flags;
        }
        if (!held && __sync_bool_compare_and_swap(&var->busy,0,owner)) {
            var->wait=1;
            sync_track_hold(var);
+           crit_nest_push(var, owner);
            return flags;
         }
        __asm__ __volatile__("pause");
@@ -214,7 +438,8 @@ unsigned long sync_entercrit_irqsave(sync_sharedvar *var){
 
 //leave the critical section
 void sync_leavecrit(sync_sharedvar *var){
-   int owner=sync_owner_token();
+   int sampled=sync_owner_token();
+   int owner=crit_nest_pop(var, sampled);
 
    if (!sync_var_ok(var)) {
         sync_bad_var("leave", var);
@@ -222,18 +447,19 @@ void sync_leavecrit(sync_sharedvar *var){
    }
 
    if (__sync_val_compare_and_swap(&var->busy,0,0)!=owner) {
-        printf("sync: warning critical section released by non-owner! crit=0x%lx busy=0x%x self=0x%x wait=%d\n",
-               (unsigned long)(uintptr)var,
-               __sync_val_compare_and_swap(&var->busy,0,0),
-               owner,
-               (int)var->wait);
-        printf("SYNCLEAVE rip0=0x%lx rip1=0x%lx rip2=0x%lx rip3=0x%lx rip4=0x%lx rip5=0x%lx\n",
-               (unsigned long)(char *)__builtin_return_address(0),
-               (unsigned long)(char *)__builtin_return_address(1),
-               (unsigned long)(char *)__builtin_return_address(2),
-               (unsigned long)(char *)__builtin_return_address(3),
-               (unsigned long)(char *)__builtin_return_address(4),
-               (unsigned long)(char *)__builtin_return_address(5));
+        /* Do not walk __builtin_return_address(1..5): a smashed RBP (cert
+           GPF64 rip=sync_leavecrit rbp=0 on gcc.exe) makes that #GP.
+           printf also re-enters libc on the same stack; keep this atomic. */
+        char line[192];
+        sprintf(line,
+                "sync: warning critical section released by non-owner! "
+                "crit=0x%lx busy=0x%x self=0x%x wait=%d rip=0x%lx\n",
+                (unsigned long)(uintptr)var,
+                __sync_val_compare_and_swap(&var->busy,0,0),
+                owner,
+                (int)var->wait,
+                (unsigned long)(char *)__builtin_return_address(0));
+        serial_puts(line);
         return;
     }
    if (__sync_sub_and_fetch(&var->wait, 1) == 0) {

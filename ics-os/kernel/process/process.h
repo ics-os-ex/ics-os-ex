@@ -318,15 +318,36 @@ typedef struct _PCB386 {
 
    void *signaltable;              //Reserved for the signal table *NOT YET IMPLEMENTED*
 
-   /* SMP: -1 = any CPU / not running; else cpu id. */
+    /* SMP: -1 = any CPU / not running; else cpu id. */
     int cpu_affinity;
     volatile int on_cpu;
+
+#ifdef __x86_64__
+    /* Identity-mapped kheap stack used by IRQ/syscall C. Same-privilege
+       interrupts keep the interrupted RSP; kernel C must not run there.
+       irqwrap.S switches RSP here when the interrupted RSP is outside
+       [kstack_base, kstack_top), and restores it from %r13 on the way out,
+       so nesting needs no counter. irq_user_rsp/irq_kframe record the
+       OUTERMOST (user-stack) frame, which fork needs. Offsets of
+       accesslevel/kstack_base/kstack_top are hardcoded in irqwrap.S and
+       asserted in process.c. */
+    void *kstack_base;
+    u64 kstack_top;
+    u64 irq_user_rsp;
+    u64 irq_kframe;
+#endif
 
     /* Critical sections currently held by this process. A faulting or
        exiting process must not leave its owner token in a crit, or every
        later acquire spins forever. */
     sync_sharedvar *held_crits[16];
       int held_crit_n;
+      /* Enter/leave nest lives on the PCB, not the CPU.  fat_wait_io()
+         yields while holding vfs+FAT; a per-CPU nest then let the next
+         process unlock the previous hold (non-owner leave, wait stuck). */
+      sync_sharedvar *crit_nest_var[16];
+      int crit_nest_tok[16];
+      int crit_nest_n;
       volatile int crits_freed;
       /* 1 while this process is in the sync_entercrit spin loop WAITING for a
          crit it does not hold. The no-preempt guard (scheduler.c) must NOT pin
@@ -335,6 +356,12 @@ typedef struct _PCB386 {
          and deadlocks the whole system (the SMP io_devlock deadlock). A holder
          that is doing useful work under a crit (crit_wait==0) is still pinned. */
       volatile int crit_wait;
+      /* The crit this process is currently spinning for, or 0. Introspection
+         only: it lets the CRITHANG reporter follow the whole wait-for chain
+         (waiter -> crit -> owner -> the crit that owner wants -> ...) and name
+         a lock cycle, which a per-CPU snapshot cannot do because a blocked
+         owner is not `current` on any CPU. */
+      sync_sharedvar * volatile crit_wait_var;
 
    /* Lock-free self-exit reclaim list. After dequeue, next/before belong to
       the scheduler; this pointer is only used once the PCB is a zombie. */
@@ -441,8 +468,20 @@ int      findprocessname(const char *name);
 void     *findsemaphore(DWORD handle);
 DWORD    fork();
 DWORD    forkprocess();
+PCB386  *sched_gethead(void);
+PCB386  *ps_find_by_cr3(unsigned long cr3);
+
+/* Retained child-status queue (posix waitpid). Serialized by waitq_lock in
+   process.c; the exit paths publish, sys_waitpid reaps. */
+int      waitq_publish(PCB386 *parent, int child_pid, int child_status);
+int      waitq_reap(PCB386 *me, int pid, int *out_pid, int *out_st);
+int      waitq_has(PCB386 *me, int pid);
+
 #ifdef __x86_64__
 long     user_fork_frame(u64 *frame);
+int      pcb_alloc_irq_kstack(PCB386 *p);
+void     pcb_free_irq_kstack(PCB386 *p);
+void     irq_kstack_enter(u64 current_rsp);
 #endif
 DWORD    free_semaphore(DWORD handle);
 void     freeprocessmemory(process_mem *memptr,DWORD *pagedir);

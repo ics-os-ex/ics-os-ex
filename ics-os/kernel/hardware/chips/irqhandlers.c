@@ -72,6 +72,8 @@ extern void syscallwrapper(void);
 extern void gpfwrapper(void);
 extern void doublefaultwrapper(void);
 extern void copwrapper(void);
+extern void udwrapper(void);
+extern void mfwrapper(void);
 extern void CPUintwrapper(void);
 extern void div_wrapper(void);
 extern void invalidtsswrapper(void);
@@ -189,9 +191,79 @@ void boundscheck(){
 };
 
 void nocoprocessor(){
-   char temp[255];
-   setCR0(0x80000011);
+   /* #NM: lazy FPU. Only clear CR0.TS. The old setCR0(0x80000011) also
+      cleared WP/NE/MP and left gcc with a smashed CR0 / #DB cascade. */
+   __asm__ volatile ("clts");
 };
+
+#ifdef __x86_64__
+#include "cpu/smp.h"
+/* #UD / #MF, entered from udwrapper / mfwrapper with %r13 (the PUSH_ALL frame)
+   in `frame`.  Neither pushes an error code, so RIP is at +120 and CS at +128
+   (see AGENTS.md).  These used to be routed into nocoprocessor(), which cleared
+   CR0.TS and returned -- retrying the same bad instruction forever.  An #UD is
+   normally the FIRST visible symptom of executing corrupted memory, so report
+   it loudly with the opcode bytes and then apply the same policy as the #PF and
+   #GP paths: kill a faulting user process, halt on a kernel fault. */
+static void exc_noerr_report(const char *tag, unsigned long *frame)
+{
+   extern void serial_puts(const char *s);
+   extern void exc_recover(void);
+   unsigned long rip = frame ? frame[15] : 0;   /* 120/8 */
+   unsigned long cs  = frame ? frame[16] : 0;   /* 128/8 */
+   const unsigned char *op = (const unsigned char *)rip;
+   /* Same ownership rule as GPFhandler64(): a USER process that has jumped
+      outside the kernel image -- including into the low page, where a shifted
+      iretq frame lands when RFLAGS is popped as RIP -- is the faulting party
+      and must be killed, not have its CPU halted.  Halting parked one CPU per
+      bad child until the whole -j4 build had no CPUs left. */
+   int user_fault = current_process
+                    && current_process->accesslevel == ACCESS_USER
+                    && (rip < 0x100000UL
+                        || rip >= (unsigned long)MEM_USER_ELF_BASE);
+#ifdef __x86_64__
+   if (!user_fault) {
+      unsigned long cr3 = 0;
+      PCB386 *owner;
+      __asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
+      owner = ps_find_by_cr3(cr3);
+      if (owner && owner->accesslevel == ACCESS_USER) {
+         int me = smp_cpu_id();
+         if (me >= 0 && me < MAX_CPUS)
+            cpus[me].current = owner;
+         user_fault = 1;
+      }
+   }
+#endif
+   char b[224];
+
+   sprintf(b, "%s: rip=0x%lx cs=0x%lx proc=%s pid=%d userfault=%d\n",
+           tag, rip, cs,
+           current_process && current_process->name ? current_process->name : "?",
+           current_process ? (int)current_process->processid : -1,
+           user_fault);
+   serial_puts(b);
+   if (rip >= 0x1000UL) {
+      sprintf(b, "%s: opcodes %02x %02x %02x %02x %02x %02x %02x %02x\n", tag,
+              op[0], op[1], op[2], op[3], op[4], op[5], op[6], op[7]);
+      serial_puts(b);
+   }
+
+   if (user_fault) {
+      serial_puts(tag);
+      serial_puts(": user fault -> killing process\n");
+      exc_recover();
+      /* not reached */
+   }
+   serial_puts(tag);
+   serial_puts(": kernel fault -> halt\n");
+   stopints();
+   while (1) { __asm__ volatile ("hlt"); }
+}
+
+void invalid_opcode64(unsigned long *frame) { exc_noerr_report("UD64", frame); }
+void fpu_error64(unsigned long *frame)      { exc_noerr_report("MF64", frame); }
+#endif
 
 void breakpoint(){
    stopints();
@@ -460,7 +532,7 @@ void setdefaulthandlers(){
                         coprocessor_segment_overrun,SYS_CODE_SEL);
 
    setinterruptvector(16,dex_idtbase,0x8E,
-                        copwrapper,SYS_CODE_SEL);
+                        mfwrapper,SYS_CODE_SEL);
 
    setinterruptvector(7,dex_idtbase,0x8E,
                         copwrapper,SYS_CODE_SEL);
@@ -472,7 +544,7 @@ void setdefaulthandlers(){
                        doublefaultwrapper,SYS_CODE_SEL);
 
    setinterruptvector(6,dex_idtbase,0x8E,
-                         copwrapper,SYS_CODE_SEL);
+                         udwrapper,SYS_CODE_SEL);
 
    setinterruptvector(3,dex_idtbase,0x8E,
                         breakpoint,SYS_CODE_SEL);

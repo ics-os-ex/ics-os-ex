@@ -5,6 +5,11 @@
 
 QEMU_I386=qemu-system-i386
 QEMU_X64=qemu-system-x86_64
+# TCG qemu64 lacks RDTSCP by default; IRQ_KSTACK_ENTER then never switches
+# onto the per-process kstack and kernel C runs on the user stack. Enable it
+# so TCG tests match the KVM/host path (IA32_TSC_AUX is how we get a CPU id
+# under a user CR3).
+QEMU_TCG_CPU?=qemu64,+rdtscp
 QEMU_MEM=128M
 SMP_CPUS?=4
 SMP_MATRIX?=1 2 4 8
@@ -31,7 +36,7 @@ HOSTG_RTFLAGS := -m64 -std=gnu89 -w -nostdlib -fno-builtin -static -ffreestandin
 vmdex:
 	make -C kernel/
 
-.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-fatwrite test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-ide-thumbdrive
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-ide-thumbdrive
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -62,6 +67,11 @@ test-vfsgrow-unit:
 	@mkdir -p /tmp/icsos-tests
 	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/vfs_grow_unit.c -o /tmp/icsos-tests/vfs_grow_unit
 	@/tmp/icsos-tests/vfs_grow_unit
+
+test-smpclaim-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/smp_claim_unit.c -o /tmp/icsos-tests/smp_claim_unit
+	@/tmp/icsos-tests/smp_claim_unit
 
 # Deterministic 64 MiB GPT disk (slot 0: 32 MiB FAT32, slot 1: 16 MiB ext4).
 ics-os-gpt.img: scripts/mkgpt.sh
@@ -510,7 +520,7 @@ test-smp: vmdex
 			cpu=$$((cpu + 1)); \
 		done; \
 	fi
-	@! grep -aqE "General Protection fault|SMP: AP work-steal (TIMEOUT|CREATE FAIL)" /tmp/icsos-smp-$(SMP_CPUS).log
+	@! grep -aqE "General Protection fault|SMP: AP work-steal (TIMEOUT|CREATE FAIL)|PF64: re-entered" /tmp/icsos-smp-$(SMP_CPUS).log
 	@echo "test-smp SMP_CPUS=$(SMP_CPUS) PASS"
 
 test-smp-matrix: vmdex
@@ -743,6 +753,7 @@ test-posixio: kernel/Kernel64.bin apps/posixio.exe
 	@grep -aq "URING_VBLK_PASS" /tmp/icsos-posixio.log
 	@test "$$(grep -ac "URING_CLOSE_DRAIN_PASS" /tmp/icsos-posixio.log)" -eq 2
 	@test "$$(grep -ac "VFS_CREATE_UNLOCK_PASS" /tmp/icsos-posixio.log)" -eq 2
+	@test "$$(grep -ac "POSIXIO_PRINTF_LONG_OK" /tmp/icsos-posixio.log)" -eq 2
 	@test "$$(grep -ac "POSIXIO_PASS" /tmp/icsos-posixio.log)" -eq 2
 	@! grep -aq "POSIXIO_FAIL" /tmp/icsos-posixio.log
 	@echo "test-posixio PASS"
@@ -863,6 +874,11 @@ STRESS_SMP ?= 4
 STRESS_ROUNDS ?= 40
 STRESS_BURST ?= 8
 STRESS_TIMEOUT ?= 120
+# Kernel cmdline for the stress ISO. Empty keeps user processes BSP-pinned;
+# `user-smp` lets the spawned children run on APs, which is what the parallel
+# self-host cert does. STRESS_TAG isolates the ISO/log artifacts per variant.
+STRESS_CMDLINE ?=
+STRESS_TAG ?= stress
 
 apps/stressproc.exe: contrib/stressproc/stressproc.c contrib/stressproc/Makefile
 	$(MAKE) -C contrib/stressproc install
@@ -870,59 +886,119 @@ apps/stressproc.exe: contrib/stressproc/stressproc.c contrib/stressproc/Makefile
 test-stress: kernel/Kernel64.bin apps/stressproc.exe apps/hello.exe
 	@$(MAKE) -C kernel all
 	@echo "Building Multiboot2 ISO for spawn/exit stress + work disk..."
-	@mkdir -p /tmp/icsos-stress-iso/boot/grub /tmp/icsos-stress-iso/apps
-	@cp kernel/Kernel64.bin /tmp/icsos-stress-iso/vmdex
-	@cp apps/stressproc.exe /tmp/icsos-stress-iso/apps/stressproc.exe
-	@cp apps/hello.exe /tmp/icsos-stress-iso/apps/hello.exe
-	@printf '%s\n' 'stressproc.exe' 'reboot' > /tmp/icsos-stress-iso/autoexec.bat
-	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
-		> /tmp/icsos-stress-iso/boot/grub/grub.cfg
-	@grub-mkrescue -o /tmp/icsos-stress.iso /tmp/icsos-stress-iso >/dev/null 2>&1
+	@rm -rf /tmp/icsos-$(STRESS_TAG)-iso
+	@mkdir -p /tmp/icsos-$(STRESS_TAG)-iso/boot/grub /tmp/icsos-$(STRESS_TAG)-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-$(STRESS_TAG)-iso/vmdex
+	@cp apps/stressproc.exe /tmp/icsos-$(STRESS_TAG)-iso/apps/stressproc.exe
+	@cp apps/hello.exe /tmp/icsos-$(STRESS_TAG)-iso/apps/hello.exe
+	@printf '%s\n' 'stressproc.exe' 'reboot' > /tmp/icsos-$(STRESS_TAG)-iso/autoexec.bat
+	@printf 'set timeout=0\nmenuentry "ics" { multiboot2 /vmdex $(STRESS_CMDLINE); boot }\n' \
+		> /tmp/icsos-$(STRESS_TAG)-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-$(STRESS_TAG).iso /tmp/icsos-$(STRESS_TAG)-iso >/dev/null 2>&1
 	@echo "Formatting 512 MiB FAT16 virtio work disk..."
-	@truncate -s 512M /tmp/icsos-work.img
-	@mkfs.vfat -F 16 -s 32 /tmp/icsos-work.img >/dev/null
-	@echo "Running spawn/exit stress (KVM, smp $(STRESS_SMP))..."
+	@truncate -s 512M /tmp/icsos-$(STRESS_TAG)-work.img
+	@mkfs.vfat -F 16 -s 32 /tmp/icsos-$(STRESS_TAG)-work.img >/dev/null
+	@echo "Running spawn/exit stress (KVM, smp $(STRESS_SMP), cmdline '$(STRESS_CMDLINE)')..."
 	@-timeout $(STRESS_TIMEOUT) stdbuf -oL $(QEMU_X64) -enable-kvm -cpu host -smp $(STRESS_SMP) -nographic -no-reboot -m 256M \
-		-cdrom /tmp/icsos-stress.iso -boot d \
-		-drive file=/tmp/icsos-work.img,if=none,id=vd0,format=raw \
+		-cdrom /tmp/icsos-$(STRESS_TAG).iso -boot d \
+		-drive file=/tmp/icsos-$(STRESS_TAG)-work.img,if=none,id=vd0,format=raw \
 		-device virtio-blk-pci,drive=vd0,disable-legacy=on \
-		< /dev/null > /tmp/icsos-stress.log 2>&1
-	@grep -aq "Root mount \[OK\]" /tmp/icsos-stress.log
-	@grep -aq "STRESSPROC_PASS" /tmp/icsos-stress.log
-	@! grep -aq "STRESSPROC_FAIL" /tmp/icsos-stress.log
-	@! grep -aqE "PF64 |GPF64 " /tmp/icsos-stress.log
-	@echo "test-stress PASS"
+		< /dev/null > /tmp/icsos-$(STRESS_TAG).log 2>&1
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-$(STRESS_TAG).log
+	@grep -aq "STRESSPROC_PASS" /tmp/icsos-$(STRESS_TAG).log
+	@! grep -aq "STRESSPROC_FAIL" /tmp/icsos-$(STRESS_TAG).log
+	@! grep -aqE "PF64 |GPF64 " /tmp/icsos-$(STRESS_TAG).log
+	@echo "test-stress STRESS_TAG=$(STRESS_TAG) SMP=$(STRESS_SMP) PASS"
+
+# Same churn with user processes allowed on APs (the cert configuration).
+# Regression gate for the lock-free sys_waitpid waitq scan: reaping a burst in
+# reverse order while remote CPUs append exit statuses lost a status (parent saw
+# ECHILD for a child that had already queued one).  BSP-pinned test-stress
+# cannot reproduce it because no exit runs concurrently with the scan.
+test-stress-user-smp:
+	@$(MAKE) --no-print-directory test-stress STRESS_CMDLINE=user-smp \
+		STRESS_TAG=stress-usmp STRESS_SMP=4
+	@grep -aq "USER_RUN cpu=[1-7]" /tmp/icsos-stress-usmp.log
+	@echo "test-stress-user-smp PASS"
+
+apps/apuser.exe: contrib/apuser/apuser.c contrib/apuser/Makefile
+	$(MAKE) -C contrib/apuser install
+
+# User ELFs on APs (cmdline user-smp). Workers use SSE + a red zone like
+# seed cc1. Requires USER_RUN on a non-BSP CPU and APUSER_PASS.
+test-apuser: kernel/Kernel64.bin apps/apuser.exe
+	@$(MAKE) -C kernel all
+	@echo "Building Multiboot2 ISO for AP user processes..."
+	@mkdir -p /tmp/icsos-apuser-iso/boot/grub /tmp/icsos-apuser-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-apuser-iso/vmdex
+	@cp apps/apuser.exe /tmp/icsos-apuser-iso/apps/apuser.exe
+	@printf '%s\n' 'apuser.exe' 'reboot' > /tmp/icsos-apuser-iso/autoexec.bat
+	@printf '%s\n' 'set timeout=0' \
+		'menuentry "ics" { multiboot2 /vmdex user-smp; boot }' \
+		> /tmp/icsos-apuser-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-apuser.iso /tmp/icsos-apuser-iso >/dev/null 2>&1
+	@echo "Running AP user test (KVM, smp 4)..."
+	@-timeout 90 stdbuf -oL $(QEMU_X64) -enable-kvm -cpu host -smp 4 -nographic -no-reboot -m 256M \
+		-cdrom /tmp/icsos-apuser.iso -boot d \
+		< /dev/null > /tmp/icsos-apuser.log 2>&1
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-apuser.log
+	@test "$$(grep -ac "APUSER_CHILD_OK" /tmp/icsos-apuser.log)" -eq 3
+	@grep -aq "APUSER_PF_RECOVER_OK" /tmp/icsos-apuser.log
+	@grep -aq "APUSER_PASS" /tmp/icsos-apuser.log
+	@! grep -aq "APUSER_FAIL" /tmp/icsos-apuser.log
+	@! grep -aqE "GPF64 " /tmp/icsos-apuser.log
+	@! grep -aq "PF64: kernel" /tmp/icsos-apuser.log
+	@! grep -aq "PF64: re-entered" /tmp/icsos-apuser.log
+	@grep -aqE "USER_RUN cpu=[1-7] " /tmp/icsos-apuser.log
+	@echo "test-apuser PASS"
 
 apps/fatwr.exe: contrib/fatwr/fatwr.c contrib/fatwr/Makefile
 	$(MAKE) -C contrib/fatwr install
 
 # Concurrent FAT16 virtio /work writers + readers. Catches unlocked
 # fat_openfileEX racing fatcache[] (truncated .s under make -j4).
+FATWR_CMDLINE ?=
+FATWR_TAG ?= fatwr
+
 test-fatwrite: kernel/Kernel64.bin apps/fatwr.exe
 	@$(MAKE) -C kernel all
 	@echo "Building Multiboot2 ISO for concurrent FAT write test..."
-	@mkdir -p /tmp/icsos-fatwr-iso/boot/grub /tmp/icsos-fatwr-iso/apps
-	@cp kernel/Kernel64.bin /tmp/icsos-fatwr-iso/vmdex
-	@cp apps/fatwr.exe /tmp/icsos-fatwr-iso/apps/fatwr.exe
-	@printf '%s\n' 'fatwr.exe' 'reboot' > /tmp/icsos-fatwr-iso/autoexec.bat
-	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
-		> /tmp/icsos-fatwr-iso/boot/grub/grub.cfg
-	@grub-mkrescue -o /tmp/icsos-fatwr.iso /tmp/icsos-fatwr-iso >/dev/null 2>&1
+	@mkdir -p /tmp/icsos-$(FATWR_TAG)-iso/boot/grub /tmp/icsos-$(FATWR_TAG)-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-$(FATWR_TAG)-iso/vmdex
+	@cp apps/fatwr.exe /tmp/icsos-$(FATWR_TAG)-iso/apps/fatwr.exe
+	@printf '%s\n' 'fatwr.exe' 'reboot' > /tmp/icsos-$(FATWR_TAG)-iso/autoexec.bat
+	@printf 'set timeout=0\nmenuentry "ics" { multiboot2 /vmdex $(FATWR_CMDLINE); boot }\n' \
+		> /tmp/icsos-$(FATWR_TAG)-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-$(FATWR_TAG).iso /tmp/icsos-$(FATWR_TAG)-iso >/dev/null 2>&1
 	@echo "Formatting 512 MiB FAT16 virtio work disk..."
-	@truncate -s 512M /tmp/icsos-fatwr-work.img
-	@mkfs.vfat -F 16 -s 32 /tmp/icsos-fatwr-work.img >/dev/null
-	@echo "Running concurrent FAT write test (KVM, smp 4)..."
+	@truncate -s 512M /tmp/icsos-$(FATWR_TAG)-work.img
+	@mkfs.vfat -F 16 -s 32 /tmp/icsos-$(FATWR_TAG)-work.img >/dev/null
+	@echo "Running concurrent FAT write test (KVM, smp 4, cmdline '$(FATWR_CMDLINE)')..."
 	@-timeout 120 stdbuf -oL $(QEMU_X64) -enable-kvm -cpu host -smp 4 -nographic -no-reboot -m 256M \
-		-cdrom /tmp/icsos-fatwr.iso -boot d \
-		-drive file=/tmp/icsos-fatwr-work.img,if=none,id=vd0,format=raw \
+		-cdrom /tmp/icsos-$(FATWR_TAG).iso -boot d \
+		-drive file=/tmp/icsos-$(FATWR_TAG)-work.img,if=none,id=vd0,format=raw \
 		-device virtio-blk-pci,drive=vd0,disable-legacy=on \
-		< /dev/null > /tmp/icsos-fatwr.log 2>&1
-	@grep -aq "Root mount \[OK\]" /tmp/icsos-fatwr.log
-	@grep -aq "work: mounted" /tmp/icsos-fatwr.log
-	@grep -aq "FATWR_PASS" /tmp/icsos-fatwr.log
-	@! grep -aq "FATWR_FAIL" /tmp/icsos-fatwr.log
-	@! grep -aqE "PF64 |GPF64 " /tmp/icsos-fatwr.log
-	@echo "test-fatwrite PASS"
+		< /dev/null > /tmp/icsos-$(FATWR_TAG).log 2>&1
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-$(FATWR_TAG).log
+	@grep -aq "work: mounted" /tmp/icsos-$(FATWR_TAG).log
+	@grep -aq "FATWR_PASS" /tmp/icsos-$(FATWR_TAG).log
+	@! grep -aq "FATWR_FAIL" /tmp/icsos-$(FATWR_TAG).log
+	@! grep -aqE "PF64 |GPF64 " /tmp/icsos-$(FATWR_TAG).log
+	@echo "test-fatwrite PASS ($(FATWR_TAG))"
+
+# Same concurrent FAT writers, but under the self-host closure's cooperative
+# user scheduling ("coop-smp": user processes on APs and no timer preemption of
+# a running user tool).  Regression gate for the -j4 bootstrap deadlock where a
+# writer holding fat_volume_busy pure-spun on pc_busy: because a nested crit
+# waiter never yielded and a non-preemptible CPU could be the only one the
+# pc_busy owner was allowed to run on, no CPU ever released the inner lock.
+# The CRITHANG assertion fails for that cause even if FATWR_PASS were reached.
+test-fatwrite-coop:
+	@$(MAKE) --no-print-directory test-fatwrite FATWR_CMDLINE=coop-smp \
+		FATWR_TAG=fatwr-coop
+	@! grep -aq "CRITHANG" /tmp/icsos-fatwr-coop.log
+	@! grep -aq "WATCHDOG" /tmp/icsos-fatwr-coop.log
+	@echo "test-fatwrite-coop PASS"
 
 apps/forktest.exe: contrib/forktest/forktest.c contrib/forktest/Makefile
 	$(MAKE) -C contrib/forktest install
@@ -942,8 +1018,8 @@ test-fork: kernel/Kernel64.bin apps/forktest.exe
 	@truncate -s 64M /tmp/icsos-fork-work.img
 	@mkfs.vfat -F 16 /tmp/icsos-fork-work.img >/dev/null
 	@test $(FORK_CPUS) -ge 1 && test $(FORK_CPUS) -le 8
-	@echo "Running COW fork test (TCG, $(FORK_CPUS) vCPUs)..."
-	@status=0; timeout 70 $(QEMU_X64) -smp $(FORK_CPUS) -nographic -no-reboot -m 256M \
+	@echo "Running COW fork test (TCG $(QEMU_TCG_CPU), $(FORK_CPUS) vCPUs)..."
+	@status=0; timeout 70 $(QEMU_X64) -cpu $(QEMU_TCG_CPU) -smp $(FORK_CPUS) -nographic -no-reboot -m 256M \
 		-cdrom /tmp/icsos-fork.iso -boot d \
 		-drive file=/tmp/icsos-fork-work.img,if=none,id=vd0,format=raw \
 		-device virtio-blk-pci,drive=vd0,disable-legacy=on \
@@ -960,6 +1036,8 @@ test-fork: kernel/Kernel64.bin apps/forktest.exe
 	@grep -aq "COW_FAULT fast" /tmp/icsos-fork.log
 	@grep -aq "COW_FAULT oom-injected" /tmp/icsos-fork.log
 	@grep -aq "FORK_STRESS_PASS count=10" /tmp/icsos-fork.log
+	@grep -aq "FORK_STRADDLE_PASS depths=272" /tmp/icsos-fork.log
+	@! grep -aqE "UD64:|MF64:|IDLE-STACK-OVERFLOW" /tmp/icsos-fork.log
 	@grep -aq "FORK_PASS" /tmp/icsos-fork.log
 	@! grep -aq "FORK_FAIL\|FORK_RUN_FAIL" /tmp/icsos-fork.log
 	@! grep -aq "General Protection Fault\|DOUBLE FAULT" /tmp/icsos-fork.log

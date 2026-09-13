@@ -237,6 +237,7 @@ DWORD getlinearloc(void *linearmemory,DWORD *pagedir);
 DWORD getmultiple(void *linearmemory,DWORD *pagedir,DWORD pages);
 DWORD getpagetablephys(DWORD vaddr,DWORD *pagedir);
 DWORD getphys(DWORD vaddr,DWORD *pagedir);
+DWORD getphys64(unsigned long long vaddr, DWORD *pagedir);
 DWORD getvirtaddress(DWORD physicaladdr);
 DWORD getvirtaddress2(DWORD physicaladdr,DWORD hdl);
 void maplineartophysical(unsigned int *pagedir,unsigned int linearaddr,

@@ -1513,50 +1513,49 @@ static PCB386 *waitpid_live_child(PCB386 *parent)
 long sys_waitpid(int pid, int *status, int options)
 {
     PCB386 *me = current_process;
-    int i, wpid, wst;
+    int wpid = 0, wst = 0;
 
     if (!me)
        return -EINVAL;
+    if (pid < -1 || pid == 0)
+       return -EINVAL;
 
     for (;;) {
-       if (pid < -1)
-          return -EINVAL;
-       for (i = 0; i < me->waitq_n; i++) {
-          if (pid == -1 || me->waitq_pid[i] == pid) {
-             wpid = me->waitq_pid[i];
-             wst = me->waitq_st[i];
-             me->waitq_n--;
-             for (; i < me->waitq_n; i++) {
-                me->waitq_pid[i] = me->waitq_pid[i + 1];
-                me->waitq_st[i] = me->waitq_st[i + 1];
-             }
+       int alive;
+
+       if (waitq_reap(me, pid, &wpid, &wst)) {
+          if (status)
+             *status = wst;
+          return wpid;
+       }
+
+       /* Is it still worth waiting?  This runs without waitq_lock:
+          ps_findprocess() waits on processmgr_busy, which an exiting sibling
+          can hold across closeallfiles() and a TLB-shootdown IPI, so it must
+          never be called with interrupts masked. */
+       if (pid > 0) {
+          PCB386 *p = ps_findprocess((DWORD)pid);
+          alive = (p != (PCB386 *)-1 && p->owner == me->processid
+                   && !(p->status & PS_ATTB_THREAD));
+       } else {
+          alive = me->nlive > 0;
+       }
+
+       if (!alive) {
+          /* The child may have exited between the scan above and this check.
+             Both exit paths append the status before dequeueing the PCB, so a
+             child that is already gone has a queued status; re-scan before
+             reporting ECHILD.  Skipping this re-scan is what made gccdriver
+             print "waitpid /work/apps/as.exe failed" under make -j4. */
+          __sync_synchronize();
+          if (waitq_reap(me, pid, &wpid, &wst)) {
              if (status)
                 *status = wst;
              return wpid;
-           }
-       }
-       if (pid == 0)
-          return -EINVAL;
-       if (pid > 0) {
-          PCB386 *p = ps_findprocess((DWORD)pid);
-          if (p == (PCB386 *)-1 || p->owner != me->processid
-              || (p->status & PS_ATTB_THREAD)) {
-             if (options & WNOHANG)
-                return -ECHILD;
-             return -ECHILD;
           }
-          if (options & WNOHANG) {
-             taskswitch();
-             return 0;
-          }
-          sched_block_process(me, ticks + 20);
-          taskswitch();
-          sched_wake_process(me);
-          continue;
-       }
-       /* pid == -1 */
-       if (me->nlive <= 0 && me->waitq_n == 0)
           return -ECHILD;
+       }
+
        if (options & WNOHANG) {
           taskswitch();
           return 0;

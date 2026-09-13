@@ -40,6 +40,7 @@ static sync_sharedvar vfs_mount_busy;
 //Prototype of some functions
 vfs_node *vfs_searchname(const char *name);
 int file_ok(file_PCB* fhandle); //validates a file handle
+static int file_ok_locked(file_PCB* fhandle);
 char *showpath(char *s);
 char *getfullpath(vfs_node *node, char *s);
 
@@ -114,16 +115,24 @@ int vfs_directread(char *buf,int itemsize,int noitems,file_PCB* fhandle)
     char temp[200];
     if (fhandle!=0)
     {
-        if (file_ok(fhandle)) //validate this handle
+        /* Hold vfs_busy across the FAT I/O. file_ok() used to acquire and
+           drop it before fat_lock_volume(); a writer could then sit in
+           fat_wait_io() holding only the volume lock while another task
+           took vfs_busy and waited for FAT -- AB-BA deadlock under -j4. */
+        sync_entercrit(&vfs_busy);
+        if (file_ok_locked(fhandle))
         {
             int fs_deviceid;
-            DWORD start=ftell(fhandle);
+            DWORD start=fhandle->ptrlow;
             
             /*reached the end of the file?
               obtain the filesystem to use*/
               
             fs_deviceid = fhandle->ptr->fsid;
-            if (fs_deviceid==-1) return 0;
+            if (fs_deviceid==-1) {
+                sync_leavecrit(&vfs_busy);
+                return 0;
+            }
 
             if (fhandle->ptrlow+size>=fhandle->ptr->size)
             {
@@ -137,7 +146,10 @@ int vfs_directread(char *buf,int itemsize,int noitems,file_PCB* fhandle)
                 fhandle->ptrlow+=size;
             };
             
-            if (read==0) return 0;
+            if (read==0) {
+                sync_leavecrit(&vfs_busy);
+                return 0;
+            }
 
             fs=(devmgr_fs_desc*)devmgr_devlist[fs_deviceid];
 
@@ -145,11 +157,15 @@ int vfs_directread(char *buf,int itemsize,int noitems,file_PCB* fhandle)
             if (fs->readfile!=0)
                 bridges_call(fs,&fs->readfile,fhandle->ptr,buf,
                        start,start+read-1,fhandle->ptr->memid);         
-            else
+            else {
+                sync_leavecrit(&vfs_busy);
                 return 0;
+            }
 
+            sync_leavecrit(&vfs_busy);
             return read;
         };
+        sync_leavecrit(&vfs_busy);
         return 0;
     }; 
     return 0;
@@ -166,14 +182,18 @@ int vfs_directwrite(char *buf, int itemsize, int n, file_PCB* fhandle)
     devmgr_fs_desc *fs;
     int bytes_per_allocation_unit=0;    
 
-    if (fhandle!=0)
-        if (file_ok(fhandle))
+    if (fhandle!=0) {
+        sync_entercrit(&vfs_busy);
+        if (file_ok_locked(fhandle))
         {
             int fs_deviceid = 0;   
-            DWORD start = ftell(fhandle);
+            DWORD start = fhandle->ptrlow;
 
             fs_deviceid = fhandle->ptr->fsid;
-            if (fs_deviceid==-1) return 0;
+            if (fs_deviceid==-1) {
+                sync_leavecrit(&vfs_busy);
+                return 0;
+            }
             fs=(devmgr_fs_desc*)devmgr_getdevice(fs_deviceid);
             //if required
             if (start+size>=fhandle->ptr->size)
@@ -184,8 +204,10 @@ int vfs_directwrite(char *buf, int itemsize, int n, file_PCB* fhandle)
                 //determine the smallest allocation unit that this filesystem supports
                 //and check if we need more blocks
                 bytes_per_allocation_unit = bridges_call(fs,&fs->getbytesperblock,fhandle->ptr->memid);
-                if (bytes_per_allocation_unit == 0)
+                if (bytes_per_allocation_unit == 0) {
+                    sync_leavecrit(&vfs_busy);
                     return 0;
+                }
                 totalblocks=vfs_units_covering(fhandle->ptr->size,
                                                (unsigned int)bytes_per_allocation_unit);
                 neededblocks=vfs_units_covering(start+size,
@@ -200,10 +222,15 @@ int vfs_directwrite(char *buf, int itemsize, int n, file_PCB* fhandle)
                     {
                         int res = bridges_call(fs,&fs->addsectors,fhandle->ptr,
                                neededblocks-totalblocks,fhandle->ptr->memid); 
-                        if (res == -1) return 0;
+                        if (res == -1) {
+                            sync_leavecrit(&vfs_busy);
+                            return 0;
+                        }
                     }
-                    else
-                        return 0; //filesystem does not support add sectors    
+                    else {
+                        sync_leavecrit(&vfs_busy);
+                        return 0; //filesystem does not support add sectors
+                    }
                 };
 
             };
@@ -213,8 +240,10 @@ int vfs_directwrite(char *buf, int itemsize, int n, file_PCB* fhandle)
             if (fs->writefile!=0)
                 bridges_call(fs,&fs->writefile,fhandle->ptr,buf,start,
                                      start + size - 1,fhandle->ptr->memid);         
-            else
-                return 0; //filesystem does not support writes   
+            else {
+                sync_leavecrit(&vfs_busy);
+                return 0; //filesystem does not support writes
+            }
 
             //update filesize if necessary                               
             if (fhandle->ptrlow+size>=fhandle->ptr->size)
@@ -234,8 +263,11 @@ int vfs_directwrite(char *buf, int itemsize, int n, file_PCB* fhandle)
                 write=size;
                 fhandle->ptrlow+=size;
             };
+            sync_leavecrit(&vfs_busy);
             return write;
         };
+        sync_leavecrit(&vfs_busy);
+    }
     return 0;
 };
 
@@ -898,7 +930,13 @@ static int file_ok_locked(file_PCB* fhandle)
 int file_ok(file_PCB* fhandle)
 {
     int retval;
+
     if (fhandle==0) return 0;
+    /* Do not acquire when THIS process already entered vfs_busy.  The
+       nest is on the PCB: a per-CPU nest survived fat_wait_io() yield
+       and let the next process skip/leave the previous hold. */
+    if (sync_cpu_holds(&vfs_busy))
+        return file_ok_locked(fhandle);
     sync_entercrit(&vfs_busy);
     retval = file_ok_locked(fhandle);
     sync_leavecrit(&vfs_busy);
@@ -1448,12 +1486,22 @@ int vfs_deletefile(vfs_node *ptr)
     devmgr_fs_desc *fs;
     int fs_deviceid=0, ret;
 
-    if (ptr->locked) return -1; //file is open, cannot delete
-    if (!vfs_removenode(ptr)) return -1;
+    sync_entercrit(&vfs_busy);
+    if (ptr->locked) {
+        sync_leavecrit(&vfs_busy);
+        return -1; //file is open, cannot delete
+    }
+    if (!vfs_removenode(ptr)) {
+        sync_leavecrit(&vfs_busy);
+        return -1;
+    }
 
     //Determine device ID of the filesystem to use
     fs_deviceid = ptr->fsid;
-    if (fs_deviceid==-1) return 0;
+    if (fs_deviceid==-1) {
+        sync_leavecrit(&vfs_busy);
+        return 0;
+    }
 
     fs=(devmgr_fs_desc*)devmgr_getdevice(fs_deviceid);
 
@@ -1467,6 +1515,7 @@ int vfs_deletefile(vfs_node *ptr)
         ret = -1;
 
     free(ptr);
+    sync_leavecrit(&vfs_busy);
     return ret;
 };
 
@@ -1636,11 +1685,19 @@ int mkdir(const char *name)
     devmgr_fs_desc *fs;
     char path[255],dirname[255],fname[255];
 
+    /* vfs_searchname may fat_mountdirectory(); createfile takes the volume
+       lock. Hold vfs_busy first so this cannot invert against a reader/writer
+       that already holds FAT and then calls file_ok()/openfilex(). */
+    sync_entercrit(&vfs_busy);
+
     //Determine the directory vfs node to place the new diretory
     node=vfs_searchname(name);
 
     //If node is nonzero, a file or directory with <name> already exists
-    if (node!=0) return -1;
+    if (node!=0) {
+        sync_leavecrit(&vfs_busy);
+        return -1;
+    }
 
     //since name is a constant we copy its contents to a temporary variable "path"
     strcpy(path,name);
@@ -1655,6 +1712,7 @@ int mkdir(const char *name)
     if (destdir==0)
     {
         printf("error locating directory!\n");
+        sync_leavecrit(&vfs_busy);
         return -1;
     };
 
@@ -1664,7 +1722,10 @@ int mkdir(const char *name)
 
     //determine the filesystem driver to use
     fs_deviceid = destdir->fsid;
-    if (fs_deviceid==-1) return -1;
+    if (fs_deviceid==-1) {
+        sync_leavecrit(&vfs_busy);
+        return -1;
+    }
 
 
     //allocate a new vfs node for this directory
@@ -1704,6 +1765,7 @@ int mkdir(const char *name)
         free(node);
     };
 
+    sync_leavecrit(&vfs_busy);
     return retval;
 };
 

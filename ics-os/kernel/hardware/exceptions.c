@@ -52,24 +52,29 @@ void wrapper_call_trap(unsigned long retaddr, unsigned long cs, unsigned long rf
   }
 }
 
+static void exc_kstack_report(const char *tag, unsigned long frsp,
+                              unsigned long rip, unsigned long rbp);
+
 void GPFhandler64(struct gpf_info *fi, unsigned long saved_rax, unsigned long saved_rcx)
   {
-    static volatile int gpf_busy = 0;
+    static volatile int gpf_busy[MAX_CPUS];
     unsigned int err = fi->err;
     const char *what = "unknown";
+    int cpu = smp_cpu_id();
 
-   if (gpf_busy) {
+   if (gpf_busy[cpu]) {
         serial_puts("GPF64: re-entered -> halt\n");
         while (1) {}
     }
-    gpf_busy = 1;
+    gpf_busy[cpu] = 1;
 
     if (err & 2)
         what = (err & 1) ? "reserved-bit" : "segment-not-present";
     else if (err & 4)
         what = (err & 1) ? "TSS-invalid" : (err & 2) ? "stack" : "TSS-bad";
     else
-        what = (err & 1) ? "base/limit" : "segment-index";
+        what = (err == 0) ? "noncanonical-or-other" :
+               ((err & 1) ? "base/limit" : "segment-index");
 
     /* Keep the #GP path small.  The previous register dump and gpf_probe_store()
        ran while the faulting context was still live and could itself fault,
@@ -87,6 +92,14 @@ void GPFhandler64(struct gpf_info *fi, unsigned long saved_rax, unsigned long sa
                  (unsigned long long)fi->cr3,
                  current_process ? current_process->name : "?");
            serial_puts(line);
+           /* Any RIP outside plausible user text -- kernel text, kernel BSS,
+              or the kernel heap -- means a corrupted return address or a wild
+              indirect call.  Report the stack it happened on before we kill or
+              halt, otherwise the evidence dies with the process. */
+           if (!(fi->rip >= (unsigned long long)MEM_USER_ELF_BASE
+                 && fi->rip < (unsigned long long)MEM_KHEAP_BASE))
+              exc_kstack_report("GPF64", (unsigned long)fi->rsp,
+                                (unsigned long)fi->rip, 0);
         }
     }
     (void)saved_rax;
@@ -96,18 +109,34 @@ void GPFhandler64(struct gpf_info *fi, unsigned long saved_rax, unsigned long sa
         ap_work (pid 16) as user processes and called exc_recover() -> exit(1),
         killing the thread while it held ready_lock and wedging every CPU.
         Only true user processes (ACCESS_USER) may be killed-and-resumed. */
-     if (current_process && current_process->accesslevel == ACCESS_USER) {
+#ifdef __x86_64__
+     {
+        PCB386 *owner = ps_find_by_cr3((unsigned long)fi->cr3);
+        if (owner && owner->accesslevel == ACCESS_USER &&
+            owner != current_process &&
+            cpu >= 0 && cpu < MAX_CPUS)
+           cpus[cpu].current = owner;
+     }
+#endif
+     if (current_process && current_process->accesslevel == ACCESS_USER
+         && (fi->rip < 0x100000ULL
+             || fi->rip >= (unsigned long long)MEM_USER_ELF_BASE)) {
           /* User-process fault: recover like the page-fault path. exc_recover()
              sets dex32_child_faulted and calls exit(1), which kills the faulted
              child and context-switches to its parent, abandoning this wrapper's
              stack frame (the gpfwrapper iretq is never reached). The parent's
              waitpid then sees the crash instead of the child spinning. */
           serial_puts("\nGPF64: user fault -> killing process, resuming parent\n");
-         gpf_busy = 0;   /* allow a later fault (e.g. the fallback run) to dump */
+         gpf_busy[cpu] = 0;   /* allow a later fault (e.g. the fallback run) to dump */
          exc_recover();
          /* not reached: exc_recover() -> exit(1) switched away */
       }
 
+    gpf_busy[cpu] = 0;
+    if (current_process && current_process->accesslevel == ACCESS_USER) {
+       serial_puts("\nGPF64: kernel RIP -> killing user process\n");
+       exc_recover();
+    }
     serial_puts("\nGPF64: kernel fault -> halt\n");
     while (1) {}
   };
@@ -288,6 +317,86 @@ void exc_showdump(DWORD location,int type,DWORD pf_info)
    
 };
 
+/* Bounded kernel-stack report for a fault taken with a kernel RIP.  A smashed
+   return address on the per-process IRQ kstack shows up as a RIP outside the
+   kernel text (BSS / heap), and without the stack window there is no way to
+   tell an overflow from a shared or stale kstack.  Prints the kstack bounds,
+   the nesting depth, and every kernel-text-looking qword near the fault RSP.
+   Reads are guarded by the caller's pf_busy latch; a nested fault here is
+   dropped by the nested path rather than recursing. */
+/* Which process owns the IRQ kstack containing `addr`?  A kernel RIP or RSP
+   that lands in some OTHER process's kstack is the signature of two contexts
+   sharing one stack, which is indistinguishable from generic heap corruption
+   without this lookup. */
+static int exc_kstack_owner(unsigned long addr, unsigned long *base_out)
+{
+#ifdef __x86_64__
+    PCB386 *head = sched_gethead();
+    PCB386 *p = head;
+
+    if (!head || !addr)
+       return -1;
+    do {
+       unsigned long b = (unsigned long)(uintptr)p->kstack_base;
+       if (b && addr >= b && addr < (unsigned long)p->kstack_top) {
+          if (base_out)
+             *base_out = b;
+          return (int)p->processid;
+       }
+       p = p->next;
+    } while (p && p->before && p != head);
+#endif
+    (void)addr; (void)base_out;
+    return -1;
+}
+
+static void exc_kstack_report(const char *tag, unsigned long frsp,
+                              unsigned long rip, unsigned long rbp)
+{
+    char line[256];
+    unsigned long base = 0, top = 0, obase = 0, uframe = 0;
+    int inside = 0;
+    unsigned long i;
+
+    if (current_process) {
+#ifdef __x86_64__
+       base = (unsigned long)(uintptr)current_process->kstack_base;
+       top = (unsigned long)current_process->kstack_top;
+       uframe = (unsigned long)current_process->irq_user_rsp;
+#endif
+       inside = (base && frsp >= base && frsp < top);
+    }
+    sprintf(line,
+            "%s-KSTACK rip=0x%lx frsp=0x%lx rsp&15=%lu rbp=0x%lx rbp&7=%lu "
+            "base=0x%lx top=0x%lx used=%ld uframe=0x%lx inside=%d pid=%d\n",
+            tag, rip, frsp, frsp & 15UL, rbp, rbp & 7UL, base, top,
+            inside ? (long)(top - frsp) : -1L, uframe, inside,
+            current_process ? (int)current_process->processid : -1);
+    serial_puts(line);
+
+    /* Name the owner of whatever kstack the fault RSP and RIP fell into. */
+    {
+       int rsp_owner = exc_kstack_owner(frsp, &obase);
+       int rip_owner = exc_kstack_owner(rip, 0);
+       sprintf(line, "%s-KOWNER rsp_owner=%d rsp_base=0x%lx rip_owner=%d\n",
+               tag, rsp_owner, obase, rip_owner);
+       serial_puts(line);
+    }
+
+    /* Only walk a stack we can prove is mapped kernel memory. */
+    if (!(frsp >= MEM_KHEAP_BASE && frsp < MEM_KHEAP_END)
+        && !(frsp >= MEM_KERNEL_LOAD && frsp < MEM_KERNEL_LIMIT))
+       return;
+    for (i = 0; i < 24; i++) {
+       unsigned long slot = frsp + i * 8;
+       if (slot + 8 >= MEM_KHEAP_END)
+          break;
+       sprintf(line, "%s-KRAW +%lu 0x%lx\n", tag, i * 8,
+               *(volatile unsigned long *)slot);
+       serial_puts(line);
+    }
+}
+
 /* Global demand-paging diagnostics (PF64-DIAG). Exposed via the 'pf64stats'
    console / shell2 command for live introspection without a reboot. */
 static volatile unsigned long pf64_demand_total = 0;
@@ -317,14 +426,41 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
     static volatile int pf_busy[MAX_CPUS];
     int fault_cpu=smp_cpu_id();
     int nested = pf_busy[fault_cpu];
+    int kernel_rip = (rip >= 0x100000UL &&
+                      rip < (unsigned long)MEM_USER_ELF_BASE);
+    PCB386 *fault_proc;
+    unsigned long fault_cr3 = 0;
     pf_busy[fault_cpu] = 1;
      stopints();
      pfoccured=1;//set the pfoccured register of the task scheduler
      pf64_rip = rip;
      pf64_cr2 = location;
+#ifdef __x86_64__
+     __asm__ __volatile__("movq %%cr3, %0" : "=r"(fault_cr3));
+     fault_proc = ps_find_by_cr3(fault_cr3);
+     if (!fault_proc)
+        fault_proc = current_process;
+     if (fault_proc && fault_proc != current_process &&
+         (pf64_print_cnt < 16)) {
+        char sl[96];
+        sprintf(sl, "PF64-STALE-CURRENT cur=%d cr3pid=%d cr3=0x%lx\n",
+                current_process ? (int)current_process->processid : -1,
+                (int)fault_proc->processid, fault_cr3);
+        serial_puts(sl);
+     }
+#else
+     fault_proc = current_process;
+#endif
     if (nested) {
-       serial_puts("PF64: re-entered -> halt\n");
-       while (1) {}
+       /* serial_puts from this handler previously re-entered uart_putc_raw
+          and halted the cert CPU.  Do not print.  Kernel RIP: drop the
+          nested frame so the outer handler can unwind; user RIP: kill. */
+       pf_busy[fault_cpu] = 0;
+       if (!kernel_rip && current_process &&
+           current_process->accesslevel == ACCESS_USER) {
+          exc_recover();
+       }
+       return 0;
     }
     if (!current_process || !(DWORD)(uintptr)current_process->pagedirloc) {
        serial_puts("PF64: bad current_process/pagedirloc -> halt\n");
@@ -357,12 +493,14 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
                   saved_regs[11], saved_regs[10], saved_regs[9],
                   saved_regs[8], frsp);
           serial_puts(line);
+          if (kernel_rip)
+             exc_kstack_report("PF64", frsp, rip, saved_regs[8]);
       }
 
 #ifdef __x86_64__
     {
        int cow_result=userpd_handle_cow(
-         (u64 *)(uintptr)current_process->pagedirloc,
+         (u64 *)(uintptr)fault_proc->pagedirloc,
          (unsigned long long)location,(unsigned)fault_info);
       if (cow_result>0) {
          pf_busy[fault_cpu]=0;
@@ -375,14 +513,14 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
          while (1) {}
       }
    }
-   mm=getphys(location,current_process->pagedirloc);
+   mm=getphys64((unsigned long long)location,fault_proc->pagedirloc);
    /* Not present: first try to restore a missing kernel identity page.
        userpd_create() zeroes most 2MiB identity blocks in the private PD0,
        but kernel code can still run under the user CR3 and reference low
        identity addresses.  Mapping a fresh zero frame for those addresses
        silently corrupts kernel state, so map VA==PA for kernel RIPs. */
     if ((mm & PG_PRESENT) == 0) {
-       DWORD *pd = (DWORD *)(uintptr)current_process->pagedirloc;
+       DWORD *pd = (DWORD *)(uintptr)fault_proc->pagedirloc;
        if (pd && pd != pagedir1
            && rip < (unsigned long)MEM_USER_ELF_BASE
            && (unsigned long long)location < 0x40000000ULL) {
@@ -394,8 +532,8 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
           }
        }
        if (pd && pd != pagedir1
-           && (unsigned)location >= (unsigned)MEM_USER_ELF_BASE
-            && (unsigned)location < (unsigned)MEM_USER_WIN_END) {
+           && (unsigned long long)location >= (unsigned long long)MEM_USER_ELF_BASE
+            && (unsigned long long)location < (unsigned long long)MEM_USER_WIN_END) {
            /* Round-4 self-host diagnostics: classify a not-present user-window
               fault against the committed heap (knext) and catch runaway
               demand-paging loops that would otherwise hang the guest silently.
@@ -404,8 +542,8 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
            {
               static volatile unsigned long pdemand_cnt = 0;
               static volatile void *pdemand_proc = 0;
-              unsigned long loc   = (unsigned long)(unsigned)location;
-              unsigned long knext = (unsigned long)(uintptr)current_process->knext;
+              unsigned long loc   = (unsigned long)location;
+              unsigned long knext = (unsigned long)(uintptr)fault_proc->knext;
               const char *cls;
               if (loc < (unsigned)MEM_USER_HEAP)        cls = "elf-region";
                else if (loc < knext)                     cls = "committed-heap";
@@ -414,14 +552,14 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
                if (cls == "elf-region")       pf64_elf_region++;
                else if (cls == "committed-heap") pf64_committed_heap++;
                else                            pf64_past_brk++;
-               if (pdemand_proc == (void *)(uintptr)current_process)
+               if (pdemand_proc == (void *)(uintptr)fault_proc)
                  pdemand_cnt++;
-              else { pdemand_proc = (void *)(uintptr)current_process; pdemand_cnt = 1; }
+              else { pdemand_proc = (void *)(uintptr)fault_proc; pdemand_cnt = 1; }
               if (pdemand_cnt <= 8 || (pdemand_cnt & 0x3f) == 0) {
                   char line[256];
                   sprintf(line,
                     "PF64-DIAG %s n=%lu cls=%s loc=0x%lx knext=0x%lx rip=0x%lx\n",
-                    current_process->name ? current_process->name : "?",
+                    fault_proc->name ? fault_proc->name : "?",
                     (unsigned long)pdemand_cnt, cls, loc, knext, rip);
                   serial_puts(line);
                }
@@ -434,23 +572,36 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
               the faulting context may already have a bad stack, and the dump
               path has previously turned a user fault into a nested PF64. */
            pf_busy[fault_cpu] = 0;
-           exc_recover();
-           while (1) {}
+           if (fault_proc->accesslevel == ACCESS_USER) {
+              if (fault_proc != current_process &&
+                  fault_cpu >= 0 && fault_cpu < MAX_CPUS)
+                 cpus[fault_cpu].current = fault_proc;
+              serial_puts("PF64: user not-present -> killing process\n");
+              exc_recover();
+           }
+           serial_puts("PF64: not-present ACCESS_SYS -> ignored\n");
+           return 0;
        }
        {
           char line[180];
           sprintf(line,
-                  "PF64: not-present cr2=0x%x rip=0x%lx err=0x%x proc=%s mm=0x%x\n",
-                  (unsigned)location, rip, (unsigned)fault_info,
-                  current_process->name ? current_process->name : "?",
+                  "PF64: not-present cr2=0x%lx rip=0x%lx err=0x%x proc=%s mm=0x%x\n",
+                  (unsigned long)location, rip, (unsigned)fault_info,
+                  fault_proc->name ? fault_proc->name : "?",
                   (unsigned)mm);
           serial_puts(line);
        }
        pf_busy[fault_cpu] = 0;
-       exc_recover();
-       while (1) {}
+       if (fault_proc->accesslevel == ACCESS_USER) {
+          if (fault_proc != current_process &&
+              fault_cpu >= 0 && fault_cpu < MAX_CPUS)
+             cpus[fault_cpu].current = fault_proc;
+          serial_puts("PF64: user not-present -> killing process\n");
+          exc_recover();
+       }
+       serial_puts("PF64: not-present ACCESS_SYS -> ignored\n");
+       return 0;
     }
-   pf_busy[fault_cpu] = 0;
 #else
    (void)rip;
    mm=getphys(location,current_process->pagedirloc);
@@ -477,6 +628,8 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
              //Finished allocation, let the task scheduler take over
              setattb(PF_TSS,0x89); //reset the TSS attribute
              taskswitch();
+             pf_busy[fault_cpu] = 0;
+             return 0;
         ;};
    
    // a copy-on-write page has been written to, we therefore duplicate this page
@@ -509,15 +662,45 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
                 #endif
                 
                 setattb(PF_TSS,0x89); //reset the TSS attribute
-                taskswitch();                
+                taskswitch();
+#ifdef __x86_64__
+                pf_busy[fault_cpu] = 0;
+                return 0;
+#endif
         };
-   //show register dump and other important information
-   exc_showdump(location,PAGE_FAULT,mm);        
-   //Try to recover from the fault
+#ifdef __x86_64__
+   /* Present PTE but CPU still faulted (TLB/private-PD mismatch, or a
+      write to a mapped stack hole).  Never halt the CPU: that wedged the
+      SMP=4 cert after make.exe PF64 rip in the user stack.  getphys() used
+      to truncate CR2 to 32 bits so an execute at 0xb000000000 looked like
+      a present page at 0. */
+   pf_busy[fault_cpu] = 0;
+   if (!kernel_rip) {
+      if (fault_proc && fault_proc->accesslevel == ACCESS_USER) {
+         if (fault_proc != current_process &&
+             fault_cpu >= 0 && fault_cpu < MAX_CPUS)
+            cpus[fault_cpu].current = fault_proc;
+         serial_puts("PF64: user unhandled -> killing process\n");
+         exc_recover();
+      }
+      serial_puts("PF64: user RIP with stale current -> ignored\n");
+      return 0;
+   }
+   if (fault_proc && fault_proc->accesslevel == ACCESS_USER) {
+      serial_puts("PF64: kernel unhandled -> killing user\n");
+      if (fault_proc != current_process &&
+          fault_cpu >= 0 && fault_cpu < MAX_CPUS)
+         cpus[fault_cpu].current = fault_proc;
+      exc_recover();
+   }
+   serial_puts("PF64: kernel unhandled (ignored)\n");
+   return 0;
+#else
+   exc_showdump(location,PAGE_FAULT,mm);
    exc_recover();
-    
    while (1) {};
    startints();
+#endif
   };
 
   

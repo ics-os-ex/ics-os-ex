@@ -182,6 +182,18 @@ int main(void)
    }
    printf("VFS_CREATE_UNLOCK_PASS\n");
 
+   /* Regression: make echoes long `ar rcs` lines through printf(). A 1024-byte
+      stack vsprintf used to smash the return address (#GP on ret). */
+   {
+      char longbuf[2048];
+      int i;
+      for (i = 0; i < (int)sizeof(longbuf) - 1; i++)
+         longbuf[i] = (char)('A' + (i % 26));
+      longbuf[sizeof(longbuf) - 1] = 0;
+      printf("%s\n", longbuf);
+      printf("POSIXIO_PRINTF_LONG_OK\n");
+   }
+
    printf("POSIXIO_PASS\n");
    printf("URING_PASS\n");
    return 0;

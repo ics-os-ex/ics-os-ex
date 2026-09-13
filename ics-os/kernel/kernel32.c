@@ -644,8 +644,20 @@ process_init();    //defined in process.c
           printf("deferred for self-host kexec");
        else {
           extern volatile int user_procs_smp;
-          if (strcmp(kernel_cmdline, "selfhost-stage1-parallel") == 0)
+          extern volatile int selfhost_cooperative_ready;
+          extern volatile int sched_coop_user_force;
+          if (strcmp(kernel_cmdline, "selfhost-stage1-parallel") == 0 ||
+              strcmp(kernel_cmdline, "user-smp") == 0 ||
+              strcmp(kernel_cmdline, "coop-smp") == 0) {
              user_procs_smp = 1;
+             if (strcmp(kernel_cmdline, "user-smp") == 0 ||
+                 strcmp(kernel_cmdline, "coop-smp") == 0)
+                selfhost_cooperative_ready = 1;
+             /* "coop-smp" additionally reproduces the stage-1 closure's
+                cooperative user scheduling for QA without kexec. */
+             if (strcmp(kernel_cmdline, "coop-smp") == 0)
+                sched_coop_user_force = 1;
+          }
           smp_start_aps();
        }
        printf("[OK]\n");

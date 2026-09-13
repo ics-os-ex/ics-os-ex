@@ -9,6 +9,7 @@ Related designs:
 - [Concurrent VFS, device, and async-I/O plan](io-subsystem-modernization-plan.md)
 - [Device-driver subsystem architecture](device-driver-subsystem-architecture.md)
 - [GCC self-host certification](gcc-selfhost.md)
+- [SMP debugging hardness and architecture](smp-debugging-hardness.md)
 
 ## 1. Executive assessment
 
@@ -168,7 +169,7 @@ timeouts, crashes, skips, and artifacts.
 | Strict closure | `test-selfhost-cert` | Intended GCC rebuild, rebuilt Make, provenance, kernel rebuild, kexec, and capability loop | Eight-hour timeout, one vCPU, hard-coded object count, and strict closure not yet a consistently green release gate |
 | Optional TinyCC | `test-selfhost`, `test-tccboot`, `test-tcc-kbuild`, `test-tcc-fullhost`, `test-fullhost` aliasing GCC path | Bootstrap experiments and compatibility | Must remain non-blocking for the supported GCC policy |
 | Aggregate | `test-integration` | Runs boot, SMP, and exec | Its name overstates scope: it excludes storage, POSIX, devices, tools, GCC, and self-hosting |
-| Host unit tests | `test-io-unit`, `test-partition-unit`, `test-gpt-unit`, `test-klog-unit`, `test-fatchain-unit` | Pure-logic verification off-target: I/O cache/device lifecycle and DMAR, IEEE CRC-32 and ATA LBA28/LBA48 decode, GPT detection/parsing/CRC, kernel-log ring semantics (init/append/wrap/truncate/clear), and the bounded fail-closed FAT cluster-chain walk | Host-only; no in-kernel or guest execution, no coverage gate |
+| Host unit tests | `test-io-unit`, `test-partition-unit`, `test-gpt-unit`, `test-klog-unit`, `test-fatchain-unit`, `test-smpclaim-unit` | Pure-logic verification off-target: I/O cache/device lifecycle and DMAR, IEEE CRC-32 and ATA LBA28/LBA48 decode, GPT detection/parsing/CRC, kernel-log ring semantics (init/append/wrap/truncate/clear), the bounded fail-closed FAT cluster-chain walk, and the SMP claim / `irq_kstack_dest` predicate (process kstack top only from the user stack; original cause of cert `PF64 rip=0x100000001000`) | Host-only; no in-kernel or guest execution, no coverage gate |
 
 ### 2.3 Strengths to preserve
 

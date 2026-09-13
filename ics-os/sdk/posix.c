@@ -1085,14 +1085,34 @@ int fprintf(FILE *f, const char *fmt, ...)
 
 int vfprintf(FILE *f, const char *fmt, va_list ap)
 {
-   char buf[4096];
-   int n = vsprintf(buf, fmt, ap);
-   if (n < 0) return n;
-   if (f == stdout || f == stderr) {
-      printf("%s", buf);
+   char buf[1024];
+   int n;
+   va_list ap2;
+   char *big;
+
+   if (f == stdout || f == stderr)
+      return vprintf(fmt, ap);
+
+   va_copy(ap2, ap);
+   n = vsnprintf(buf, sizeof(buf), fmt, ap);
+   if (n < 0) {
+      va_end(ap2);
       return n;
    }
-   return fwrite(buf, 1, n, f);
+   if ((size_t)n < sizeof(buf)) {
+      va_end(ap2);
+      return (int)fwrite(buf, 1, (size_t)n, f);
+   }
+   big = (char *)malloc((size_t)n + 1);
+   if (!big) {
+      va_end(ap2);
+      return -1;
+   }
+   vsnprintf(big, (size_t)n + 1, fmt, ap2);
+   va_end(ap2);
+   n = (int)fwrite(big, 1, (size_t)n, f);
+   free(big);
+   return n;
 }
 
 int snprintf(char *buf, size_t n, const char *fmt, ...)
@@ -1102,21 +1122,6 @@ int snprintf(char *buf, size_t n, const char *fmt, ...)
    va_start(ap, fmt);
    r = vsnprintf(buf, n, fmt, ap);
    va_end(ap);
-   return r;
-}
-
-int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap)
-{
-   char tmp[4096];
-   int r = vsprintf(tmp, fmt, ap);
-   if (!buf || n == 0) return r;
-   if (r < 0) return r;
-   if ((size_t)r >= n) {
-      memcpy(buf, tmp, n - 1);
-      buf[n - 1] = 0;
-   } else {
-      memcpy(buf, tmp, (size_t)r + 1);
-   }
    return r;
 }
 

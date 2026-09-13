@@ -22,6 +22,14 @@ typedef struct cpu_local {
 
 extern cpu_local cpus[MAX_CPUS];
 extern int cpu_count;
+extern int smp_have_rdtscp;
+/* Per-CPU IRQ stack (MEM_CPUIRQ_*).  FOREIGN user IRQs land here so
+   kernel C never runs on another CPU's user stack or process kstack.
+   ACCESS_SYS stays on its own stack (continuation across context_switch).
+   Nested IRQs must not reset RSP to the top. */
+extern u64 irq_safe_stack_top[MAX_CPUS];
+extern u64 irq_safe_stack_base[MAX_CPUS];
+void smp_gs_publish(int id);
 extern spinlock_t sched_lock;
 
 void smp_init(void);

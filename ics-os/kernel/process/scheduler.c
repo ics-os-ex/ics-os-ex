@@ -42,6 +42,50 @@ void sched_wake_process(PCB386 *process)
    spin_unlock_irqrestore(&ready_lock,flags);
 }
 
+/* Scheduling priority to compare tasks by.  A task spinning in sync_entercrit
+   for a crit it does not hold performs no work, and the owner it waits for may
+   be a lower-priority task that can only run on this CPU: user processes get
+   priority 1 (see process.c) while kernel threads such as disk_mgr keep 0, so a
+   spinning user process would win every pass 1 and the holder would never be
+   selected.  That is a hard priority inversion -- it wedged the -j4 self-host
+   bootstrap with mkdir.exe spinning on pc_busy held by the BSP-pinned disk_mgr.
+   Ranking a waiter at the floor lets any other runnable task, including the
+   holder, win; when the waiter is the only candidate it is still selected. */
+static int sched_eff_prio(PCB386 *ptr) {
+   if (ptr->crit_wait)
+      return 0;
+   return (int)ptr->priority;
+}
+
+/* A PCB the ready walk may safely dereference.  Nodes live in the kernel heap
+   or are static kernel objects (sPCB, the per-CPU idle tasks), and their ring
+   links must round-trip.  A node that fails this was freed while still linked,
+   or the ring was torn by a dequeue that could not unlink cleanly; walking it
+   dereferences recycled or unmapped memory and #GP'd inside this very function
+   during fork churn.  Skipping the rest of the walk costs at most one tick of
+   scheduling; RLBAD above still reports the corruption. */
+static int sched_node_ok(PCB386 *p) {
+   uintptr a = (uintptr)p;
+   uintptr n, b;
+
+   if (!(a >= MEM_KERNEL_LOAD && a < MEM_KERNEL_LIMIT)
+       && !(a >= MEM_KHEAP_BASE && a < MEM_KHEAP_END))
+      return 0;
+   n = (uintptr)p->next;
+   b = (uintptr)p->before;
+   if (!(n >= MEM_KERNEL_LOAD && n < MEM_KERNEL_LIMIT)
+       && !(n >= MEM_KHEAP_BASE && n < MEM_KHEAP_END))
+      return 0;
+   if (!(b >= MEM_KERNEL_LOAD && b < MEM_KERNEL_LIMIT)
+       && !(b >= MEM_KHEAP_BASE && b < MEM_KHEAP_END))
+      return 0;
+   if (p->next->before != p || p->before->next != p)
+      return 0;
+   if (p->status & 0xFFFF0000)
+      return 0;
+   return 1;
+}
+
 static int sched_runnable_here(PCB386 *ptr) {
    int me = smp_cpu_id();
    if (ptr->waiting)
@@ -110,6 +154,25 @@ PCB386 *scheduler(PCB386 *lastprocess){
    { DWORD fl; storeflags(&fl); stopints();
    spin_lock(&ready_lock);
 
+   /* Re-validate lastprocess under the lock.  It is the caller's idea of the
+      current task, checked above without ready_lock, so another CPU can have
+      dequeued and freed it in between; the walk below would then read recycled
+      kheap and fault (observed as RLBAD followed by a kernel #PF).  Require the
+      ring links to round-trip and fall back to the head if they do not. */
+   if (!lastprocess->next || !lastprocess->before
+       || lastprocess->next->before != lastprocess
+       || lastprocess->before->next != lastprocess) {
+      PCB386 *head = sched_phead;
+      if (head && head->next && head->before
+          && head->next->before == head && head->before->next == head) {
+         lastprocess = head;
+      } else {
+         spin_unlock(&ready_lock);
+         restoreflags(fl);
+         return lastprocess;
+      }
+   }
+
    /* Bounded ready-list integrity validator (victim-vs-source probe for the
        first-switch wild-rip corruption). Runs under ready_lock + IF=0, so any
        corruption it finds was produced OUTSIDE the lock: either by a
@@ -168,6 +231,8 @@ PCB386 *scheduler(PCB386 *lastprocess){
       int hops = 0;
       do {
          PCB386 *nx;
+         if (!sched_node_ok(ptr))
+            break;
          if ((ptr->status&PS_ATTB_BLOCKED) &&
              deadline_expired(ticks,ptr->wait_deadline)) {
             ptr->wait_deadline=0;
@@ -176,9 +241,9 @@ PCB386 *scheduler(PCB386 *lastprocess){
          if (ptr->waiting) {
             ptr->waiting--;
          } else if (sched_runnable_here(ptr)) {
-            if ((int)ptr->priority > best_prio) {
+            if (sched_eff_prio(ptr) > best_prio) {
                best = ptr;
-               best_prio = (int)ptr->priority;
+               best_prio = sched_eff_prio(ptr);
             }
          }
          nx = ptr->next;
@@ -194,8 +259,10 @@ PCB386 *scheduler(PCB386 *lastprocess){
        ptr = lastprocess->next;
        do {
           PCB386 *nx;
+          if (!sched_node_ok(ptr))
+             break;
           if (sched_runnable_here(ptr)
-              && (int)ptr->priority == best_prio) {
+              && sched_eff_prio(ptr) == best_prio) {
              best = ptr;
              break;
           }
@@ -204,9 +271,16 @@ PCB386 *scheduler(PCB386 *lastprocess){
              break;
           ptr = nx;
        } while (ptr != lastprocess->next);
-       /* Claim before unlock so another CPU cannot pick the same task. */
-       best->on_cpu = me;
     }
+
+    /* Claim before unlock so another CPU cannot pick the same task.  This must
+       be a CAS, not a store: ps_switchto() and self_exit_current() claim and
+       release on_cpu without ready_lock, so a plain store here could overwrite
+       a claim another CPU had just won and put two CPUs on one PCB -- and thus
+       on one IRQ kstack.  Losing the race just means idling this tick. */
+    if (best && best->on_cpu != me
+        && !__sync_bool_compare_and_swap(&best->on_cpu, -1, me))
+       best = 0;
 
     spin_unlock(&ready_lock);
     restoreflags(fl); }

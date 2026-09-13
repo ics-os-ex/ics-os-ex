@@ -24,8 +24,10 @@
  *  | user ELF window  |          ELF_START_ADDR; private PTEs (cc1 ~22MB)
  *  +------------------+ 0x01800000  MEM_KEXEC_STAGE
  *  | kexec staging    |          8MiB, not in mempop (kernel image < 4MiB)
- *  +------------------+ 0x02000000  MEM_KHEAP_BASE
- *  | kernel heap      |          sbrk/dlmalloc; identity; 64MiB cap
+ *  +------------------+ 0x02000000  MEM_CPUIRQ_BASE
+ *  | per-CPU IRQ stks |          256KiB reserved (32KiB * MAX_CPUS)
+ *  +------------------+ 0x02040000  MEM_KHEAP_BASE
+ *  | kernel heap      |          sbrk/dlmalloc; identity; ~64MiB cap
  *  +------------------+ 0x06000000
  *  | mempop frames    |          anonymous 4KiB pages (PF, legacy PT)
  *  +------------------+ 0x08000000  MEM_USER_WIN_BASE
@@ -46,7 +48,8 @@
  *     user ELFs start at 4MiB.  The frame pool skips the whole
  *     MEM_KERNEL_LOAD..MEM_KERNEL_LIMIT reserved range, so growing the kernel
  *     image into that gap is safe.
- *  2. Kernel stacks live in .bss (like AP stacks), not at a magic PA.
+ *  2. AP/idle stacks still live in .bss.  IRQ stacks are MEM_CPUIRQ_* so
+ *     they can be 16KiB without blowing the 4MiB kernel image cap.
  *  3. Kernel heap is a closed interval; sbrk must not mempop and must not
  *     walk past MEM_KHEAP_END.
  *  4. userpd pool must not overlap any identity range the kernel writes
@@ -89,8 +92,16 @@
 #define MEM_KEXEC_STAGE_SIZE   0x00800000UL   /* 8MiB (kernel image < 4MiB) */
 #define MEM_KEXEC_STAGE_END    (MEM_KEXEC_STAGE + MEM_KEXEC_STAGE_SIZE)
 
-#define MEM_KHEAP_BASE         0x02000000UL
-#define MEM_KHEAP_SIZE         0x04000000UL   /* 64MiB: absorbs retired kmode slot */
+/* Per-CPU IRQ stacks live here, not in kernel BSS: 16 KiB * MAX_CPUS would
+   fail the 4 MiB user-ELF ASSERT, and BSS-adjacent stacks overflowed into
+   the neighbour.  mempop skips this range. */
+#define MEM_CPUIRQ_BASE        MEM_KEXEC_STAGE_END
+#define MEM_CPUIRQ_SIZE        0x00040000UL   /* 256 KiB: 8 * 16 KiB + slack */
+#define MEM_CPUIRQ_END         (MEM_CPUIRQ_BASE + MEM_CPUIRQ_SIZE)
+#define MEM_CPUIRQ_STACK       0x8000UL       /* 32 KiB; 8 CPUs fill 256 KiB */
+
+#define MEM_KHEAP_BASE         MEM_CPUIRQ_END
+#define MEM_KHEAP_SIZE         (0x04000000UL - MEM_CPUIRQ_SIZE)
 #define MEM_KHEAP_END          (MEM_KHEAP_BASE + MEM_KHEAP_SIZE)
 
 /* Former 16MiB kmode slot is now part of the kernel heap.  MEM_KMODE_*
@@ -129,8 +140,10 @@ typedef char memlayout_kernel_below_userelf[
    (MEM_KERNEL_LIMIT == MEM_USER_ELF_BASE) ? 1 : -1];
 typedef char memlayout_kexec_after_elf[
    (MEM_KEXEC_STAGE == MEM_USER_ELF_END) ? 1 : -1];
-typedef char memlayout_heap_after_kexec[
-   (MEM_KHEAP_BASE == MEM_KEXEC_STAGE_END) ? 1 : -1];
+typedef char memlayout_cpuirq_after_kexec[
+   (MEM_CPUIRQ_BASE == MEM_KEXEC_STAGE_END) ? 1 : -1];
+typedef char memlayout_heap_after_cpuirq[
+   (MEM_KHEAP_BASE == MEM_CPUIRQ_END) ? 1 : -1];
 typedef char memlayout_kmode_after_heap[
    (MEM_KMODE_BASE == MEM_KHEAP_END) ? 1 : -1];
 typedef char memlayout_userpd_after_kmode[

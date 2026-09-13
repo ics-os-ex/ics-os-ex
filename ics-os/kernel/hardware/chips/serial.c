@@ -11,6 +11,9 @@
 
 #include "../../cpu/spinlock.h"
 
+extern void uart_com1_putc(unsigned int c);
+extern void uart_com2_putc(unsigned int c);
+
 #define SERIAL_COM1 0x3F8
 #define SERIAL_COM2 0x2F8
 
@@ -39,15 +42,22 @@ typedef struct serial_guard {
 
 extern unsigned int lapic_get_id(void);
 extern volatile unsigned int *lapic_mmio;
+extern int smp_cpu_id(void);
 
 static serial_guard uart_guard_acquire(uart_dev *u)
 {
     serial_guard guard;
-    int cpu = lapic_mmio ? (int)lapic_get_id() : 0;
+    int cpu;
     unsigned spins = 0;
 
     __asm__ __volatile__("pushfq; popq %0; cli"
                          : "=r"(guard.flags) : : "memory");
+    /* Never walk LAPIC MMIO here: ps_switchto may call serial_puts while
+       CR3 is still a user PML4, and 0xFEE00000 is not mapped there.
+       TSC_AUX / smp_cpu_id() is CR3-safe. */
+    cpu = smp_cpu_id();
+    if (cpu < 0)
+        cpu = 0;
     guard.locked = 0;
     if (u->lock.locked && u->owner == cpu)
         return guard;
@@ -73,13 +83,10 @@ static void uart_guard_release(uart_dev *u, serial_guard guard)
 
 static void uart_putc_raw(uart_dev *u, char c)
 {
-    int spins = 0;
-
-    while ((inportb(u->base + 5) & 0x20) == 0) {
-        if (++spins > 100000)
-            return;
-    }
-    outportb(u->base, (unsigned char)c);
+    if (u == &uart2)
+        uart_com2_putc((unsigned char)c);
+    else
+        uart_com1_putc((unsigned char)c);
 }
 
 static int uart_getc_raw(uart_dev *u)
@@ -139,6 +146,24 @@ void serial_puts(const char *s)
         if (*s == '\n')
             uart_putc_raw(&uart1, '\r');
         uart_putc_raw(&uart1, *s++);
+    }
+    uart_guard_release(&uart1, guard);
+};
+
+void serial_write(const char *s, int n)
+{
+    serial_guard guard;
+    int i;
+
+    if (s == 0 || n <= 0)
+        return;
+    if (!uart1.ready)
+        return;
+    guard = uart_guard_acquire(&uart1);
+    for (i = 0; i < n; i++) {
+        if (s[i] == '\n')
+            uart_putc_raw(&uart1, '\r');
+        uart_putc_raw(&uart1, s[i]);
     }
     uart_guard_release(&uart1, guard);
 };

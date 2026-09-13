@@ -32,6 +32,7 @@
 #include "../devmgr/dex32_devmgr.h"
 #include "../iomgr/iosched.h"
 #include "../vfs/vfs_core.h"
+#include "../process/process.h"
 
 //#define DEBUG_FAT12
 
@@ -39,8 +40,17 @@ extern void taskswitch(void);
 
 static void fat_wait_io(DWORD hdl)
 {
+   /* I/O wait holds fat_volume_busy (and often vfs_busy).  The scheduler
+      pins a holder with crit_wait==0, so taskswitch() would be a no-op and
+      disk_mgr would starve if every CPU was in this wait.  Rank ourselves
+      as a waiter so the owner of the block layer can run. */
+   PCB386 *p = current_process;
+   if (p)
+      p->crit_wait = 1;
    while (!dex32_IOcomplete(hdl))
       taskswitch();
+   if (p)
+      p->crit_wait = 0;
 }
 
 int fat_deviceid;

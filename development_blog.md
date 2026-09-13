@@ -1,6 +1,746 @@
 # Development blog
 
+## 2026-09-13 (Manila, UTC+8)
+
+### 11:00 — SMP=4 cert still not closed
+
+**Current problem / activity:** Latest
+`test-selfhost-cert-parallel` reached 3 `GCC_DRIVER_OK` then
+`GPF64: kernel fault -> halt`. Earlier runs: 16 objects then
+`sync_leavecrit` frame-walk GPF (fixed); `PF64-STALE-CURRENT` +
+`UD64` halt (CR3-owner recover added); make.exe killed by leftover
+current. Certification is **not** claimed. Current activity: leftover
+`current` still lets IRQs smash stacks under `make -j4`.
+
+### 10:55 — UD64/GPF recover the CR3 owner instead of halting
+
+**Current problem / activity:** Cert printed `PF64-STALE-CURRENT` then
+`UD64 rip=0x10047d` on `task_mgr`/`gcc.exe` and halted (`userfault=0`
+because leftover current was ACCESS_SYS). Current activity: `#UD`/`#GP`
+look up the CR3 owner and kill that user process. Relaunch cert.
+Certification is **not** claimed.
+
+### 10:45 — PF64 uses CR3 owner, not leftover current
+
+**Current problem / activity:** `PF64 cr2=0x40d100` with a user RIP halted
+the guest because leftover `current` was ACCESS_SYS, so COW was skipped
+and the handler did `while(1)`. Current activity: resolve the faulting
+PCB from CR3; never halt the machine on a user RIP or ACCESS_SYS
+not-present. Then re-gate and relaunch cert. Certification is **not**
+claimed.
+
+### 10:35 — Idle BSS leftover uses MEM_CPUIRQ, not process kstack top
+
+**Current problem / activity:** Cert halted in `task_mgr` at
+`rip=0x300000003` after leftover `current` on an idle BSS stack reset a
+process `kstack_top`. Current activity: user stack -> process kstack;
+idle BSS -> `MEM_CPUIRQ`; other kernel RSP stays. `test-fatwrite-coop`
+PASS. Relaunch cert. Certification is **not** claimed.
+
+### 10:20 — Cert GPF in sync_leavecrit frame walk
+
+**Current problem / activity:** Parallel cert compiled 16 objects then
+`GPF64 rip=sync_leavecrit rbp=0` on `gcc.exe` while printing a non-owner
+leave. `__builtin_return_address(1..5)` walked a smashed frame. Current
+activity: warn with `serial_puts` and only `return_address(0)`; stop the
+hung guest; re-gate; relaunch cert. Certification is **not** claimed.
+
+### 10:25 — Reverted irqwrap experiments; coop PASS; relaunching cert
+
+**Current problem / activity:** `IRQ_KSTACK_ENTER` stay/yank variants
+regressed `test-fatwrite-coop` (`UD64` / idle-stack smash / WATCHDOG).
+Restored the claimed-user `kstack_top` switch that already passed coop
+and reached `GCC_DRIVER_OK` before `PF64 rip=0x100000001000`. Host TAP
+still documents `irq_kstack_dest`. `test-fatwrite-coop` PASS on retry.
+Current activity: relaunch
+`test-selfhost-cert-parallel CERT_TIMEOUT=28800`. Certification is
+**not** claimed.
+
+### 10:15 — FROM-K sprintf smashed the idle stack
+
+**Current problem / activity:** `test-fatwrite-coop` hit `UD64 rip=0x3cb7e1`
+(`cpus+0x21`) after eight `KSTACK-FROM-K` lines with `rsp=0x2390f0` (idle
+BSS) and `current=fatwr`. The stay rule is right; logging it on that stack
+is the ACCESS_SYS diagnostic smash. Current activity: silent refuse of
+`irq_user_rsp` from a kernel RSP; re-gate; relaunch cert. Certification is
+**not** claimed.
+
+### 10:05 — Stay on kernel RSP; do not yank to MEM_CPUIRQ
+
+**Current problem / activity:** After refusing `kstack_top` reset from a
+kernel RSP, `test-fatwrite-coop` died `UD64 rip=0x217` on `fatwr` with
+`KSTACK-FROM-K` `on_cpu=-1`. Parking leftover execution on `MEM_CPUIRQ`
+shifted the live `iretq`. Current activity: stay on any kernel stack;
+`MEM_CPUIRQ` only for a FOREIGN user still on the user stack. Then re-gate
+and relaunch cert. Certification is **not** claimed.
+
+### 09:55 — Cert died: process kstack top reset from a kernel RSP
+
+**Current problem / activity:** `test-selfhost-cert-parallel` reached
+`GCC_SELF_BEGIN` / `GCC_DRIVER_OK` then `PF64 rip=0x100000001000` on
+`gcc.exe` (`GCC_SELF_CERT_FAIL make bootstrap`). No `CTXBAD`: `ctx.rip`
+was fine; the syscall `iretq` slot at `kstack_top` was overwritten because
+`IRQ_KSTACK_ENTER` reset a claimed user's process kstack from a kernel RSP
+(publish-before-switch or leftover `current`+claim). Current activity:
+only switch to process `kstack_top` from `MEM_USER_STACK_*`; otherwise
+`MEM_CPUIRQ`. Host TAP `irq_kstack_dest` covers the original cause. Then
+re-gate (`test-smpclaim-unit`, `test-fork`, `test-fatwrite-coop`) and
+relaunch cert. Certification is **not** claimed.
+
+### 09:30 — `test-fatwrite-coop` PASS; launching cert
+
+**Current problem / activity:** `test-fatwrite-coop` passed after passing the
+captured CPU id into `context_load` and releasing `on_cpu` only off the old
+stack. `test-stress-user-smp` still fails (`posix_spawn` ENOEXEC after COW
+PF at `0x40d100`). Cert regime is coop, so launching
+`test-selfhost-cert-parallel CERT_TIMEOUT=28800`. Certification is **not**
+claimed.
+
+### 09:25 — Pass captured CPU id into context_load; release after stack switch
+
+**Current problem / activity:** `context_load` re-queried `smp_cpu_id()` and
+could clear `ps_switchto_in_progress[wrong]`, leaving this CPU unable to
+schedule (coop: holder `on_cpu=2`, waiter spinning on that CPU). It also
+released `prev->on_cpu` while still on prev's stack. Current activity:
+caller-captured id; release only after RSP is the new stack. Then re-gate
+and launch cert. Certification is **not** claimed.
+
+### 09:15 — `smp_this_cpu` must not trust a valid-looking wrong GS
+
+**Current problem / activity:** `current_process` is `smp_this_cpu()->current`.
+`smp_this_cpu()` returned `smp_gs_local()` whenever GS sat inside `cpus[]`,
+so an AP whose GS still named `cpus[0]` used the BSP's current (WATCHDOG
+`cpu=1 pid=fatwr` with RIP in `smp_cpu_idle`). That is two CPUs on one
+PCB for every C path. Current activity: `smp_this_cpu()` uses
+`smp_cpu_id()` (RDTSCP); idle repairs a leftover `current`. Then re-gate
+and launch cert. Certification is **not** claimed.
+
+### 09:10 — Stale-claim drop stole a mid-switch PCB; reverted
+
+**Current problem / activity:** Clearing `on_cpu` when `current` already
+named someone else raced the publish-before-release window in
+`ps_switchto` and put two CPUs on one kstack (`test-stress-user-smp`
+RIP became ASCII). The drop is reverted. RDTSCP still wins over GS.
+`test-fatwrite-coop` still times out (holder pinned, waiter spinning).
+Certification is **not** launched and **not** claimed.
+
+### 09:05 — RDTSCP wins over GS; drop stale on_cpu
+
+**Current problem / activity:** `test-fatwrite-coop` still hung: FAT holder
+`on_cpu=2` while CPU 2 ran the waiter (`critowner=30`). GS `smp_cpu_id()`
+can disagree with irqwrap's RDTSCP. Current activity: RDTSCP is the id;
+GS is re-published if it disagrees; scheduler CAS-clears a claim whose
+CPU already has another `current` and is not mid-switch. Then re-gate
+and launch cert. Certification is **not** claimed.
+
+### 08:55 — Crit nest is on the PCB, not the CPU
+
+**Current problem / activity:** `test-fatwrite-coop` hung in `sync_justwait`
+after `fat_unlock_volume` non-owner leave (`busy=0x1d self=0x1e`). Per-CPU
+nest tokens survived `fat_wait_io()` yield (vfs+FAT still held), so the
+next writer unlocked the previous hold. Current activity: nest lives on
+the PCB; `file_ok` checks this process; `justwait` sets `crit_wait` and
+yields. Then re-gate and launch cert. Certification is **not** claimed.
+
+### 08:45 — ACCESS_SYS must not continue on MEM_CPUIRQ
+
+**Current problem / activity:** After the reserved per-CPU IRQ stacks,
+`test-fatwrite` / `test-fatwrite-coop` died with `UD64 rip=0x3cb7e1`
+(`cpus+0x21`, opcodes from `cpu_local`) on `cpu_idle` / `disk_mgr`.
+`IRQ_KSTACK_ENTER` had moved every ACCESS_SYS IRQ onto `MEM_CPUIRQ`;
+`schedule_from_timer` then saved that continuation on the shared top,
+and the next IRQ reused it. Current activity: ACCESS_SYS stays on its
+own stack; only FOREIGN user IRQs use the CPU stack. Then re-gate and
+launch cert. Certification is **not** claimed.
+
+### 08:25 — Implementing the SMP architecture items, then cert
+
+**Current problem / activity:** Implementing the high-leverage items from
+`smp-debugging-hardness.md`: GS-relative CPU id / `current`, reserved
+32 KiB per-CPU IRQ stacks at `MEM_CPUIRQ_*` (FOREIGN/idle/kernel; claimed
+user syscalls keep the 128 KiB process kstack), crit enter/leave nest
+tokens so leave does not re-sample a stale `current`, `ps_publish_current`
+with a captured CPU id, and `make test-smpclaim-unit`. Then re-gate
+(`test-fork`, `test-fatwrite`, `test-fatwrite-coop`, `test-stress-user-smp`,
+`test-apuser`) and launch `test-selfhost-cert-parallel`. Certification is
+**not** claimed.
+
+### 08:15 — Documented why SMP fixes keep taking days
+
+**Current problem / activity:** `test-fatwrite-coop` still fails (idle-token
+`vfs_busy` leave after `SDK_EXIT`); cert is **not** claimed. Stepped back
+to write `ics-os/docs/smp-debugging-hardness.md`: the recurring classes
+(two CPUs on one PCB, kernel C on a foreign stack, nested stack-top
+reset, stale `iretq` frame, vfs/FAT inversion, waiter pinning, crit
+tokens sampled from `current`), what is ordinary SMP experience, and
+which design choices amplify it (same-privilege user IRQs, per-process
+kstack + informal claim, `current_process` re-reading `smp_cpu_id()`,
+recursive busy-words, BSS stacks under 4 MiB). Highest-leverage fixes
+are one switch primitive and CPU-local IRQ stacks, not another
+`IRQ_KSTACK_ENTER` special case.
+
+### 08:10 — Cert task 248084 was the nested-FOREIGN `#GP`; coop hang is `file_ok`
+
+**Current problem / activity:** The completed `test-selfhost-cert-parallel`
+shell (15s, `tail` exit 0) is `GCC_SELF_CERT_FAIL make bootstrap`:
+`KSTACK-FOREIGN` then `GPF64` in `vsprintf` with `cs=0x220008`. That is the
+nested safe-stack smash already patched; it is **not** certification.
+`test-fatwrite-coop` then hung after `SDK_EXIT` on `vfs_busy`: `file_ok`
+recursive-entered (stale `current` == holder) and inflated `wait`, then
+non-owner `leavecrit` left the lock stuck. Current activity: skip the
+nested acquire when `current` already tracks `vfs_busy`. Certification is
+**not** claimed.
+
+### 08:05 — `self_exit` stole fatwr; nested safe-stack was not enough
+
+**Current problem / activity:** The aborted cert relaunch was already superseded.
+Nested FOREIGN no longer resets RSP to the safe-stack top (16 KiB blew the
+4 MiB BSS cap, so the stack stays 8 KiB). `test-fatwrite-coop` then failed
+with `KSTACK-SHARED cpu=2 other=0 pid=24` right after `SDK_EXIT`: CPU 2
+owned the parent while CPU 0 still advertised it, both ran on one kstack,
+`on_cpu` became 127, then `UD64`/`WATCHDOG`/`GPF64`. Current activity:
+claim the parent only with CAS from -1 (no `on_cpu==me` shortcut, no
+`on_cpu=me` store), publish `cpus[me].current` with the captured CPU id,
+and refuse to `context_load` a PCB another CPU still has as `current`.
+The first claim-only pass stopped the smash but hung
+`test-fatwrite-coop`: `vfs_busy` held by pid 31 (`on_cpu=3`) while CPU 3
+ran the waiter, because "any other `current==p`" treated a stale pointer
+as live and kept unclaiming the holder. Only treat another CPU as live
+if it still claims the PCB or has released `on_cpu` without publishing a
+successor. Re-gating; certification is **not** claimed.
+
+### 07:50 — Nested FOREIGN IRQ smashed the safe stack (`vsprintf` #GP)
+
+**Current problem / activity:** The cert relaunch died in ~guest-seconds:
+`KSTACK-FOREIGN` then `GPF64` in `vsprintf` with `cs=0x220008` (stack
+address grafted onto CS) while dumping the fault. Every FOREIGN IRQ set
+RSP to `irq_safe_stack_top`, so a nested timer/GPF reused the same top and
+destroyed the outer frame. Current activity: treat `[base, top)` as nested (do not reset RSP).
+16 KiB stacks blew the 4 MiB BSS cap (`bssEnd <= 0x3f0000`), so the
+stack stays 8 KiB. Then re-gate and relaunch cert. Certification is
+**not** claimed.
+
+### 07:45 — Two CPUs ran gcc.exe; timer C ran on its user stack
+
+**Current problem / activity:** Replacement cert produced one `GCC_DRIVER_OK`
+object then `KSTACK-FOREIGN`/`KSTACK-SHARED` on pid 30 (`gcc.exe`): CPU 1's
+`current` still named that PCB while `on_cpu=2`, and the timer interrupted
+`rsp=0x3fffe990` (user stack). The wrapper comment claimed a foreign current
+meant "already on this CPU's kernel stack"; that was false, so `time_handler`
+ran on the other CPU's user stack and the guest went silent. Current activity:
+on a foreign claim, switch to this CPU's idle `kernel_stack` and do not touch
+`irq_user_rsp`; keep `ps_switchto_in_progress` until `context_load`; refuse
+`ps_switchto`/`schedule_from_timer` when `current->on_cpu` is not us. Then
+re-gate and relaunch cert. Certification is **not** claimed.
+
+### 07:35 — Cert hung on vfs_busy ↔ fat_volume_busy inversion
+
+**Current problem / activity:** First SMP=4 cert after the fork-frame fix
+deadlocked in minutes: `CRITHANG` `vfs_busy` owner=`cc1.exe` (pid 42) wants
+`fat_volume_busy[11]`, while `gcc.exe` (pid 41) held that FAT lock and
+`file_ok()`/`openfilex()` wanted `vfs_busy`. Ready-list `RLBAD` and a later
+`timerwrapper` `iretq` #GP on `make.exe` are treated as fallout of the hang,
+not a new root cause. Current activity: hold `vfs_busy` across FAT I/O
+(`vfs_directread`/`write`, `mkdir`, `vfs_deletefile`, `vfs_listdir` mount)
+so the order is always vfs then FAT. `fat_wait_io` now sets `crit_wait` so
+the holder is not pinned while the block layer runs — otherwise every CPU
+in a vfs+FAT I/O wait starves `disk_mgr`. `test-fatwrite-coop` failed once
+with `KSTACK-FOREIGN`/`UD64` before that wait fix; re-running it. Certification
+is **not** claimed.
+
+### 07:20 — Fork used a stale `irq_user_rsp`; the wrapper now passes `%r13`
+
+**Current problem / activity:** `make test-fork` is 8/8 PASS including
+`FORK_STRADDLE_PASS depths=272`. Launching `test-selfhost-cert-parallel` next.
+`GCC_SELF_CERT_PASS` is **not** claimed until that log contains the marker set.
+
+**Root cause of `UD64 rip=0x207`.** The `int 0x30` wrapper special-cased fork
+(`rax==0x90`) as `movq $0, %rdi; call user_fork_frame`. The C side then preferred
+`parent->irq_user_rsp` over the (always-NULL) argument. `irq_user_rsp` is
+updated on a *fresh* IRQ/syscall entry, but it can still name a *prior timer
+IRQ's* user frame if that is what was last recorded. A child that
+`fork_child_return`'s `POP_ALL; iretq` from a frame 16 bytes too high pops
+RFLAGS as RIP (`0x207` = `CF|reserved|PF|IF`) with `cs=0x8`. The wrapper now
+passes `%r13` (this syscall's PUSH_ALL), `user_fork_frame` requires the pointer
+to sit in the user-stack window, and interrupts stay off until the child's copy
+of that frame exists and its rax slot is zeroed.
+
+**TCG path.** `IRQ_KSTACK_ENTER` skips the kstack switch when RDTSCP is absent
+(TCG `qemu64` default). Kernel C then runs on the user stack, spilling
+`KDIRECT()` pointers into the same pages the child will `iretq` from -- the
+straddle test's `UD64 rip=0xffff800007ffd0da`. `test-fork` now boots
+`-cpu qemu64,+rdtscp` so TCG matches the KVM/host CPU-id source.
+
+**The straddle copy remains.** `userpd_clone_cow` still private-copies both the
+first and last page of the 144-byte same-privilege frame (15 GPRs + RIP/CS/RFLAGS;
+user ELFs still enter with kernel CS, so `iretq` does not pop SS:RSP).
+
+### 06:40 — The fork frame straddles pages; 30-minute bug is now a 12-second test
+
+**Current problem / activity:** `make test-fork` now reproduces the cert's
+`UD64` child fault in ~12 seconds instead of 30 minutes of `-j4` GCC bootstrap.
+It still fails on roughly 2 of 3 runs, so the defect is **not** fixed and
+`GCC_SELF_CERT_PASS` is **not** claimed. Current activity: the residual fault
+always reports the same constant RIP, `0xffff800007ffd0da` — a `KDIRECT()`
+pointer, i.e. a kernel-computed address, sitting in the child's `iretq` RIP slot.
+Finding who writes it is the next step.
+
+**The straddle bug.** `fork_child_return` does `POP_ALL` then `iretq` over 160
+bytes at the recorded user RSP: 15 saved registers (120 bytes) plus the 5-word
+hardware frame (40 bytes). `userpd_clone_cow()` eagerly copied only
+*one* page — the one holding the rax slot the kernel zeroes at
+`private_vaddr + 112`. When the 160-byte frame spanned a page boundary the tail
+page, holding the child's RIP/CS/RFLAGS, stayed COW-shared with a parent that
+returns from the syscall and immediately reuses that same stack. Both eager-copy
+conditions now cover `frame_first` and `frame_last`, so the whole frame is
+private to the child.
+
+**New regression test: `FORK_STRADDLE_PASS`.** `contrib/forktest` walks RSP
+across a full page in 16-byte steps (272 depths of a small recursive frame) and
+forks at each alignment, so the straddling alignments are hit by construction
+rather than by a lucky stack layout. `test-fork` asserts
+`FORK_STRADDLE_PASS depths=272` and additionally that no `UD64`, `MF64` or
+`IDLE-STACK-OVERFLOW` appears in the log — it fails on the fault itself, not on
+a missing success marker. This is what converted an intermittent, 30-minute,
+deep-in-the-GCC-bootstrap failure into a fast local reproducer.
+
+### 06:15 — `#UD` was being swallowed; the real fault is a shifted `iretq` frame
+
+**Current problem / activity:** the cert no longer deadlocks and now gets deep
+into the `make -j4` object build (best run: **76 of 349 objects**, up from 18),
+but forked children of `gcc.exe` die with `UD64 rip=0x207`, `make` reports the
+failed object, and the closure aborts. `GCC_SELF_CERT_PASS` has **not** been
+observed and is **not** claimed. Current activity: tracing the 16-byte frame
+offset described below.
+
+**`copwrapper` was hiding the first fault.** Vectors **6 (#UD)**, **7 (#NM)** and
+**16 (#MF)** were all wired to `copwrapper`, whose handler is
+`nocoprocessor()` — `clts` and return. So an invalid opcode cleared CR0.TS and
+*retried the same bad instruction forever*. Worse, `copwrapper` guesses whether
+it was entered by an exception or by a plain `call` by testing whether
+`8(%rsp)` looks like a code selector (`0x8/0x20/0x2b/0x23`); when that guess is
+wrong it `iretq`s a non-exception frame, which is where the confusing
+`GPF64 err=0xe350 rip=<inside copwrapper>` came from. Vectors 6 and 16 now have
+their own wrappers (`udwrapper`/`mfwrapper` in `irqwrap.S`) reporting RIP, CS,
+process and the opcode bytes at RIP, then applying the same ownership rule as
+`GPFhandler64()`: kill a faulting USER process, halt only on a genuine kernel
+fault. Getting that rule wrong matters — classifying by RIP alone parked one CPU
+per bad child until the `-j4` build had no CPUs left.
+
+**Idle-task stack overflow.** An idle task is `ACCESS_SYS`, so
+`irq_kstack_enter()` does *not* move it to a per-process kheap kstack: every
+timer IRQ runs `PUSH_ALL` plus the whole `schedule_from_timer` / `scheduler` /
+`zombie_drain` / `freeprocessmemory` chain, the WATCHDOG and CRITHANG reporters
+(256-byte `sprintf` buffers each), and any exception dump directly on
+`ap_idle_stacks[cpu]` — which was **8KiB**. Because those stacks are adjacent,
+an overflow ran off the bottom into the neighbouring CPU's idle stack, which is
+indistinguishable from "another CPU is writing my frames". That is exactly how it
+presented: 64-bit slots with a small CPU-id-like integer in the high half. The
+stacks are now 16KiB (the kernel image must stay under the 4MiB user-ELF window,
+`ASSERT(bssEnd <= 0x3F0000)`, so 64KiB × 8 CPUs does not fit) with 16 guard
+words immediately below each one, checked from the timer path:
+`IDLE-STACK-OVERFLOW cpu=N word=N`. Only APs get an `ap_prepare_idle()`, so the
+guard is armed per CPU and unarmed CPUs are skipped — checking CPU 0
+unconditionally reported a false positive in every run.
+
+**What remains, precisely.** Forked children of `gcc.exe` fault with
+`UD64: rip=0x207 cs=0x8 userfault=1`. `0x207` is a valid RFLAGS value
+(`CF|bit1|PF|IF`), and `cs` reads back as the correct `0x8`, so an `iretq` popped
+a frame shifted by exactly **two slots** — RIP took RFLAGS. Fork children
+inherit the parent's name via `strcpy(child->name, parent->name)`, so these are
+children, and `fork_child_return` is the only path that does `POP_ALL; iretq`
+*without* `IRQ_KSTACK_LEAVE`, relying on the frame `user_fork_frame()` seeded.
+That is where the 16-byte offset should be looked for next. This is the same
+family as the documented `GPF64 rip=0x8 cs=0x206` bug (CS popped as RIP), just a
+different alignment.
+
+**Gates:** `test-boot`, `test-smp`, `test-smp-matrix`, `test-exec`, `test-fork`,
+`test-apuser`, `test-spawn`, `test-stress`, `test-stress-user-smp`, `test-dup`,
+`test-fatwrite`, `test-fatwrite-coop`, `test-posixio`, `test-virtio` all PASS.
+`test-fatwrite` is 14/14 clean (it was 7/10 mid-session).
+
+### 04:10 — Priority inversion was what wedged `make -j4`
+
+**Current problem / activity:** `make test-selfhost-cert-parallel
+CERT_TIMEOUT=28800` is running again on `-smp 4` with the fixes below.
+`GCC_SELF_CERT_PASS` has **not** been observed and is **not** claimed. One
+known defect remains open: `make test-fatwrite` still fails about 1 run in 12
+with a kernel `#PF` whose faulting address is a 64-bit stack slot with another
+CPU's 32-bit value in its high half.
+
+**Where the cert stood.** The previous run deadlocked ~25 minutes in, during the
+concurrent `mkdir -p /work/gccobj*` plus first `gcc.exe -c alias.c` phase. The
+existing WATCHDOG line named the crit and the owner *token*, but not the owner's
+state, because the owner was not `current` on any CPU. So the first thing built
+was the introspection needed to see it.
+
+**New introspection: the wait-for chain.** `PCB386` gained
+`crit_wait_var` (the crit this task is spinning for), set and cleared alongside
+the existing `crit_wait` flag. `sync_report_owner()` in `kernel/process/sync.c`
+now walks the whole chain — waiter, crit, owner, the crit that owner wants, and
+so on for up to 8 hops — printing one `CRITHANG hop=N ...` line per hop, and
+`CRITCYCLE` when the chain returns to a task already seen. Address resolution
+is via `nm -n kernel/Kernel64.sym`. This paid for itself immediately.
+
+**Root cause 1 — priority inversion (the deadlock).** The chain said:
+
+```
+CRITHANG crit=0x3ad270 (io_devlock[11])      owner=17 'disk_mgr'  status=0x8 on_cpu=0  aff=0 held=2
+CRITHANG crit=0x3aee20 (pc_busy)             owner=17 'disk_mgr'  status=0x8 on_cpu=-1 aff=0 held=1 critwait=1
+CRITHANG crit=0x3aeef0 (fat_volume_busy[11]) owner=31 'mkdir.exe' status=0x0 on_cpu=0  aff=-1 held=1 critwait=1
+```
+
+`status=0x8` is `PS_ATTB_THREAD`, so `disk_mgr` was runnable, not blocked — it
+simply never got a CPU. It is BSP-pinned (`aff=0`), and CPU 0 was occupied by
+`mkdir.exe` spinning for `pc_busy`, which `disk_mgr` held. CPU 3 was idle and
+could not help.
+
+The reason CPU 0 never handed over: `process.c` gives every user process
+`priority = 1` while kernel threads keep `0`, and `scheduler()` compared raw
+priority. A spinning user process therefore won every pass and `taskswitch()`
+re-selected it forever — `no-yield=310000` in the WATCHDOG line with
+`critspins=84000000`. Fixed with `sched_eff_prio()` in `scheduler.c`: a task
+with `crit_wait` set ranks at the priority floor, so any other runnable task —
+including the holder — wins, while a lone waiter is still selected. Two
+supporting changes: `schedule_from_timer()`'s cooperative early return no longer
+applies to a `crit_wait` task (a spinner is not a tool doing work), and a nested
+waiter in `sync_entercrit` now yields every 1M spins instead of never.
+
+**Root cause 2 — the owner latched as its own waiter.** After the priority fix,
+`test-fatwrite` started reporting `CRITCYCLE ... closes at pid=29` with
+`owner=29 ... wants=<the crit it owns>`. Not a lock-order inversion: between the
+successful CAS in `sync_entercrit` and the `crit_wait = 0` a few lines later, a
+timer IRQ can preempt, and the task is then a lock *holder* still flagged as a
+*waiter* — which the new `sched_eff_prio()` demotes to the floor, starving it
+while it owns a hot lock. The acquire in `sync_entercrit` now does CAS,
+`crit_wait = 0`, `var->wait = 1` and `sync_track_hold()` in one
+interrupts-off region, and re-checks `busy == owner` on every pass so a
+recursive acquire can never spin against itself.
+
+**Root cause 3 — `&sPCB` is not per-CPU.** `self_exit_current()`'s last-resort
+successor was `&sPCB` with the comment "sPCB is the per-CPU kernel fallback and
+is never claimed". It is a single global `PCB386` with one `ctx.rsp`, claimed
+with a plain store, so two CPUs reaching that fallback resume one context on one
+stack. That is the source of the corruption signature seen in both the cert and
+`test-fatwrite`: a 64-bit stack slot whose high half holds another CPU's 32-bit
+`smp_cpu_id()` result, read back as a return address like `0x1_03c9efd0`
+(`rip == cr2 == frsp+0x10 | 1<<32`), faulting in the serial path with
+`rdi = &uart1` and `rbp` pointing into `smp_cpu_id`. The fallback now
+force-claims this CPU's own idle task. `test-fatwrite` went from 7/10 to 11/12.
+
+**Root cause 4 — `frame_retain` rejected reserved frames.** `test-fork` failed
+about 1 run in 3 with `fork() == -1` preceded by `FRAME RETAIN-FREE
+phys=0x100000`. Reserved ranges (kernel image, kheap, identity windows) are
+permanently mapped and never enter the pool, so they carry no refcount;
+`frame_release()` already ignored them but `frame_retain()` reported and failed,
+aborting `userpd_clone_cow()` whenever a user PD held a 4KiB leaf for low
+identity memory instead of the usual 2MiB page. Retain is now a no-op success
+for reserved frames, matching release. 4/4 then 12/12 clean.
+
+**Root cause 5 — the ready walk could step onto a freed PCB.** An intermittent
+`GPF64 ... rip=0x15e3a3 proc=task_mgr` resolved to `sched_runnable_here`.
+`scheduler()` now re-validates `lastprocess` *under* `ready_lock` (the existing
+check ran unlocked, so another CPU could dequeue and free it in between), and
+both ready-walk passes validate each node with a new `sched_node_ok()` — kheap
+or kernel-image address, ring links round-trip, status not wild — and break out
+instead of dereferencing recycled memory. `RLBAD` still reports the corruption.
+
+**New QA gate.** `make test-fatwrite-coop` runs the concurrent FAT writers under
+`coop-smp`, a test-only cmdline (`kernel32.c`) that reproduces the closure's
+scheduling regime — user processes on APs plus no timer preemption of a running
+user tool — without booting a stage-1 kexec kernel. It asserts no `CRITHANG` and
+no `WATCHDOG`, so it fails on the hang cause itself rather than on a missing
+success marker. `test-fatwrite` is now parameterized by `FATWR_CMDLINE` /
+`FATWR_TAG`. Honest limitation: this gate does **not** by itself reproduce the
+priority inversion — `fatwr.exe` alone passed with the fixes reverted — so the
+inversion is currently covered only by the cert. A deterministic reproducer
+needs a low-priority kernel-thread lock holder pinned to the waiter's CPU.
+
+**Gates run on the final binary:** `test-boot`, `test-smp`, `test-exec`,
+`test-fork`, `test-apuser`, `test-spawn`, `test-stress`,
+`test-stress-user-smp`, `test-dup`, `test-fatwrite-coop` all PASS.
+`test-fatwrite` passes 11/12; the remaining failure is the open defect above.
+
 ## 2026-09-12 (Manila, UTC+8)
+
+### 23:50 — Two CPUs on one PCB: the real AP user-process bug
+
+**Current problem / activity:** `make test-selfhost-cert-parallel
+CERT_TIMEOUT=28800` is running on `-smp 4` after four root-cause fixes below.
+`GCC_SELF_CERT_PASS` is **not** claimed yet; the run is in progress.
+
+**Problem:** the cert kept dying in the `make -j4` bootstrap with symptoms that
+looked like heap corruption: kernel RIPs inside BSS or the kheap, `GPF64
+rip=0x8 cs=0x206` (CS read as RIP at `iretq`), `PF64` at addresses like
+`0x1e0015dc96` (a valid kernel address with a small integer grafted into the
+high half), and `gccdriver: waitpid /work/apps/as.exe failed`.
+
+**Reproducer first.** `test-stress` never caught any of this because it runs
+BSP-pinned, so no child exit is ever concurrent with the parent. Added
+`STRESS_CMDLINE`/`STRESS_TAG` to `test-stress` and a new
+`make test-stress-user-smp` (same spawn/fork/reap churn with `user-smp`, so
+children land on APs, plus a `USER_RUN cpu=[1-7]` assertion). The pristine
+tree fails it 3/3 in about a second — AP-resident user processes with
+fork/spawn/waitpid churn have never worked. That gate is the regression test
+for everything below.
+
+**Diagnostics.** Blind guessing was the bottleneck, so: `sync_entercrit`
+publishes the crit it is spinning on (`crit=`/`critowner=`/`critspins=` in the
+`WATCHDOG` line); the `#PF` and `#GP` handlers print the faulting kernel
+stack (`PF64-KSTACK`/`PF64-KRAW`, bounds, `rsp&15`, and which process owns the
+kstack the RSP/RIP fell into via `PF64-KOWNER`); and `irq_kstack_enter` reports
+`KSTACK-FOREIGN` when a CPU is about to run kernel C on a kstack whose task is
+claimed by a different CPU. That last line turned a week of inference into a
+one-line answer, and it correlated perfectly with every failure.
+
+**Fix 1 — `sys_waitpid` lost child statuses.** The exit paths append to
+`parent->waitq_*` from the child's CPU while the parent compacted the same
+array unlocked, and the parent returned `ECHILD` for a child that had exited
+between its failed scan and `ps_findprocess()`. Added `waitq_publish` /
+`waitq_reap` / `waitq_has` in `process.c` behind a dedicated `waitq_lock`,
+deliberately **not** `processmgr_busy` (that crit is held across
+`closeallfiles()` and `smp_tlb_shootdown()`, which waits for an IPI ack from
+every other CPU, so spinning on it with interrupts masked deadlocks). Both
+exit paths publish before `ps_dequeue`, so `sys_waitpid` re-scans the queue
+once after observing the child gone before reporting `ECHILD`.
+
+**Fix 2 — stateless IRQ kstack nesting.** `PCB.irq_kstack_nest` +
+`irq_kstack_leave` reconstructed "am I already on the kstack" from a counter,
+and `irq_kframe_current()` handed the fault wrappers the *outermost* frame. A
+nested `#PF`/`#GP` therefore read its error code at the wrong offset and
+`iretq`'d from the syscall's user frame after `addq $8` for an error code that
+frame never had — exactly `rip=0x8 cs=0x206`. `IRQ_KSTACK_ENTER` now decides
+purely from the interrupted RSP (switch only when it is outside
+`[kstack_base, kstack_top)`), every wrapper reads its own frame from `%r13`,
+and `IRQ_KSTACK_LEAVE` is just `cli; movq %r13, %rsp`. `%r13` is
+callee-saved and is saved/restored by `context_switch`/`context_load`, so it
+survives a mid-syscall reschedule. Deleted `irq_kstack_nest`, `irq_saved[24]`,
+`irq_kstack_leave`, `irq_kframe_current`, `irq_user_rsp_current`, and
+`irq_kstack_top_for_current`.
+
+**Fix 3 — `taskswitcher` published an unclaimed task.** `taskswitcher` set
+`current_process = readyprocess` *before* `ps_switchto()`. When `ps_switchto`
+then bailed because another CPU already owned that task, this CPU's
+`current_process` pointed at a foreign task, and the next interrupt switched
+RSP onto that task's IRQ kstack. Two CPUs then wrote each other's frames —
+which is why corrupted qwords carried small integers (2, 3) in the high half:
+those were the *other* CPU's `smp_cpu_id()` locals landing at `slot+4`.
+Removed the premature publish (`ps_switchto` already publishes after a
+successful claim) and added a claim re-verify inside `ps_switchto`'s
+interrupts-off window.
+
+**Fix 4 — non-atomic claims.** `scheduler()` claimed with a plain
+`best->on_cpu = me` store, and `self_exit_current()` tested `parent->on_cpu`
+and then assigned `on_cpu = me` further down. Both race with `ps_switchto`'s
+CAS, which does not hold `ready_lock`. Both are now `__sync_bool_compare_and_swap`
+with a fallback (idle this tick / pick the idle task / `sPCB`). Also added a
+defence-in-depth `PCB_ON_CPU == cpu` test in `IRQ_KSTACK_ENTER` so a stale
+`current_process` can never select a foreign kstack again.
+
+**Also:** the not-present kernel `#PF` path used to print "(ignored)" and
+`iretq` straight back onto the same faulting store, livelocking; it now kills
+the user process or halts. `gccdriver` prints the actual `waitpid` return and
+`errno`.
+
+**Tests:** `test-stress-user-smp` 6/6 with zero `KSTACK-FOREIGN` (1/6 before
+fixes 3-4, 0/3 pristine). `test-boot`, `test-smp`, `test-exec`, `test-fork`,
+`test-apuser`, `test-spawn`, `test-stress`, `test-dup` all PASS.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`. The cert run is still in flight.
+
+### 20:35 — Asm IRQ kstack switch (no C on user RSP); restart cert
+
+**Problem:** Parallel cert still died in ~50s after 35× `GCC_DRIVER_OK` with
+no `PF64`/`FAIL` in the serial file: QEMU `-no-reboot` exited (triple fault).
+`IRQ_KSTACK_ENTER` still called C `irq_kstack_top_for_current` on the
+interrupted stack. `timerwrapper` also called `smp_cpu_id` there before the
+switch. Unconditional `rdtscp` in the wrapper `#UD`'d on TCG qemu64
+(`test-fork` died at the first LAPIC tick).
+
+**Fix:** Switch RSP from RDTSCP/TSC_AUX in `irqwrap.S` only when
+`smp_have_rdtscp==1`. Timer watchdog dumps `%r13` after the switch.
+`irq_kstack_leave` returns `PCB.irq_user_rsp`.
+
+**Problem:** Cert died after 25× `GCC_DRIVER_OK` with `irq_kframe_copy_n`
+`mov %rax,(%rdx)` at `rip=0x13594f`, `cr2=0x62d6e22a8` (write). Nest was
+still 0 during the copy, so a nested `#PF` reset RSP to `kstack_top` and
+smashed the loop index. Ignored kernel not-present livelocked, then `GPF64`
+killed `make`.
+
+**Fix:** Set `irq_kstack_nest` before any work; C reads the user `PUSH_ALL`
+in place (no copy). Kernel not-present outside a successful identity map
+kills the user process instead of `iretq` to the same store.
+
+**Tests:** `make test-fork` PASS; `make test-apuser` PASS.
+
+**Latest cert:** `GCC_SELF_CERT_FAIL make bootstrap` after a few `GCC_DRIVER_OK`.
+`GPF64` at `syscallwrapper` `iretq` with `rip=0x8` (`gcc.exe`) — PUSH_ALL pointer
+8 bytes too high so CS lands in the RIP slot. A CS-slot correction on leave
+broke `test-apuser` (error-code frames) and was reverted.
+
+**Current:** next cert run after the leave revert. Serial `/tmp/icsos-gccself.log`.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 18:40 — Per-process IRQ/syscall kstack; restart SMP=4 cert
+
+**Problem:** Parallel cert died at ~97s with `GCC_SELF_CERT_FAIL make bootstrap`.
+`PF64` at `rip=0xa02478f` (user heap) while GPRs were kernel (`rdx=cpus[]`,
+`rcx=0xb0` LAPIC EOI). Same-privilege IRQs still ran kernel C on `make`'s
+stack and smashed the IRQ/syscall frame.
+
+**Fix:** `irq_kstack_enter`/`leave` copy 152 bytes (PUSH_ALL + error
+frame) onto a 16-byte-aligned 128KiB kheap stack. A 256-byte copy overran
+a fresh user stack near `0x40000000`. `fork` COW uses `irq_user_rsp`.
+
+**Current:** virtio MSI-X uses the same kheap C stack (`make` died at heap
+`rip=0xa078dc7` writing `-0x6c`). Restarting cert.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 18:15 — COM1 TX off the user stack; kernel-RIP `#PF` must not kill `make`
+
+**Problem:** Cert froze after 40× `GCC_DRIVER_OK`. `uart_putc_raw` `#PF` at
+`rip=0x102d66` (`mov (%rax),%eax`) with `rax=cr2=0xfb002398a0` while
+`rdi=0x3fd` (COM1 LSR). That is a reload of `uart_dev*` from
+`-0x18(%rbp)` on `make`'s stack after `inportb()` returned. The handler
+treated it as a user not-present fault, killed `make`, then
+`serial_puts` re-entered UART and `PF64: re-entered -> halt`.
+
+**Fix:** `uart_com1_putc`/`uart_com2_putc` in `asmlib.S` (port I/O in
+registers only). Kernel-text `#PF` does not `exc_recover()` the user
+process. Nested `#PF` does not `serial_puts` or halt.
+
+**Tests:** `make test-apuser` PASS; `make test-smp` PASS.
+
+**Current:** `make test-selfhost-cert-parallel CERT_TIMEOUT=28800`. Serial
+`/tmp/icsos-gccself.log`.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 17:58 — `getphys64` full CR2; no kernel CR3 on user RSP
+
+**Problem:** Parallel cert died in ~73s with `GCC_SELF_CERT_FAIL make bootstrap`.
+`PF64 cr2=rip=0xb000000000` (`err=0`), GPRs looked like LAPIC EOI
+(`rdx=0xfee000b0`), then `PF64: user unhandled -> killing process`.
+
+**Cause:** `getphys(DWORD)` zero-extended CR2, so `0xb000000000` walked as
+VA 0 (present identity) and the user-unhandled path killed `make`.
+
+**Not done:** loading `pagedir1` in IRQ C. Same-privilege IRQs still use the
+user stack; kernel CR3 does not map those private pages (`test-apuser` hung
+on the first `printf`). A kernel IRQ stack is required before that switch.
+
+**Fix:** `getphys64` walks the full VA through `KDIRECT`. User “unhandled”
+kill only if RIP is in the user ELF window.
+
+**Tests:** `make test-apuser` PASS; `make test-smp` PASS.
+
+**Current:** `make test-selfhost-cert-parallel CERT_TIMEOUT=28800`. Serial
+`/tmp/icsos-gccself.log`.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 17:40 — Restart SMP=4 cert (user `#PF` recover + UART `smp_cpu_id`)
+
+**Current:** `make test-selfhost-cert-parallel CERT_TIMEOUT=28800` on the
+kernel that passed `test-apuser` / `test-smp`. Serial `/tmp/icsos-gccself.log`.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 17:32 — Cert serial freeze: user `#PF` halted a CPU
+
+**Problem:** After 24× `GCC_DRIVER_OK`, COM1 stopped (~3.5 min) while QEMU
+still ran. Log had `PF64` in `make.exe` (`rip=0x3fffcc77` stack, `cr2=`
+high stack-ish) then `exc_showdump` / `while(1)` on that CPU. `USER_RUN` on
+every steal (~23k lines) called `serial_puts` which used `lapic_get_id()`
+under a user CR3.
+
+**Fix:** UART owner = `smp_cpu_id()`. `USER_RUN` once per CPU from idle.
+x86-64 user `#PF` recovers like GPF (kill process, do not halt).
+`test-apuser` requires `APUSER_PF_RECOVER_OK`. `make test-apuser` PASS;
+`test-smp` PASS.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 17:26 — Restart SMP=4 cert (AP SSE + idle steal + `rip=` watchdog)
+
+**Current:** `make test-selfhost-cert-parallel CERT_TIMEOUT=28800` with the
+kernel that passed `test-apuser`. Serial `/tmp/icsos-gccself.log`. Watch for
+`USER_RUN` on APs, `gccdriver: wrote` of `alias.o`/`attribs.o`/`auto-inc-dec.o`,
+and `WATCHDOG ... rip=` if those three stick again.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 17:15 — AP user `cc1` hang: SSE bring-up + idle steal + `test-apuser`
+
+**Problem:** SMP=4 cert parked three seed `cc1` on APs from the first `-j4`
+wave (`alias`/`attribs`/`auto-inc-dec`) with frozen `sc` and no yield. BSP
+finished the rest of the objects but `cc1-1.a` never built. Hung QEMU killed
+to free KVM.
+
+**Changes:** APs now match BSP SSE (`OSFXSR`/`OSXMMEXCPT`, `CR0.EM` clear)
+before `fxrstor`. Cooperative timer still does not preempt a running user
+tool, but idle CPUs fall through and steal ready work. Watchdog prints
+`rip=` from the interrupt frame. `USER_RUN cpu=` on first user switch.
+`console_puts` (user `printf`) holds the UART lock for the whole line.
+`make test-apuser` PASS (cooperative `user-smp`, 3 SSE workers, `USER_RUN`
+on CPUs 1 and 2). `test-smp` PASS. `test-boot` PASS.
+
+Finite AP user compute is not the cert hang; seed `cc1` on APs remains the
+open question. Hung cert QEMU was killed.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 17:06 — Cert check: printf fix held; 3 AP `cc1` livelock
+
+**Still running** (~33 min). No `GPF64` / `GCC_SELF_CERT_FAIL`. Long `ar rcs
+/work/libib.a` survived. 434× `GCC_DRIVER_OK`; archives through `libz.a`.
+
+**Issue:** the first `-j4` batch started `alias.c`, `attribs.c`,
+`auto-inc-dec.c`, and `alloc-pool.c`. `alloc-pool.o` finished. The other
+three `cc1.exe` (pids 42/44/45 on CPUs 2/3/1) have **never yielded**
+(`no-yield` ~1.2e6 ticks, `sc` stuck at 594655, last syscalls `sbrk`/`mmap`
+or `read`/`close`). `cc1-1.a` never built, so `cc1.exe` cannot link.
+
+All later compiles ran on the BSP with those three jobserver slots occupied.
+Looks like AP-bound seed `cc1` spinning in userspace, not a slow giant file.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 16:32 — Restart SMP=4 GCC self-host cert
+
+**Current:** `make test-selfhost-cert-parallel CERT_TIMEOUT=28800` restarted
+with bounded SDK `printf` / rebuilt `apps/make.exe`. Serial `/tmp/icsos-gccself.log`.
+First checkpoint: survive `ar rcs /work/libib.a` without `GPF64` in make.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
+
+### 16:23 — make GPF on long `printf` (`ar rcs libib.a`)
+
+**Failure:** `GPF64 err=0 rip=0x432b7e` (`printf` `ret`) in `/work/apps/make.exe`
+right after echoing the ~2 KiB `ar rcs /work/libib.a ...` recipe.
+`GCC_SELF_CERT_FAIL make bootstrap`. err=0 is a non-canonical RIP from a
+smashed return address, not a segment lookup.
+
+**Cause:** SDK `printf` `vsprintf`'d into a 1024-byte stack buffer then
+`console_puts`. A line longer than 1024 overwrote saved RBP/RIP.
+
+**Fix:** bounded `vsnprintf`; `printf`/`vprintf` atomically emit short lines
+and malloc a heap buffer for long ones. Rebuilt `apps/make.exe`.
+`make test-posixio` PASS including two `POSIXIO_PRINTF_LONG_OK` (no GPF).
+
+**Not claimed:** `GCC_SELF_CERT_PASS`. Re-run
+`make test-selfhost-cert-parallel` to get past `ar rcs /work/libib.a`.
+
+### 16:06 — SMP=4 GCC self-host cert (full `CERT_TIMEOUT=28800`)
+
+**Current:** `make test-selfhost-cert-parallel CERT_TIMEOUT=28800` is **running**
+(QEMU `-smp 4 -m 4096M`, cmdline `selfhost-stage1-parallel`). Serial:
+`/tmp/icsos-gccself.log`. After boot: 40× `GCC_DRIVER_OK`, temps on `/work`,
+into `cgraphunit.c`, no GPF/`Out of space`. COM2: `telnet 127.0.0.1 4555`.
+
+**Not claimed:** `GCC_SELF_CERT_PASS`.
 
 ### 15:53 — Concurrent `/work` writes: grow math + page-cache lookup
 

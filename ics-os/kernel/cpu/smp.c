@@ -2,6 +2,7 @@
 #include "lapic.h"
 #include "../process/process.h"
 #include "../cpu/context.h"
+#include "../memory/memlayout.h"
 
 extern int printf(const char *fmt, ...);
 extern int sprintf(char *str, const char *fmt, ...);
@@ -27,8 +28,74 @@ spinlock_t sched_lock;
 u8 smp_fpu_scratch[MAX_CPUS][512] __attribute__((aligned(16)));
 
 static u8 ap_stacks[MAX_CPUS][65536] __attribute__((aligned(16)));
+u64 irq_safe_stack_top[MAX_CPUS];
+u64 irq_safe_stack_base[MAX_CPUS];
 static PCB386 ap_idle_pcb[MAX_CPUS];
-static u8 ap_idle_stacks[MAX_CPUS][8192] __attribute__((aligned(16)));
+/* An idle task is ACCESS_SYS, so IRQ_KSTACK_ENTER stays on THIS stack (not
+   MEM_CPUIRQ and not a process kstack).  schedule_from_timer context-switches
+   from idle; the saved RIP/RSP must remain on this private stack.  Parking
+   idle on the per-CPU IRQ stack smashed that RIP into cpus[] (UD64 at
+   cpus+0x21) when the next FOREIGN IRQ reused the same top.  Every timer
+   IRQ still runs PUSH_ALL plus schedule_from_timer / scheduler /
+   zombie_drain / freeprocessmemory, the WATCHDOG and CRITHANG reporters
+   (256-byte sprintf buffers each), and any exception dump here.  8KiB did
+   not cover that, and because the stacks are adjacent an overflow ran off
+   the bottom into the neighbouring CPU's idle stack -- indistinguishable
+   from "another CPU is writing my frames".  IDLE_GUARD words below each
+   stack turn a future overflow into a report instead of silent corruption
+   of another CPU. */
+/* Sized to fit the BSS budget: the kernel image must stay below the 4MiB user
+   ELF window (lscript64.ld enforces it), and these are MAX_CPUS deep. */
+#define IDLE_STACK_SIZE   0x4000UL
+#define IDLE_GUARD_WORDS  16
+#define IDLE_GUARD_MAGIC  0x1D1E57AC61D1E57AULL
+
+/* guard[] sits immediately BELOW stack[] inside each element, so an overflow of
+   this CPU's stack lands in its own guard before it can reach the previous
+   element's stack. */
+typedef struct {
+    u64 guard[IDLE_GUARD_WORDS];
+    u8  stack[IDLE_STACK_SIZE];
+} idle_stack_t;
+
+static idle_stack_t ap_idle_stack[MAX_CPUS] __attribute__((aligned(16)));
+
+/* Only APs get an ap_prepare_idle(); the BSP never runs on ap_idle_stack[0], so
+   its guard is never armed and must not be checked. */
+static volatile int ap_idle_guard_armed[MAX_CPUS];
+
+static void ap_idle_guard_arm(int id)
+{
+    int i;
+    for (i = 0; i < IDLE_GUARD_WORDS; i++)
+        ap_idle_stack[id].guard[i] = IDLE_GUARD_MAGIC;
+    ap_idle_guard_armed[id] = 1;
+}
+
+/* Called from the timer path; returns 1 once per CPU when the guard is broken. */
+int smp_idle_guard_check(int id)
+{
+    static volatile int reported[MAX_CPUS];
+    int i;
+
+    if (id < 0 || id >= MAX_CPUS || reported[id] || !ap_idle_guard_armed[id])
+        return 0;
+    /* Walk downward from the word nearest the stack: that is the first one an
+       overflow touches, so it names the smallest overrun. */
+    for (i = IDLE_GUARD_WORDS - 1; i >= 0; i--) {
+        if (ap_idle_stack[id].guard[i] != IDLE_GUARD_MAGIC) {
+            char b[160];
+            reported[id] = 1;
+            sprintf(b, "IDLE-STACK-OVERFLOW cpu=%d word=%d val=0x%llx "
+                       "base=0x%lx\n",
+                    id, i, (unsigned long long)ap_idle_stack[id].guard[i],
+                    (unsigned long)(uintptr)&ap_idle_stack[id].stack[0]);
+            serial_puts(b);
+            return 1;
+        }
+    }
+    return 0;
+}
 static volatile int ap_claimed = 0;
 static volatile int ap_boot_state = 0;
 static volatile int ap_boot_apic = -1;
@@ -44,6 +111,41 @@ static volatile u32 tlb_shootdown_ack[MAX_CPUS];
    non-owner leave under make -j4).  RDTSCP reads TSC_AUX without a memory
    walk.  GS cannot hold this: startup/kexec reload %gs from the GDT. */
 #define MSR_IA32_TSC_AUX 0xC0000103u
+#define MSR_IA32_GS_BASE 0xC0000101u
+
+void smp_gs_publish(int id)
+{
+    u64 base;
+    u32 lo, hi;
+    if (id < 0 || id >= MAX_CPUS)
+        return;
+    cpus[id].cpu_id = id;
+    base = (u64)(uintptr)&cpus[id];
+    lo = (u32)base;
+    hi = (u32)(base >> 32);
+    __asm__ __volatile__("wrmsr"
+                         :
+                         : "c"(MSR_IA32_GS_BASE), "a"(lo), "d"(hi)
+                         : "memory");
+}
+
+static cpu_local *smp_gs_local(void)
+{
+    u32 lo, hi;
+    u64 base, first, last;
+    __asm__ __volatile__("rdmsr"
+                         : "=a"(lo), "=d"(hi)
+                         : "c"(MSR_IA32_GS_BASE)
+                         : "memory");
+    base = ((u64)hi << 32) | lo;
+    first = (u64)(uintptr)&cpus[0];
+    last = (u64)(uintptr)&cpus[MAX_CPUS - 1];
+    if (base < first || base > last)
+        return 0;
+    if ((base - first) % sizeof(cpu_local))
+        return 0;
+    return (cpu_local *)(uintptr)base;
+}
 
 static void smp_publish_cpu_id(int id)
 {
@@ -69,7 +171,8 @@ static int smp_cpu_id_from_lapic(void)
     return -1;
 }
 
-static int smp_have_rdtscp = -1;
+/* irqwrap.S only executes RDTSCP when this is 1 (set in smp_init). */
+int smp_have_rdtscp = -1;
 
 static int smp_rdtscp_available(void)
 {
@@ -93,7 +196,12 @@ static int smp_rdtscp_available(void)
 }
 
 int smp_cpu_id(void) {
-    int id;
+    cpu_local *c;
+    int id = -1;
+    int gs_id = -1;
+    /* irqwrap.S uses RDTSCP/TSC_AUX.  GS must agree or claim/current
+       publish uses a different id than the stack switch and two CPUs
+       share one PCB (owner on_cpu=2 while that CPU runs the waiter). */
     if (smp_rdtscp_available()) {
         u32 aux, lo, hi;
         __asm__ __volatile__("rdtscp"
@@ -101,8 +209,18 @@ int smp_cpu_id(void) {
                              :
                              : "memory");
         if (aux < (u32)MAX_CPUS)
-            return (int)aux;
+            id = (int)aux;
     }
+    c = smp_gs_local();
+    if (c && c->cpu_id >= 0 && c->cpu_id < MAX_CPUS)
+        gs_id = c->cpu_id;
+    if (id >= 0) {
+        if (gs_id != id)
+            smp_gs_publish(id);
+        return id;
+    }
+    if (gs_id >= 0)
+        return gs_id;
     id = smp_cpu_id_from_lapic();
     if (id >= 0)
         return id;
@@ -129,7 +247,14 @@ static void smp_tlb_process_requests(int cpu)
 }
 
 cpu_local *smp_this_cpu(void) {
-    return &cpus[smp_cpu_id()];
+    /* Do not return smp_gs_local() just because the base is inside cpus[].
+       A leftover GS pointing at cpus[0] made every AP's current_process
+       (and crit nest, waitpid, COW) operate on the BSP slot — two CPUs
+       on one PCB.  smp_cpu_id() prefers TSC_AUX and repairs GS. */
+    int id = smp_cpu_id();
+    if (id < 0 || id >= MAX_CPUS)
+        id = 0;
+    return &cpus[id];
 }
 
 void smp_enable_scheduling(void) {
@@ -144,9 +269,25 @@ void smp_enable_scheduling(void) {
 }
 
 void smp_cpu_idle(void) {
+    int me;
+    PCB386 *idle, *cur;
     /* Arm LAPIC timer only once we are on the idle stack with kernel GDT. */
-    if (smp_cpu_id() != 0)
+    me = smp_cpu_id();
+    if (me != 0)
         smp_ap_enable_timer();
+    idle = (me >= 0 && me < MAX_CPUS) ? (PCB386 *)cpus[me].idle : 0;
+    cur = (me >= 0 && me < MAX_CPUS) ? (PCB386 *)cpus[me].current : 0;
+    if (idle && cur && cur != idle) {
+        char b[128];
+        sprintf(b, "IDLE-STALE-CURRENT cpu=%d pid=%d on_cpu=%d\n",
+                me, (int)cur->processid, cur->on_cpu);
+        serial_puts(b);
+        if (cur->on_cpu == me)
+            cur->on_cpu = -1;
+        cpus[me].current = idle;
+        idle->on_cpu = me;
+        __sync_synchronize();
+    }
     for (;;) {
         __asm__ __volatile__("sti; hlt");
     }
@@ -319,15 +460,16 @@ static void ap_prepare_idle(int id) {
     idle->priority = 0;
     idle->pagedirloc = pagedir1;
     strcpy(idle->name, "cpu_idle");
+    ap_idle_guard_arm(id);
     idle->regs.EIP = (DWORD)(uintptr)smp_cpu_idle;
-    idle->regs.ESP = (DWORD)(uintptr)&ap_idle_stacks[id][8192];
+    idle->regs.ESP = (DWORD)(uintptr)&ap_idle_stack[id].stack[IDLE_STACK_SIZE];
     idle->regs.EFLAGS = 0x202;
     idle->regs.CS = 0x08; /* SYS_CODE_SEL */
     idle->regs.SS = 0x10; /* SYS_DATA_SEL */
     idle->regs.DS = 0x10;
     idle->ctx.rip = (u64)(uintptr)smp_cpu_idle;
     {
-        uintptr top = (uintptr)&ap_idle_stacks[id][8192];
+        uintptr top = (uintptr)&ap_idle_stack[id].stack[IDLE_STACK_SIZE];
         top &= ~(uintptr)15;
         top -= 8;
         idle->regs.ESP = (DWORD)top;
@@ -345,6 +487,21 @@ static void ap_prepare_idle(int id) {
     ps_enqueue(idle);
 }
 
+/* BSP startup.S enables OSFXSR/OSXMMEXCPT and clears CR0.EM. The AP
+   trampoline only sets PAE+PG+WP, so fxrstor and SSE #UD on APs unless
+   we match the BSP here before the first fpu_restore or user cc1. */
+static void ap_enable_sse(void)
+{
+    unsigned long cr0, cr4;
+    __asm__ __volatile__("movq %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~4UL;
+    cr0 |= 2UL | (1UL << 16);
+    __asm__ __volatile__("movq %0, %%cr0" :: "r"(cr0) : "memory");
+    __asm__ __volatile__("movq %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1UL << 9) | (1UL << 10);
+    __asm__ __volatile__("movq %0, %%cr4" :: "r"(cr4) : "memory");
+}
+
 void ap_main(void) {
     int id;
     int apic;
@@ -352,6 +509,7 @@ void ap_main(void) {
     /* Leave the trampoline GDT; IDT gates use kernel CS selectors. */
     ap_load_kernel_gdt();
     loadregisters(); /* same IDT as BSP */
+    ap_enable_sse();
 
     apic=(int)lapic_get_id();
     if (ap_boot_state!=1 || ap_boot_apic!=apic) {
@@ -366,6 +524,7 @@ void ap_main(void) {
             __asm__ __volatile__("cli; hlt");
     }
     smp_publish_cpu_id(id);
+    smp_gs_publish(id);
     cpus[id].cpu_id = id;
     cpus[id].apic_id = (u32)apic;
     cpus[id].online = 0;
@@ -398,18 +557,29 @@ void ap_main(void) {
     /* Enter idle with IF clear; idle arms the timer then sti/hlt. */
     fpu_restore(&ap_idle_pcb[id].fpu);
     __asm__ __volatile__("cli");
-    context_load(&ap_idle_pcb[id].ctx);
+    context_load(&ap_idle_pcb[id].ctx, id);
     /* not reached */
     smp_cpu_idle();
 }
 
 void smp_init(void) {
+    (void)smp_rdtscp_available();
     spin_init(&sched_lock);
     memset(cpus, 0, sizeof(cpus));
+    {
+       int i;
+       for (i = 0; i < MAX_CPUS; i++) {
+          irq_safe_stack_base[i] =
+             (u64)MEM_CPUIRQ_BASE + (u64)i * MEM_CPUIRQ_STACK;
+          irq_safe_stack_top[i] =
+             irq_safe_stack_base[i] + MEM_CPUIRQ_STACK;
+       }
+    }
     cpus[0].cpu_id = 0;
     cpus[0].apic_id = lapic_get_id();
     cpus[0].online = 1;
     smp_publish_cpu_id(0);
+    smp_gs_publish(0);
     /* The BSP needs its own per-CPU kernel stack for int 0x30 / timer
        entry: user ELFs run in kernel CS (CPL 0), so those traps are
        same-privilege and never load a TSS RSP0.  Without this, the

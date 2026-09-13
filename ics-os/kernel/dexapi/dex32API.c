@@ -292,41 +292,45 @@ api_arg_t syscallentry64(api_arg_t sysno, api_arg_t a0, api_arg_t a1,
                          api_arg_t a2, api_arg_t a3, api_arg_t a4)
 {
    struct k_iovec iov;
+   api_arg_t r = (api_arg_t)(long)-38;
    switch ((unsigned)sysno) {
    case 0:  /* read(fd, buf, n) */
-      return api_syscall(0xA4, a0, a1, a2, 0, 0);
+      r = api_syscall(0xA4, a0, a1, a2, 0, 0); break;
    case 1:  /* write(fd, buf, n) */
-      return api_syscall(0xA5, a0, a1, a2, 0, 0);
+      r = api_syscall(0xA5, a0, a1, a2, 0, 0); break;
    case 2:  /* open(path, flags, mode) */
-      return api_syscall(0xA7, a0, a1, a2, 0, 0);
+      r = api_syscall(0xA7, a0, a1, a2, 0, 0); break;
    case 3:  /* close(fd) */
-       return api_syscall(0xA8, a0, 0, 0, 0, 0);
+       r = api_syscall(0xA8, a0, 0, 0, 0, 0); break;
     case 32: /* dup(oldfd) */
-       return api_syscall(0xC5, a0, 0, 0, 0, 0);
+       r = api_syscall(0xC5, a0, 0, 0, 0, 0); break;
     case 4:  /* stat */
-       return api_syscall(36, a0, a1, 0, 0, 0);
+       r = api_syscall(36, a0, a1, 0, 0, 0); break;
    case 5:  /* fstat(fd, buf) */
-      return api_syscall(0xAF, a0, a1, 0, 0, 0);
+      r = api_syscall(0xAF, a0, a1, 0, 0, 0); break;
    case 8:  /* lseek */
-      return api_syscall(0xA9, a0, a1, a2, 0, 0);
+      r = api_syscall(0xA9, a0, a1, a2, 0, 0); break;
    case 12: /* brk */
       if (a0 == 0)
-         return (api_arg_t)(uintptr)current_process->knext;
-      {
+         r = (api_arg_t)(uintptr)current_process->knext;
+      else {
          unsigned long cur = (unsigned long)(uintptr)current_process->knext;
          unsigned long want = (unsigned long)a0;
          if (want > cur)
             api_syscall(9, (api_arg_t)(want - cur), 0, 0, 0, 0);
-         return (api_arg_t)(uintptr)current_process->knext;
+         r = (api_arg_t)(uintptr)current_process->knext;
       }
+      break;
    case 17: /* pread64 */
       iov.iov_base = (void *)(uintptr)a1;
       iov.iov_len = (unsigned long)a2;
-      return (api_arg_t)sys_preadv((int)a0, &iov, 1, (long)a3);
+      r = (api_arg_t)sys_preadv((int)a0, &iov, 1, (long)a3);
+      break;
    case 18: /* pwrite64 */
       iov.iov_base = (void *)(uintptr)a1;
       iov.iov_len = (unsigned long)a2;
-      return (api_arg_t)sys_pwritev((int)a0, &iov, 1, (long)a3);
+      r = (api_arg_t)sys_pwritev((int)a0, &iov, 1, (long)a3);
+      break;
    case 19: /* readv — treat as preadv at current offset */
       {
          long off = sys_lseek((int)a0, 0, 1);
@@ -334,8 +338,9 @@ api_arg_t syscallentry64(api_arg_t sysno, api_arg_t a0, api_arg_t a1,
                              (int)a2, off);
          if (n > 0)
             sys_lseek((int)a0, off + n, 0);
-         return (api_arg_t)n;
+         r = (api_arg_t)n;
       }
+      break;
    case 20: /* writev */
       {
          long off = sys_lseek((int)a0, 0, 1);
@@ -343,33 +348,36 @@ api_arg_t syscallentry64(api_arg_t sysno, api_arg_t a0, api_arg_t a1,
                               (int)a2, off);
          if (n > 0)
             sys_lseek((int)a0, off + n, 0);
-         return (api_arg_t)n;
+         r = (api_arg_t)n;
       }
+      break;
    case 39: /* getpid */
-      return api_syscall(2, 0, 0, 0, 0, 0);
+      r = api_syscall(2, 0, 0, 0, 0, 0); break;
    case 60: /* exit */
-      return api_syscall(3, a0, 0, 0, 0, 0);
+      r = api_syscall(3, a0, 0, 0, 0, 0); break;
    case 74: /* fsync */
-      return api_syscall(0xAC, a0, 0, 0, 0, 0);
+      r = api_syscall(0xAC, a0, 0, 0, 0, 0); break;
    case 79: /* getcwd */
-      return api_syscall(0x43, a0, a1, 0, 0, 0);
+      r = api_syscall(0x43, a0, a1, 0, 0, 0); break;
    case 201: /* time */
-      return api_syscall(0x55, a0, 0, 0, 0, 0);
+      r = api_syscall(0x55, a0, 0, 0, 0, 0); break;
    case 257: /* openat(dirfd, path, flags, mode) */
       (void)a0;
-      return api_syscall(0xA7, a1, a2, a3, 0, 0);
+      r = api_syscall(0xA7, a1, a2, a3, 0, 0); break;
    case 295: /* preadv */
-      return api_syscall(0xAA, a0, a1, a2, a3, 0);
+      r = api_syscall(0xAA, a0, a1, a2, a3, 0); break;
    case 296: /* pwritev */
-      return api_syscall(0xAB, a0, a1, a2, a3, 0);
+      r = api_syscall(0xAB, a0, a1, a2, a3, 0); break;
    case 425: /* io_uring_setup */
-      return api_syscall(0xAD, a0, a1, 0, 0, 0);
+      r = api_syscall(0xAD, a0, a1, 0, 0, 0); break;
    case 426: /* io_uring_enter */
-      return api_syscall(0xAE, a0, a1, a2, a3, 0);
+      r = api_syscall(0xAE, a0, a1, a2, a3, 0); break;
    default:
       (void)a4;
-      return (api_arg_t)(long)-38; /* -ENOSYS */
+      r = (api_arg_t)(long)-38; /* -ENOSYS */
+      break;
    }
+   return r;
 }
 #endif      
 

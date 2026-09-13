@@ -7,6 +7,7 @@
 .extern smp_cpu_id
 .extern smp_fpu_scratch
 .extern ctx_load_in_progress
+.extern ps_switchto_in_progress
 .extern ctx_load_check
 
 .set CTX_R15, 0
@@ -33,7 +34,11 @@
 .set CTX_RETCANARY, 168
 
 context_switch:
-    /* rdi=old, rsi=new, rdx=&old->on_cpu (or NULL) — save then release claim */
+    /* rdi=old, rsi=new, rdx=&old->on_cpu (or NULL), rcx=cpu_id.
+       Save old, then load new.  Release the old claim only after RSP is
+       on the new stack (see context_load).  cpu_id is the value captured
+       by the caller: re-querying smp_cpu_id() here cleared the wrong
+       ps_switchto_in_progress slot when GS and TSC_AUX disagreed. */
     cli
     movq %r15, CTX_R15(%rdi)
     movq %r14, CTX_R14(%rdi)
@@ -69,25 +74,24 @@ context_switch:
     movq %cr3, %rax
     movq %rax, CTX_CR3(%rdi)
 
-    /* Old task is fully saved — allow another CPU to pick it up. */
-    testq %rdx, %rdx
-    jz 3f
-    movl $-1, (%rdx)
-3:
+    /* rdx still &old->on_cpu; rcx still cpu_id.  Do not release yet. */
     movq %rsi, %rdi
+    movq %rcx, %rsi
+    jmp context_load_from_switch
 
 /* Ring-3 note: CTX_CS/SS are saved for a future iretq path. Today we
    ret to kernel CS; user processes record USER_CODE in PCB.usercs. */
 /* Ring-3: CTX_CS/SS saved for a future iretq. Today we `ret` in kernel CS. */
+.globl context_load
 context_load:
-      /* CR3, RSP, and GPR restoration is not interruptible.  The destination
-          RFLAGS below re-enables interrupts after ctx_load_in_progress is set.
-          Query the CPU id BEFORE loading the destination CR3/RSP so the call
-          cannot clobber the destination task's live stack frame. */
+    /* rdi=ctx, rsi=cpu_id.  C callers have a garbage rdx; do not release. */
+    xorq %rdx, %rdx
+context_load_from_switch:
+      /* rdi=ctx, rsi=cpu_id, rdx=&old->on_cpu or NULL.
+          CR3, RSP, and GPR restoration is not interruptible. */
       cli
     movq %rdi, %r13
-    call smp_cpu_id
-    movl %eax, %r11d
+    movl %esi, %r11d
     movq CTX_CR3(%r13), %rax
     testq %rax, %rax
     jz 1f
@@ -95,6 +99,11 @@ context_load:
     movq %rax, %cr3
 1:
     movq CTX_RSP(%r13), %rsp
+    /* Old task is fully saved and we are off its stack. */
+    testq %rdx, %rdx
+    jz 4f
+    movl $-1, (%rdx)
+4:
     /* Run the canary check only for the user-task/kernel-epilogue case.  The
        C call executes on the destination stack, so avoid it for early kernel
        idle/thread contexts.  R12 is callee-saved and carries the CPU id. */
@@ -139,6 +148,8 @@ context_load:
        enabled while the flag was already clear and the RIP had not yet been
        pushed. */
     leaq ctx_load_in_progress(%rip), %rax
+    movl $0, (%rax,%r11,4)
+    leaq ps_switchto_in_progress(%rip), %rax
     movl $0, (%rax,%r11,4)
     movq %r10, %r11
     movq CTX_R10(%r13), %r10

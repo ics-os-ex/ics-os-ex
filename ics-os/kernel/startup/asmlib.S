@@ -336,3 +336,44 @@ move_cursor:
     movb %bh, %al
     outb %al, %dx
     ret
+
+/* COM1/COM2 TX using only GPRs. C uart_putc_raw reloaded uart_dev* from the
+   user stack after inportb(); that slot was 0xfb002398a0 and #PF'd in
+   kernel text, then the PF handler's serial_puts re-entered and halted. */
+.globl uart_com1_putc
+uart_com1_putc:
+    movl $0x3FD, %edx
+    movl $100000, %ecx
+1:
+    inb %dx, %al
+    testb $0x20, %al
+    jnz 2f
+    decl %ecx
+    jz 3f
+    pause
+    jmp 1b
+2:
+    movl $0x3F8, %edx
+    movl %edi, %eax
+    outb %al, %dx
+3:
+    ret
+
+.globl uart_com2_putc
+uart_com2_putc:
+    movl $0x2FD, %edx
+    movl $100000, %ecx
+1:
+    inb %dx, %al
+    testb $0x20, %al
+    jnz 2f
+    decl %ecx
+    jz 3f
+    pause
+    jmp 1b
+2:
+    movl $0x2F8, %edx
+    movl %edi, %eax
+    outb %al, %dx
+3:
+    ret

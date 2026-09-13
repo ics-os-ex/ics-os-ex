@@ -37,7 +37,7 @@ volatile unsigned long kheap_ev_seq;
 
 static unsigned long kheap_chunk_size(unsigned long p)
 {
-    if (p >= 0x02000000UL && p < 0x06000000UL)
+    if (p >= 0x02040000UL && p < 0x06000000UL)
       {
        unsigned long s = ((volatile unsigned long *)(p - 8))[0] & ~7UL;
        if (s >= 16 && s < 0x04000000UL)

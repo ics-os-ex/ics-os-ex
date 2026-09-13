@@ -212,12 +212,9 @@ int vfs_listdir(vfs_node *current_dir,vfs_node *buffer,int size)
     
     
     
-    //The directory might not yet be mounted so mount it 
-    if (dptr->files == VFS_NOT_MOUNTED) vfs_mountdirectory(dptr);
-    
-    //enter critical section, prevent other VFS operations from\
-    //taking plce until we leave
+    /* Mount under vfs_busy: fat_mountdirectory takes the volume lock. */
     sync_entercrit(&vfs_busy);
+    if (dptr->files == VFS_NOT_MOUNTED) vfs_mountdirectory(dptr);
     
     //obtain the starting VFS file node
     fileptr = dptr->files;

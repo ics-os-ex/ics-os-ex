@@ -233,9 +233,10 @@ int vprintf_help(unsigned c, void **ptr,FILE *f){
    return 0 ;
 }
 
+static int sdk_vprint(const char *fmt, va_list args);
 
 int vprintf(const char *fmt, va_list args){
-	return do_printf(fmt, args, vprintf_help,0,NULL);
+	return sdk_vprint(fmt, args);
 }
 
 
@@ -479,21 +480,22 @@ EMIT2:				if((flags & PR_LJ) == 0)
 /* toupper/tolower live in posix.c */
 
 int vsprintf(char *buffer, const char *fmt, va_list args);
+int vsnprintf(char *buffer, size_t n, const char *fmt, va_list args);
 
 /* Format into a local buffer and emit the WHOLE line in one non-require-ints
    syscall (0xB5 = console_puts). The int 0x30 entry leaves IF=0 for the entire
    kernel call, so a timer IRQ / scheduler context switch cannot fire between
-   characters; the line cannot be torn by kernel teardown output. */
+   characters; the line cannot be torn by kernel teardown output. Lines longer
+   than the stack buffer used to overflow and GPF on ret (make echoing `ar rcs`
+   of libib.a); those allocate or stream instead. */
 int printf(const char *fmt, ...)
 {
 	va_list args;
-	char buf[1024];
 	int ret_val;
 
 	va_start(args, fmt);
-	ret_val = vsprintf(buf, fmt, args);
+	ret_val = sdk_vprint(fmt, args);
 	va_end(args);
-	dexsdk_systemcall(0xB5, (long)buf, (long)ret_val, 0, 0, 0);
 	return ret_val;
 }
 
@@ -749,11 +751,69 @@ int vsprintf_help(unsigned c, void **ptr ){
         *ptr = dst;
         return 0 ;
 }
-/*****************************************************************************
-*****************************************************************************/
-/**
- * FIXME
- */ 
+
+typedef struct sdk_sn {
+        char *p;
+        unsigned long left;
+} sdk_sn;
+
+static int vsnprintf_help(unsigned c, void **ptr)
+{
+        sdk_sn *s = *(sdk_sn **)ptr;
+        if (s->p && s->left > 1) {
+                *s->p++ = (char)c;
+                s->left--;
+        }
+        return 0;
+}
+
+int vsnprintf(char *buffer, size_t n, const char *fmt, va_list args)
+{
+        sdk_sn ctx, *pc = &ctx;
+        int ret_val;
+        ctx.p = buffer;
+        ctx.left = (buffer && n) ? (unsigned long)n : 0;
+        ret_val = do_sprintf(fmt, args, vsnprintf_help, (void *)&pc);
+        if (buffer && n) {
+                size_t term = (size_t)ret_val;
+                if (term >= n)
+                        term = n - 1;
+                buffer[term] = 0;
+        }
+        return ret_val;
+}
+
+static int sdk_vprint(const char *fmt, va_list args)
+{
+        char buf[1024];
+        va_list args2;
+        int n;
+        char *big;
+
+        va_copy(args2, args);
+        n = vsnprintf(buf, sizeof(buf), fmt, args);
+        if (n < 0) {
+                va_end(args2);
+                return n;
+        }
+        if ((size_t)n < sizeof(buf)) {
+                va_end(args2);
+                dexsdk_systemcall(0xB5, (long)buf, (long)n, 0, 0, 0);
+                return n;
+        }
+        big = (char *)malloc((size_t)n + 1);
+        if (!big) {
+                n = do_printf(fmt, args2, vprintf_help, 0, NULL);
+                va_end(args2);
+                return n;
+        }
+        vsnprintf(big, (size_t)n + 1, fmt, args2);
+        va_end(args2);
+        dexsdk_systemcall(0xB5, (long)big, (long)n, 0, 0, 0);
+        free(big);
+        return n;
+}
+
 int vsprintf(char *buffer, const char *fmt, va_list args){
         int ret_val;
         /* do_sprintf advances the pointer it is given (vsprintf_help writes

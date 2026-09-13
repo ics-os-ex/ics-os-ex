@@ -17,8 +17,9 @@ typedef struct __attribute__((aligned(16))) _fpu_state {
     u8 fx[512];
 } fpu_state;
 
-void context_switch(cpu_context *old, cpu_context *newctx, volatile int *release_on_cpu);
-void context_load(cpu_context *ctx);
+void context_switch(cpu_context *old, cpu_context *newctx,
+                    volatile int *release_on_cpu, int cpu_id);
+void context_load(cpu_context *ctx, int cpu_id);
 void ctx_load_check(cpu_context *ctx);
 void fpu_save(fpu_state *s);
 void fpu_restore(fpu_state *s);

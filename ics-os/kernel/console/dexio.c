@@ -511,8 +511,20 @@ api_arg_t console_puts(api_arg_t str, api_arg_t len,
    const char *s = (const char *)str;
    int i;
    int n = (int)len;
-   for (i = 0; i < n; i++)
-      putcEX(s[i]);
+   extern void serial_write(const char *s, int n);
+   (void)a3; (void)a4; (void)a5;
+   serial_write(s, n);
+#ifdef USE_CONSOLEDDL
+   if (consoleDDL) {
+      DEX32_DDL_INFO *d = Dex32GetProcessDevice();
+      if (d) {
+         for (i = 0; i < n; i++)
+            Dex32PutC(d, s[i]);
+      }
+   }
+#else
+   (void)i;
+#endif
    return n;
 }
 

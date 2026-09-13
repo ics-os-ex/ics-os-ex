@@ -53,7 +53,81 @@ Default scheduler is **priority round-robin** (`process/scheduler.c`):
   which a LAPIC-only id would return 0 and the AP would enter/leave crits as
   the BSP process. A LAPIC id match is only a fallback if TSC_AUX is unset.
 - APs come up **parked** until `smp_enable_scheduling()` after a successful root mount, then load the **kernel GDT**, arm a **LAPIC timer on vector 0x41**, and participate in scheduling.
-- Ready-queue tasks are claimed via `on_cpu`; `cpu_affinity` pins console/`fg_mgr`/user processes to the BSP. APs run migratable kthreads (see `ap_work` smoke).
+- Ready-queue tasks are claimed via `on_cpu`. Console/`fg_mgr` stay BSP-pinned.
+   User processes are BSP-pinned unless `user_procs_smp` is set (`user-smp` or
+  `selfhost-stage1-parallel`). APs enable SSE (`CR4.OSFXSR|OSXMMEXCPT`,
+  `CR0.EM` clear) before `fxrstor`. UART `serial_puts` identifies the CPU with
+  `smp_cpu_id()` (never LAPIC MMIO under a user CR3). COM1 TX is GPR-only
+  (`uart_com1_putc`); do not reload a `uart_dev*` from the user stack after
+  `inportb`. Same-privilege IRQs move kernel C onto a per-process kheap stack
+  before running any C. `IRQ_KSTACK_ENTER` switches RSP with RDTSCP/TSC_AUX (no
+  C prologue on the interrupted stack); it does not execute `rdtscp` unless
+  `smp_have_rdtscp==1` (TCG qemu64 may #UD), and it refuses to use a kstack
+  whose task is not claimed by this CPU (`PCB.on_cpu`).
+  Nesting is **stateless**: stay when RSP is already on `[kstack_base,
+  kstack_top)` or `MEM_CPUIRQ`; switch to the process kstack only from the
+  user stack (`MEM_USER_STACK_GUARD`..`MEM_USER_STACK`). A claimed user whose
+  interrupted RSP is some other kernel stack stays there so
+  `kstack_top` is not reset over a saved syscall `iretq` frame. Each wrapper
+  reads its own `PUSH_ALL` frame from `%r13`, and `IRQ_KSTACK_LEAVE` is just
+  `cli; movq %r13, %rsp`.
+  `%r13` is callee-saved and is preserved by `context_switch`/`context_load`, so
+  it survives a reschedule mid-syscall. Do not reintroduce a nesting counter or
+  a PCB-held restore pointer: with those, a nested `#PF`/`#GP` read its error
+  code at the outermost frame's offset and `iretq`'d from the syscall's user
+  frame after `addq $8` for an error code that frame never had (`GPF64 rip=0x8
+  cs=0x206`, i.e. CS landing in the RIP slot).
+  Do not load the kernel PML4 while RSP still points at a user-private page.
+  `fork` COW uses `PCB.irq_user_rsp` (recorded by the outermost entry).
+- **One PCB, one CPU.** `PCB.on_cpu` is the claim. Every claim must be a CAS:
+  `scheduler()`, `ps_switchto()`, and `self_exit_current()` claim without a
+  common lock, so a plain store or a test-then-assign lets two CPUs run one
+  PCB — and therefore share one IRQ kstack, with each CPU's locals overwriting
+  the other's frames. Never publish `current_process` for a task this CPU has
+  not claimed; `ps_switchto()` publishes only after the claim is re-verified
+  with interrupts off. `irq_kstack_enter()` prints `KSTACK-FOREIGN cpu=/owner=`
+  when this invariant breaks — that line is the fastest way to identify the
+  class of "random" kernel corruption on APs. `make test-stress-user-smp` is
+  the gate. The last-resort successor in `self_exit_current()` must be this
+  CPU's own idle task, force-claimed. `&sPCB` is a *single global* `PCB386`
+  with one `ctx.rsp`, so two CPUs falling back to it resume one context on one
+  stack. The signature of any shared-stack bug is a 64-bit stack slot whose
+  high half holds another CPU's 32-bit `smp_cpu_id()` result: a return address
+  read back as `0x1_xxxxxxxx`, usually faulting in the serial path with
+  `rdi = &uart1`.
+- **Fork's child `iretq` frame is this syscall's `%r13`, not `irq_user_rsp`.**
+  `fork_child_return` does `POP_ALL; iretq` over the interrupted user PUSH_ALL
+  (15 GPRs + RIP/CS/RFLAGS; same-privilege, no SS:RSP). The wrapper must pass
+  `%r13`; trusting a stale `irq_user_rsp` (a prior timer frame) is a 16-byte
+  shift that shows up as `UD64 rip=0x207` (RFLAGS popped as RIP).
+  `userpd_clone_cow` private-copies both pages the 144-byte frame occupies.
+  `IRQ_KSTACK_ENTER` needs RDTSCP (TCG: `-cpu qemu64,+rdtscp`) or kernel C
+  runs on the user stack and spills `KDIRECT()` pointers into the child's
+  frame. `make test-fork` (`FORK_STRADDLE_PASS`) is the gate.
+- **A spinning lock waiter must never outrank the lock's owner.** User
+  processes get `priority = 1` (`process.c`) while kernel threads keep `0`, so
+  comparing raw priority let a spinning user process win every `scheduler()`
+  pass forever while the BSP-pinned holder (`disk_mgr`) sat runnable in the
+  ready queue — `no-yield` climbing with `critspins` in the tens of millions.
+  `sched_eff_prio()` ranks a `crit_wait` task at the floor; the cooperative
+  early return in `schedule_from_timer()` also skips a `crit_wait` task. This
+  is why `crit_wait` must be exact: `sync_entercrit()` performs the CAS,
+  `crit_wait = 0`, `var->wait = 1` and `sync_track_hold()` in one
+  interrupts-off region, because a holder still flagged as a waiter gets
+  demoted to the floor while owning a hot lock.
+- **Debugging a lock hang.** `CRITHANG hop=N crit=... owner=... wants=...`
+  prints the whole wait-for chain (`sync_report_owner()`), and `CRITCYCLE`
+  fires when the chain closes — that is what separates a lock-order inversion
+  from CPU starvation. Resolve crit addresses with
+  `nm -n kernel/Kernel64.sym`. `make test-fatwrite-coop` reproduces the
+  closure's scheduling regime without a stage-1 kexec kernel.
+  `getphys64()` walks page tables through `KDIRECT` and must not truncate
+  CR2 to 32 bits. A kernel-text `#PF` must not kill the current user
+  process or `while(1)` on nested `serial_puts`. Cooperative stage-1
+  timers do not preempt a running user tool, but idle CPUs still steal ready
+  work. A user `#PF` kills that process and resumes the parent; it must not
+  `while(1)` the CPU. A `#PF` whose RIP is still in the kernel image is not
+  treated as a user kill.
 - `IPI_RESCHEDULE` (0xFC) may `taskswitch()` only when the interrupted task is
   idle or `ACCESS_SYS`. A user process is not preempted from that wrapper:
   software `context_switch` from the IPI frame enables IF before `iretq` and
@@ -72,6 +146,14 @@ Default scheduler is **priority round-robin** (`process/scheduler.c`):
   concurrent console output cannot corrupt acceptance markers.
 - QEMU defaults to four CPUs for `make test-smp`; override with
   `SMP_CPUS=1..8`. `make test-smp-matrix` validates 1/2/4/8 CPUs.
+
+Why these bugs take days and which of them are design rather than "SMP
+is hard" is collected in [smp-debugging-hardness.md](smp-debugging-hardness.md).
+The short version: same-privilege user IRQs, a per-process kstack whose
+owner is a CAS convention, and crit tokens sampled from `current` at
+both enter and leave turn every claim race into a `#GP` in `vsprintf`
+or a stuck `vfs_busy`. A single switch primitive and CPU-local IRQ
+stacks delete most of that class.
 
 Current bare-metal discovery still assumes contiguous legacy xAPIC IDs starting
 at one. ACPI MADT parsing, sparse APIC IDs, x2APIC, NUMA topology, CPU hotplug,

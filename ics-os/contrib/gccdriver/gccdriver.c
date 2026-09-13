@@ -45,6 +45,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <spawn.h>
@@ -155,8 +156,10 @@ static int run_tool(const char *path, char *const argv[])
    /* Wait before printing: the child shares the serial console, and the SDK
       printf is char-at-a-time, so printing while the child runs would
       interleave the two streams into an unreadable blob. */
-   if (waitpid(pid, &st, 0) != pid) {
-      printf("gccdriver: waitpid %s failed\n", path);
+   r = waitpid(pid, &st, 0);
+   if (r != (int)pid) {
+      printf("gccdriver: waitpid %s failed pid=%d r=%d errno=%d\n",
+             path, (int)pid, r, errno);
       return -1;
    }
    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {

@@ -5,6 +5,7 @@
 void serial_init(void);
 void serial_putc(char c);
 void serial_puts(const char *s);
+void serial_write(const char *s, int n);
 int serial_getc(void);
 
 /* COM2 (0x2F8): optional interactive terminal / shell (live introspection). */
@@ -17,5 +18,9 @@ int serial2_getc(void);
    output to COM2 so the shell2 terminal sees command results. */
 void serial2_mirror_set(int on);
 int  serial2_mirror_get(void);
+
+/* Register-only COM1/COM2 TX (no uart_dev* on the C stack). */
+void uart_com1_putc(unsigned int c);
+void uart_com2_putc(unsigned int c);
 
 #endif
