@@ -1,8 +1,12 @@
 #include "smp.h"
 #include "lapic.h"
 #include "../process/process.h"
+#include "../process/irq_kstack.h"
 #include "../cpu/context.h"
 #include "../memory/memlayout.h"
+
+extern volatile int ctx_load_in_progress[];
+extern volatile int ps_switchto_in_progress[];
 
 extern int printf(const char *fmt, ...);
 extern int sprintf(char *str, const char *fmt, ...);
@@ -268,24 +272,67 @@ void smp_enable_scheduling(void) {
     smp_reschedule_others();
 }
 
+/* Drop a leftover USER advertisement when this CPU is not executing that
+   process (CR3 mismatch) and is not mid-switch.  No sprintf: idle BSS
+   stacks are 8KiB and a format buffer there has already smashed frames. */
+void smp_repair_stale_current(void)
+{
+    int me;
+    PCB386 *idle, *cur;
+    unsigned long hw_cr3, pcb_cr3;
+
+    me = smp_cpu_id();
+    if (me < 0 || me >= MAX_CPUS)
+        return;
+    idle = (PCB386 *)cpus[me].idle;
+    cur = (PCB386 *)cpus[me].current;
+    if (!idle || !cur || cur == idle)
+        return;
+    __asm__ __volatile__("movq %%cr3, %0" : "=r"(hw_cr3));
+    pcb_cr3 = (unsigned long)(uintptr)cur->pagedirloc;
+    if (cur->ctx.cr3 &&
+        ((unsigned long)cur->ctx.cr3 & ~0xFFFUL) == (hw_cr3 & ~0xFFFUL))
+        pcb_cr3 = (unsigned long)cur->ctx.cr3;
+    if (!leftover_current_should_repair(cur->on_cpu, me,
+                                       cur->accesslevel == ACCESS_USER,
+                                       pcb_cr3, hw_cr3,
+                                       ctx_load_in_progress[me] ||
+                                       ps_switchto_in_progress[me]))
+        return;
+    /* Never clear a FOREIGN on_cpu; that claim belongs to the owner. */
+    if (cur->on_cpu == me)
+        cur->on_cpu = -1;
+    cpus[me].current = idle;
+    {
+        static volatile unsigned long repair_n;
+        if (++repair_n <= 8)
+            serial_puts("STALE-CURRENT-REPAIR\n");
+    }
+    if (idle->on_cpu < 0)
+        idle->on_cpu = me;
+    __sync_synchronize();
+}
+
 void smp_cpu_idle(void) {
     int me;
     PCB386 *idle, *cur;
+
     /* Arm LAPIC timer only once we are on the idle stack with kernel GDT. */
     me = smp_cpu_id();
     if (me != 0)
         smp_ap_enable_timer();
+    smp_repair_stale_current();
+    /* The IRQ predicate will not steal on_cpu==me (publish-before-CR3).
+       Once we are in the idle loop we are not that USER process. */
     idle = (me >= 0 && me < MAX_CPUS) ? (PCB386 *)cpus[me].idle : 0;
     cur = (me >= 0 && me < MAX_CPUS) ? (PCB386 *)cpus[me].current : 0;
-    if (idle && cur && cur != idle) {
-        char b[128];
-        sprintf(b, "IDLE-STALE-CURRENT cpu=%d pid=%d on_cpu=%d\n",
-                me, (int)cur->processid, cur->on_cpu);
-        serial_puts(b);
+    if (idle && cur && cur != idle &&
+        !ctx_load_in_progress[me] && !ps_switchto_in_progress[me]) {
         if (cur->on_cpu == me)
             cur->on_cpu = -1;
         cpus[me].current = idle;
-        idle->on_cpu = me;
+        if (idle->on_cpu < 0)
+            idle->on_cpu = me;
         __sync_synchronize();
     }
     for (;;) {

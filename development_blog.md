@@ -2,6 +2,99 @@
 
 ## 2026-09-13 (Manila, UTC+8)
 
+### 13:25 — Kernel-RIP recover no longer kills as.exe; smash remains
+
+**Current problem / activity:** New cert: 3 `GCC_DRIVER_OK`, no
+`GPF64: kernel RIP -> killing user process`, then `GPF64: kernel
+fault -> halt` and idle WATCHDOG. Policy change held; the
+`ps_switchto` smash is still open. Hung QEMU stopped. Certification
+is **not** claimed.
+
+### 13:20 — Kernel-text #GP/#UD halt; do not kill the CR3 user
+
+**Current problem / activity:** Cert `GPF64 rip=0x13c200` in
+`ps_switchto` killed as.exe (`GPF64: kernel RIP -> killing user
+process`) and left `vfs_busy` held. Current activity: kernel-image
+RIP is a kernel fault (halt), not `exc_recover`. User RIP / wild RIP
+still kill the CR3 user. Relaunch cert. Certification is **not**
+claimed.
+
+### 13:00 — Cert hung: GPF in ps_switchto killed as.exe, vfs_busy
+
+**Current problem / activity:** Idle-only leftover repair. Cert got
+1 `GCC_DRIVER_OK` then `GPF64 rip=0x13c200` in `ps_switchto` on
+as.exe's kstack; kernel-RIP recover killed as (`GCC_DRV_FAIL as
+spawn`). gcc.exe then WATCHDOG-spun on `vfs_busy` owner=41. Hung
+QEMU stopped. Certification is **not** claimed. Next: do not treat a
+kernel-text `#GP` as a user fault (leaks crits), and stop the
+`ps_switchto` smash (`cpus[]` on the kstack).
+
+### 12:55 — Pull leftover repair off the timer/IPI path
+
+**Current problem / activity:** Even CR3-guarded timer repair still
+printed `STALE-CURRENT-REPAIR` then smashed gcc RIP (`0x2900000202`)
+and halted. Current activity: `smp_repair_stale_current` stays for
+idle only. Predicate + TAP 15–21 remain as the leftover contract.
+Relaunch cert. Certification is **not** claimed.
+
+### 12:50 — Do not retarget current to idle while CR3 is still user
+
+**Current problem / activity:** Cert: `GPF64 rip=0x12b943 proc=cpu_idle`
+`frsp=0x3fffac10` (user stack) `cr3=make`. Repair set `current=idle`
+while still in the user address space; the next IRQ stayed on the user
+stack. Current activity: leftover repair requires CR3 mismatch even
+for FOREIGN ads. TAP 16/17 encode that. Relaunch cert. Certification
+is **not** claimed.
+
+### 12:40 — Do not repair leftover current inside irq_kstack_enter
+
+**Current problem / activity:** Cert printed `STALE-CURRENT-REPAIR` then
+`PF64 rip=0x2a00000206` on gcc.exe and `make` Error 1. Repair ran in
+`irq_kstack_enter` after the wrapper had already selected the process
+kstack. Current activity: repair only from `schedule_from_timer` /
+idle / IPI. Relaunch cert. Certification is **not** claimed.
+
+### 12:35 — Drop leftover FOREIGN current; do not steal on_cpu
+
+**Current problem / activity:** After the live-claim guard, cert died
+on `KSTACK-SHARED cpu=0 other=1 pid=40` (cc1) then `GCC_DRV_FAIL` /
+`UD64` on gcc.exe. CPU 1 still advertised a PCB CPU 0 claimed.
+Current activity: IRQ repair drops a FOREIGN leftover advertisement
+without touching `on_cpu`. TAP 16 is that original cause. Relaunch
+cert. Certification is **not** claimed.
+
+### 12:25 — Do not steal on_cpu==me from IRQ repair
+
+**Current problem / activity:** Cert reached 3 `GCC_DRIVER_OK` then
+`STALE-CURRENT-REPAIR` and `GPF64 rip=0x13c0bc` in `ps_switchto` on
+make.exe's kstack (`GPF64: re-entered -> halt`). IRQ repair treated a
+published dest (CR3 still prev) as leftover and cleared `on_cpu`.
+Current activity: IRQ/timer repair only unclaimed (`on_cpu < 0`)
+USER advertisements; live claims stay. Idle still drops a false claim.
+Relaunch cert. Certification is **not** claimed.
+
+### 12:15 — Leftover-current repair in IRQ/timer; recertify
+
+**Current problem / activity:** `45a6635` is committed. Leftover USER
+`current` still smashed stacks under `-j4`. `smp_repair_stale_current`
+now drops that advertisement when CR3 is not the PCB (not mid-switch /
+FOREIGN / still-on-user-CR3). TAP 15–20 encode the original cause.
+`test-fork` PASS; `test-fatwrite-coop` still FAIL (UD64 / `0x40d100` /
+timeout — known flake, not treated as a design revert). Certification
+is **not** claimed. Current activity: relaunch
+`test-selfhost-cert-parallel`.
+
+### 12:00 — Commit, leftover-current repair, then recertify
+
+**Current problem / activity:** Certification is **not** claimed. The
+campaign through `45a6635` (SMP claim, reserved IRQ stacks, CR3-owner
+faults) is committed. Leftover `cpus[i].current` still advertised a
+USER PCB after release, so coop `schedule_from_timer` returned early
+and IRQ C walked the wrong nest / kstack. Current activity: repair
+when advertised USER CR3 is not the hardware CR3 (and not mid-switch /
+FOREIGN / still-on-user-CR3). Host TAP 15–20 fail for that original
+cause. Rebuild, re-gate, relaunch `test-selfhost-cert-parallel`.
+
 ### 11:00 — SMP=4 cert still not closed
 
 **Current problem / activity:** Latest

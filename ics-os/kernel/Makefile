@@ -113,7 +113,7 @@ kernel32.o: kernel32.c build.h hardware/usb/uhci.c hardware/usb/xhci.c hardware/
 		stdlib/stdlib.c hardware/keyboard/mouse.c hardware/exceptions.c \
 		hardware/hardware.c hardware/chips/speaker.c devmgr/dex32_devmgr.c \
 		devmgr/extension.c process/environment.c devmgr/bridges.c \
-		process/sync.c console/script.c process/process.c process/process.h dexapi/dex32API.c \
+		process/sync.c console/script.c process/process.c process/process.h process/irq_kstack.h dexapi/dex32API.c \
  		hardware/ATA/ide.c vfs/vfs_aux.c vfs/posixfd.h memory/kheap.c memory/dexmalloc.c \
  		vmm/vmm.c kexec.c kexec.h \
  		console/klog.c console/klog.h console/klog_ring.h build_info.h
@@ -179,7 +179,7 @@ vtd.o: hardware/vtd.c hardware/vtd.h hardware/iommu.h
 lapic.o: cpu/lapic.c cpu/lapic.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o lapic.o cpu/lapic.c
 
-smp.o: cpu/smp.c cpu/smp.h process/process.h
+smp.o: cpu/smp.c cpu/smp.h process/process.h process/irq_kstack.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o smp.o cpu/smp.c
 	
 Kernel64.bin: startup.o asmlib.o context.o ap_trampoline.o lapic.o smp.o kernel32.o \

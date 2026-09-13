@@ -217,12 +217,16 @@ static void exc_noerr_report(const char *tag, unsigned long *frame)
       iretq frame lands when RFLAGS is popped as RIP -- is the faulting party
       and must be killed, not have its CPU halted.  Halting parked one CPU per
       bad child until the whole -j4 build had no CPUs left. */
+   int kernel_rip = (rip >= 0x100000UL &&
+                     rip < (unsigned long)MEM_KERNEL_LIMIT);
    int user_fault = current_process
                     && current_process->accesslevel == ACCESS_USER
                     && (rip < 0x100000UL
                         || rip >= (unsigned long)MEM_USER_ELF_BASE);
 #ifdef __x86_64__
-   if (!user_fault) {
+   /* Kernel-image #UD is a smashed iretq, not a user opcode.  Assigning
+      the CR3 owner and killing it leaked crits (cert make.exe / as.exe). */
+   if (!user_fault && !kernel_rip) {
       unsigned long cr3 = 0;
       PCB386 *owner;
       __asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));

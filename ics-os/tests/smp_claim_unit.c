@@ -45,7 +45,7 @@ int main(void)
    int i;
 
    printf("TAP version 13\n");
-   printf("1..14\n");
+   printf("1..21\n");
 
    on_cpu = -1;
    for (i = 0; i < 8; i++)
@@ -102,6 +102,23 @@ int main(void)
    check("claimed idle BSS stack uses CPU stack not process kstack top",
          irq_kstack_dest(0x2390f0UL, 0x02b00000UL, 0x02b20000UL, 1)
          == IRQ_KSTACK_CPU);
+
+   /* Leftover current: advertise a USER PCB this CPU is not executing.
+      Original cause of cert smash / make.exe kill / ACCESS_SYS halt. */
+   check("claimed user matching CR3 is not leftover",
+         !leftover_current_should_repair(2, 2, 1, 0x2000UL, 0x2000UL, 0));
+   check("FOREIGN leftover on that CR3 must not pretend idle",
+         !leftover_current_should_repair(3, 0, 1, 0x2000UL, 0x2000UL, 0));
+   check("FOREIGN leftover after CR3 left must drop",
+         leftover_current_should_repair(3, 0, 1, 0x2000UL, 0x1000UL, 0));
+   check("mid-switch publish-before-stack is not leftover",
+         !leftover_current_should_repair(2, 2, 1, 0x2000UL, 0x1000UL, 1));
+   check("released user still on its CR3 is not leftover",
+         !leftover_current_should_repair(-1, 0, 1, 0x2000UL, 0x2000UL, 0));
+   check("unclaimed USER on kernel CR3 must repair",
+         leftover_current_should_repair(-1, 0, 1, 0x2000UL, 0x1000UL, 0));
+   check("IRQ path must not steal a live on_cpu==me claim",
+         !leftover_current_should_repair(0, 0, 1, 0x2000UL, 0x1000UL, 0));
 
    return g_ok ? 0 : 1;
 }

@@ -111,7 +111,13 @@ void GPFhandler64(struct gpf_info *fi, unsigned long saved_rax, unsigned long sa
         Only true user processes (ACCESS_USER) may be killed-and-resumed. */
 #ifdef __x86_64__
      {
-        PCB386 *owner = ps_find_by_cr3((unsigned long)fi->cr3);
+        /* Kernel-image RIP is a kernel bug (cert ps_switchto GPF).  Do not
+           retarget current to the CR3 user and kill it: that leaked vfs_busy
+           and WATCHDOG-spun gcc after as.exe was recovered. */
+        int kernel_rip = (fi->rip >= 0x100000ULL &&
+                          fi->rip < (unsigned long long)MEM_KERNEL_LIMIT);
+        PCB386 *owner = kernel_rip ? 0
+                          : ps_find_by_cr3((unsigned long)fi->cr3);
         if (owner && owner->accesslevel == ACCESS_USER &&
             owner != current_process &&
             cpu >= 0 && cpu < MAX_CPUS)
@@ -133,10 +139,6 @@ void GPFhandler64(struct gpf_info *fi, unsigned long saved_rax, unsigned long sa
       }
 
     gpf_busy[cpu] = 0;
-    if (current_process && current_process->accesslevel == ACCESS_USER) {
-       serial_puts("\nGPF64: kernel RIP -> killing user process\n");
-       exc_recover();
-    }
     serial_puts("\nGPF64: kernel fault -> halt\n");
     while (1) {}
   };

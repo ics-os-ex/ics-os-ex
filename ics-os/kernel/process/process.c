@@ -650,11 +650,18 @@ void pcb_free_irq_kstack(PCB386 *p)
 void irq_kstack_enter(u64 current_rsp)
 {
    extern volatile int ctx_load_in_progress[MAX_CPUS];
-   PCB386 *p=current_process;
+   PCB386 *p;
    int me;
 
    /* Kernel SSE stores must not take #NM here; lazy FPU is not used. */
    __asm__ volatile ("clts");
+
+   /* Do not repair leftover current here.  The wrapper already chose RSP
+      from the advertised PCB; retargeting current mid-entry (cert
+      STALE-CURRENT-REPAIR then PF64 rip=0x2a00000206 on gcc.exe) drops
+      irq_user_rsp and crit tokens for a still-running syscall.
+      schedule_from_timer / idle / IPI repair after this frame is done. */
+   p=current_process;
 
    /* Tripwire for the shared-stack corruption class: every legitimate RSP in
       this system lives in the identity-mapped low 4GiB, so a non-zero high half

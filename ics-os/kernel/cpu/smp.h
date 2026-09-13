@@ -38,6 +38,7 @@ void smp_init(void);
 int  smp_cpu_id(void);
 cpu_local *smp_this_cpu(void);
 void smp_cpu_idle(void);
+void smp_repair_stale_current(void);
 void smp_reschedule_others(void);
 int smp_tlb_shootdown(u64 cr3);
 int smp_tlb_shootdown_all(void);

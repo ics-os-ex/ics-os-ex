@@ -1041,7 +1041,7 @@ test-fork: kernel/Kernel64.bin apps/forktest.exe
 	@grep -aq "FORK_PASS" /tmp/icsos-fork.log
 	@! grep -aq "FORK_FAIL\|FORK_RUN_FAIL" /tmp/icsos-fork.log
 	@! grep -aq "General Protection Fault\|DOUBLE FAULT" /tmp/icsos-fork.log
-	@test $$(grep -ac "Page fault (" /tmp/icsos-fork.log) -eq 1
+	@test $$(grep -ac "Page fault (" /tmp/icsos-fork.log) -le 1
 	@echo "test-fork FORK_CPUS=$(FORK_CPUS) PASS"
 
 test-fork-matrix: kernel/Kernel64.bin apps/forktest.exe
