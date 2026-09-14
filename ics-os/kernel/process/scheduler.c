@@ -11,6 +11,7 @@ Description: Priority-aware round-robin scheduler with a locked ready walk
 #include "../devmgr/dex32_devmgr.h"
 #include "../cpu/spinlock.h"
 #include "../cpu/smp.h"
+#include "irq_kstack.h"
 
 extern void serial_puts(const char *s);
 extern int sprintf(char *str, const char *fmt, ...);
@@ -68,16 +69,11 @@ static int sched_node_ok(PCB386 *p) {
    uintptr a = (uintptr)p;
    uintptr n, b;
 
-   if (!(a >= MEM_KERNEL_LOAD && a < MEM_KERNEL_LIMIT)
-       && !(a >= MEM_KHEAP_BASE && a < MEM_KHEAP_END))
+   if (!sched_link_ok(a))
       return 0;
    n = (uintptr)p->next;
    b = (uintptr)p->before;
-   if (!(n >= MEM_KERNEL_LOAD && n < MEM_KERNEL_LIMIT)
-       && !(n >= MEM_KHEAP_BASE && n < MEM_KHEAP_END))
-      return 0;
-   if (!(b >= MEM_KERNEL_LOAD && b < MEM_KERNEL_LIMIT)
-       && !(b >= MEM_KHEAP_BASE && b < MEM_KHEAP_END))
+   if (!sched_link_ok(n) || !sched_link_ok(b))
       return 0;
    if (p->next->before != p || p->before->next != p)
       return 0;
@@ -141,7 +137,7 @@ PCB386 *scheduler(PCB386 *lastprocess){
        pin a waiter; fall through to the ready walk so the owner gets a CPU.
        A holder doing real work under a crit (crit_wait==0) is still pinned, so
        mid-critical-section preemption protection is preserved. */
-    if (lastprocess->held_crit_n > 0
+    if (pcb_held_n(lastprocess) > 0
         && !(lastprocess->status & (PS_ATTB_DYING | PS_ATTB_BLOCKED))
         && !lastprocess->waiting
         && !lastprocess->crit_wait)
@@ -159,12 +155,9 @@ PCB386 *scheduler(PCB386 *lastprocess){
       dequeued and freed it in between; the walk below would then read recycled
       kheap and fault (observed as RLBAD followed by a kernel #PF).  Require the
       ring links to round-trip and fall back to the head if they do not. */
-   if (!lastprocess->next || !lastprocess->before
-       || lastprocess->next->before != lastprocess
-       || lastprocess->before->next != lastprocess) {
+   if (!sched_node_ok(lastprocess)) {
       PCB386 *head = sched_phead;
-      if (head && head->next && head->before
-          && head->next->before == head && head->before->next == head) {
+      if (head && sched_node_ok(head)) {
          lastprocess = head;
       } else {
          spin_unlock(&ready_lock);
@@ -189,12 +182,8 @@ PCB386 *scheduler(PCB386 *lastprocess){
              static sPCB. next/before must round-trip (n->next->before == n)
              and stay in the same world. status must not be wild. */
           while (hops < 256) {
-             PCB386 *nx = n->next;
-             PCB386 *bf = n->before;
-             if (!nx || !bf || (uintptr)nx < 0x100000 || (uintptr)bf < 0x100000) { bad = 1; break; }
-             if (nx->before != n || bf->next != n) { bad = 1; break; }
-             if (n->status & 0xFFFF0000) { bad = 1; break; }
-             n = nx;
+             if (!sched_node_ok(n)) { bad = 1; break; }
+             n = n->next;
              if (n == lastprocess) break;
              hops++;
           }
@@ -317,8 +306,7 @@ void sched_enqueue(PCB386 *process){
 
    /* Already linked: a second insert would splice the ring and leave the
       old neighbors pointing at a node that is about to be overwritten. */
-   if (process->next && process->before &&
-       process->next->before == process && process->before->next == process) {
+   if (sched_node_ok(process)) {
       spin_unlock(&ready_lock);
       restoreflags(fl);
       return;
@@ -344,8 +332,7 @@ int sched_dequeue(PCB386 *ptr){
    int was_queued = 0;
    { DWORD fl; storeflags(&fl); stopints();
    spin_lock(&ready_lock);
-   if (ptr && ptr->next && ptr->before &&
-       ptr->next->before == ptr && ptr->before->next == ptr) {
+   if (sched_node_ok(ptr)) {
       was_queued = 1;
       if (ptr->next == ptr) {
          if (sched_phead == ptr)
@@ -382,9 +369,11 @@ PCB386 *sched_findprocess(int pid){
    head_ptr = sched_phead;
    ptr = head_ptr;
 
-   if (head_ptr) {
+   if (head_ptr && sched_node_ok(head_ptr)) {
       int hops = 0;
       do{
+         if (!sched_node_ok(ptr))
+            break;
          if (ptr->processid == pid) {
             retval = ptr;
             break;
@@ -421,8 +410,10 @@ int sched_listprocess(PCB386 *process_buf, DWORD size_per_item, int items){
    head_ptr = sched_phead;
    ptr = head_ptr;
 
-   if (head_ptr) {
+   if (head_ptr && sched_node_ok(head_ptr)) {
       do{
+         if (!sched_node_ok(ptr))
+            break;
          if (process_buf!=0 && items!=0 ){ 
             if (i < items)    
                memcpy(&process_buf[i], ptr, size_per_item < sizeof(PCB386) ?

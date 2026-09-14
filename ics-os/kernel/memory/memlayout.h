@@ -26,7 +26,10 @@
  *  | kexec staging    |          8MiB, not in mempop (kernel image < 4MiB)
  *  +------------------+ 0x02000000  MEM_CPUIRQ_BASE
  *  | per-CPU IRQ stks |          256KiB reserved (32KiB * MAX_CPUS)
- *  +------------------+ 0x02040000  MEM_KHEAP_BASE
+ *  +------------------+ 0x02040000  MEM_IDLE_STACK_BASE
+ *  | per-CPU idle stks|          64KiB * 8 plus guards (32KiB overflowed
+ *  |                  |          under nested timer C, cert 248137)
+ *  +------------------+ 0x020C2000  MEM_KHEAP_BASE
  *  | kernel heap      |          sbrk/dlmalloc; identity; ~64MiB cap
  *  +------------------+ 0x06000000
  *  | mempop frames    |          anonymous 4KiB pages (PF, legacy PT)
@@ -48,8 +51,8 @@
  *     user ELFs start at 4MiB.  The frame pool skips the whole
  *     MEM_KERNEL_LOAD..MEM_KERNEL_LIMIT reserved range, so growing the kernel
  *     image into that gap is safe.
- *  2. AP/idle stacks still live in .bss.  IRQ stacks are MEM_CPUIRQ_* so
- *     they can be 16KiB without blowing the 4MiB kernel image cap.
+ *  2. IRQ and idle stacks are MEM_CPUIRQ_* / MEM_IDLE_STACK_* so they can
+ *     be 32KiB/64KiB without blowing the 4MiB kernel image cap.
  *  3. Kernel heap is a closed interval; sbrk must not mempop and must not
  *     walk past MEM_KHEAP_END.
  *  4. userpd pool must not overlap any identity range the kernel writes
@@ -67,6 +70,9 @@
 #define KDIRECT(phys)          ((void *)(KDIRECT_BASE | ((phys) & 0xFFFFFFFFULL)))
 #define KMMIO_BASE             0xFFFF800100000000ULL
 #define KMMIO_SIZE             0x00200000UL
+/* boot_pdpt_high[5]: 2MiB WC pages for a GOP framebuffer above 4GiB. */
+#define KFB_BASE               0xFFFF800140000000ULL
+#define KFB_SIZE               0x04000000UL
 
 #define MEM_LOW_END            0x00100000UL
 #define MEM_GDT                0x00001000UL
@@ -85,6 +91,16 @@
    allocator (dexmem.c), which skips the reserved kernel range entirely. */
 #define MEM_KERNEL_BSS_LIMIT   0x003F0000UL
 
+/* Per-CPU idle stacks (not BSS).  16KiB and 24KiB both overflowed
+   through the guard (cert 248117/248120 IDLE-STACK-OVERFLOW).  32KiB * 8
+   misses MEM_KERNEL_BSS_LIMIT, so they live after MEM_CPUIRQ. */
+#define MEM_IDLE_STACK_SIZE    0x10000UL
+#define MEM_IDLE_STACK_GUARD   0x80UL
+#define MEM_IDLE_STACK_SLOT    (MEM_IDLE_STACK_GUARD + MEM_IDLE_STACK_SIZE)
+#define MEM_IDLE_STACK_BASE    MEM_CPUIRQ_END
+#define MEM_IDLE_STACK_BYTES   0x00082000UL
+#define MEM_IDLE_STACK_END     (MEM_IDLE_STACK_BASE + MEM_IDLE_STACK_BYTES)
+
 #define MEM_USER_ELF_BASE      0x00400000UL
 #define MEM_USER_ELF_END       0x01800000UL   /* 20MiB window for large EXEs (cc1 ~22MB) */
 
@@ -100,9 +116,9 @@
 #define MEM_CPUIRQ_END         (MEM_CPUIRQ_BASE + MEM_CPUIRQ_SIZE)
 #define MEM_CPUIRQ_STACK       0x8000UL       /* 32 KiB; 8 CPUs fill 256 KiB */
 
-#define MEM_KHEAP_BASE         MEM_CPUIRQ_END
-#define MEM_KHEAP_SIZE         (0x04000000UL - MEM_CPUIRQ_SIZE)
-#define MEM_KHEAP_END          (MEM_KHEAP_BASE + MEM_KHEAP_SIZE)
+#define MEM_KHEAP_BASE         MEM_IDLE_STACK_END
+#define MEM_KHEAP_END          0x06000000UL
+#define MEM_KHEAP_SIZE         (MEM_KHEAP_END - MEM_KHEAP_BASE)
 
 /* Former 16MiB kmode slot is now part of the kernel heap.  MEM_KMODE_*
    marks the anonymous mempop-frame gap that follows the heap; it is NOT a
@@ -142,8 +158,12 @@ typedef char memlayout_kexec_after_elf[
    (MEM_KEXEC_STAGE == MEM_USER_ELF_END) ? 1 : -1];
 typedef char memlayout_cpuirq_after_kexec[
    (MEM_CPUIRQ_BASE == MEM_KEXEC_STAGE_END) ? 1 : -1];
-typedef char memlayout_heap_after_cpuirq[
-   (MEM_KHEAP_BASE == MEM_CPUIRQ_END) ? 1 : -1];
+typedef char memlayout_idle_after_cpuirq[
+   (MEM_IDLE_STACK_BASE == MEM_CPUIRQ_END) ? 1 : -1];
+typedef char memlayout_heap_after_idle[
+   (MEM_KHEAP_BASE == MEM_IDLE_STACK_END) ? 1 : -1];
+typedef char memlayout_idle_slot_fits[
+   (MEM_IDLE_STACK_SLOT * 8UL <= MEM_IDLE_STACK_BYTES) ? 1 : -1];
 typedef char memlayout_kmode_after_heap[
    (MEM_KMODE_BASE == MEM_KHEAP_END) ? 1 : -1];
 typedef char memlayout_userpd_after_kmode[
@@ -155,5 +175,12 @@ typedef char memlayout_shared_not_in_pool[
 
 int  mem_is_reserved(unsigned long phys);
 void mem_layout_dump(void);
+
+/* Kernel free() must not hand dlmalloc a user/wild pointer.
+   Cert disk_mgr / gcc dlfree #PF cr2=0x800250d58 livelocked ACCESS_SYS. */
+static inline int kheap_ptr_in_range(unsigned long p)
+{
+   return p >= MEM_KHEAP_BASE && p < MEM_KHEAP_END;
+}
 
 #endif

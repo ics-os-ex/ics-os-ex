@@ -36,7 +36,8 @@ HOSTG_RTFLAGS := -m64 -std=gnu89 -w -nostdlib -fno-builtin -static -ffreestandin
 vmdex:
 	make -C kernel/
 
-.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-ide-thumbdrive
+.PHONY: usb-uefi usb-etcher test-usb-uefi-gpt test-vbox-uefi-gpt test-vbox-uefi-gpt-bios test-bochs-uefi-gpt
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-ide-thumbdrive
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -73,6 +74,29 @@ test-smpclaim-unit:
 	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/smp_claim_unit.c -o /tmp/icsos-tests/smp_claim_unit
 	@/tmp/icsos-tests/smp_claim_unit
 
+test-fbconsole-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/fbconsole_geom_unit.c -o /tmp/icsos-tests/fbconsole_geom_unit
+	@/tmp/icsos-tests/fbconsole_geom_unit
+
+# LCD line buffer used by extras/ics-esp32-serial-bridge (Waveshare ESP32-S3
+# debug bridge). Compiles the shared C source so the tested logic is exactly
+# the logic linked into the firmware.
+test-bridge-console-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I../extras/ics-esp32-serial-bridge/src tests/bridge_console_unit.c ../extras/ics-esp32-serial-bridge/src/bridge_console.c -o /tmp/icsos-tests/bridge_console_unit
+	@/tmp/icsos-tests/bridge_console_unit
+
+test-kbdleds-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/kbd_boot_leds_unit.c -o /tmp/icsos-tests/kbd_boot_leds_unit
+	@/tmp/icsos-tests/kbd_boot_leds_unit
+
+test-lapicx2-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/lapic_x2_unit.c -o /tmp/icsos-tests/lapic_x2_unit
+	@/tmp/icsos-tests/lapic_x2_unit
+
 # Deterministic 64 MiB GPT disk (slot 0: 32 MiB FAT32, slot 1: 16 MiB ext4).
 ics-os-gpt.img: scripts/mkgpt.sh
 	@chmod +x scripts/mkgpt.sh
@@ -92,9 +116,26 @@ test-vbox-usb-image-efi: ics-os-usb.img
 	@chmod +x scripts/test-vbox-usb-image.sh
 	@VBOX_FIRMWARE=efi scripts/test-vbox-usb-image.sh ics-os-usb.img
 
+# GPT ESP Etcher image: VirtualBox EFI (N150-like firmware) and BIOS.
+test-vbox-uefi-gpt: usb-uefi
+	@chmod +x scripts/test-vbox-usb-image.sh
+	@VBOX_FIRMWARE=efi VBOX_EXPECT_GPT=1 VBOX_TIMEOUT_SECONDS=120 \
+		scripts/test-vbox-usb-image.sh ics-os-uefi.img
+
+test-vbox-uefi-gpt-bios: usb-uefi
+	@chmod +x scripts/test-vbox-usb-image.sh
+	@VBOX_FIRMWARE=bios VBOX_EXPECT_GPT=1 VBOX_TIMEOUT_SECONDS=120 \
+		scripts/test-vbox-usb-image.sh ics-os-uefi.img
+
+# Bochs BIOS boot of the same GPT ESP image (GRUB in the GPT gap).
+test-bochs-uefi-gpt: usb-uefi
+	@chmod +x scripts/test-bochs-usb-image.sh
+	@scripts/test-bochs-usb-image.sh ics-os-uefi.img
+
 clean:
 	rm -f vmdex
-	rm -f ics-os-livecd.iso ics-os-usb.img ics-os-gpt.img ics-os-dist.img ics-os-dist-test.img
+	rm -f ics-os-livecd.iso ics-os-usb.img ics-os-uefi.img ics-os-uefi.img.zip \
+		ics-os-gpt.img ics-os-dist.img ics-os-dist-test.img
 	rm -fr tmp/* tmp-usb /tmp/icsos-gcc/rt
 	make -C kernel/ clean
 
@@ -142,6 +183,20 @@ usb: apps prep_image
 	chmod +x scripts/mkusb.sh
 	ICSOS_USB_SIZE_MB=$${ICSOS_USB_SIZE_MB:-128} scripts/mkusb.sh
 	rm -fr tmp/ tmp-usb
+
+# GPT + FAT32 EFI System Partition image for 64-bit UEFI (Intel N150).
+# Raw ics-os-uefi.img is a full-disk image Etcher can flash as-is.
+usb-uefi: apps prep_image
+	chmod +x scripts/mkusb-uefi.sh
+	ICSOS_USB_SIZE_MB=$${ICSOS_USB_SIZE_MB:-128} scripts/mkusb-uefi.sh
+	rm -fr tmp/ tmp-usb
+
+# Same image plus ics-os-uefi.img.zip for Balena Etcher file picker.
+usb-etcher: usb-uefi
+	rm -f ics-os-uefi.img.zip
+	zip -9 -j ics-os-uefi.img.zip ics-os-uefi.img
+	@echo "Etcher image: $$(pwd)/ics-os-uefi.img"
+	@echo "Etcher zip:   $$(pwd)/ics-os-uefi.img.zip"
 
 # Host-built GCC toolchain pieces the distribution ships: the cc1 compiler
 # proper, the thin gcc driver, and the five SDK runtime objects the driver
@@ -315,6 +370,29 @@ test-usb-uefi: usb
 	@! grep -aq "General Protection fault" /tmp/icsos-uefi-usb.log
 	@echo "test-usb-uefi PASS"
 
+# N150-like path: OVMF + q35 xHCI loads BOOTX64.EFI from the GPT ESP.
+test-usb-uefi-gpt: usb-uefi
+	@echo "Boot-testing GPT ESP thumbdrive image via UEFI (OVMF q35 xHCI)..."
+	@test -n "$(OVMF_FD)" || { echo "OVMF firmware not found (install ovmf)."; exit 1; }
+	@-timeout 70 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
+		-machine q35 -bios $(OVMF_FD) \
+		-drive if=none,id=stick,format=raw,file=ics-os-uefi.img \
+		-device qemu-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,drive=stick \
+		< /dev/null > /tmp/icsos-uefi-gpt.log 2>&1
+	@grep -aq "BdsDxe: loading Boot0001" /tmp/icsos-uefi-gpt.log || \
+		grep -aq "EFI/BOOT/BOOTX64.EFI" /tmp/icsos-uefi-gpt.log || \
+		grep -aq "BdsDxe:" /tmp/icsos-uefi-gpt.log
+	@grep -aq "GPT_DETECT usb0" /tmp/icsos-uefi-gpt.log
+	@grep -aq "serial console ready" /tmp/icsos-uefi-gpt.log
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-uefi-gpt.log
+	@grep -aq "Root filesystem is the USB mass-storage device" /tmp/icsos-uefi-gpt.log
+	@grep -aq "AP scheduling enabled" /tmp/icsos-uefi-gpt.log
+	@grep -aq "FBCONSOLE_PASS" /tmp/icsos-uefi-gpt.log
+	@mtype -i "ics-os-uefi.img@@$$((2048 * 512))" ::/boot/grub/grub.cfg | grep -q gfxpayload
+	@! grep -aq "General Protection fault" /tmp/icsos-uefi-gpt.log
+	@echo "test-usb-uefi-gpt PASS"
+
 test-usb-amd64: vmdex
 	@mkdir -p /tmp/icsos-boot-iso/boot/grub
 	@cp kernel/Kernel64.bin /tmp/icsos-boot-iso/vmdex
@@ -485,6 +563,17 @@ test-usb-storage-xhci-reconnect-identity-mismatch: vmdex ics-os-usb.img
 test-usb-storage-xhci-no-device: vmdex
 	@chmod +x scripts/test-qemu-xhci-no-device.sh
 	@QEMU_X64=$(QEMU_X64) QEMU_MACHINE=q35 scripts/test-qemu-xhci-no-device.sh
+
+# Phase 0 oracle: a CDC-ACM device (QEMU usb-serial) shares the xHCI
+# controller with the MSC root. Characterizes two-device coexistence in both
+# attach orders; gates that the MSC root survives the second device's presence.
+# (Full CDC console write path lands with the usb_cdc_console driver.)
+test-usb-cdc-console: vmdex ics-os-usb.img
+	@chmod +x scripts/test-qemu-xhci-cdc-coexist.sh
+	@QEMU_X64=$(QEMU_X64) PORT_ORDER=msc_first \
+		scripts/test-qemu-xhci-cdc-coexist.sh ics-os-usb.img
+	@QEMU_X64=$(QEMU_X64) PORT_ORDER=cdc_first \
+		scripts/test-qemu-xhci-cdc-coexist.sh ics-os-usb.img
 
 test-usb-storage-xhci-late-attach: vmdex ics-os-usb.img
 	@chmod +x scripts/test-qemu-xhci-no-device.sh

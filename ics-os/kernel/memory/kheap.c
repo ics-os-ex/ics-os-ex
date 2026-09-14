@@ -18,6 +18,7 @@ sync_sharedvar kheap_crit;
 
 extern int smp_cpu_id(void);
 extern DWORD getprocessid(void);
+extern void serial_puts(const char *s);
 
 volatile int kheap_diag_op[8];
 volatile int kheap_diag_state[8];
@@ -37,7 +38,7 @@ volatile unsigned long kheap_ev_seq;
 
 static unsigned long kheap_chunk_size(unsigned long p)
 {
-    if (p >= 0x02040000UL && p < 0x06000000UL)
+    if (kheap_ptr_in_range(p))
       {
        unsigned long s = ((volatile unsigned long *)(p - 8))[0] & ~7UL;
        if (s >= 16 && s < 0x04000000UL)
@@ -121,6 +122,12 @@ void *realloc(void *ptr,unsigned int size)
     void *val;
     devmgr_malloc_extension *dev_malloc;
 
+    if (ptr && !kheap_ptr_in_range((unsigned long)(uintptr)ptr)) {
+        static volatile unsigned long badrealloc_n;
+        if (++badrealloc_n <= 8)
+            serial_puts("KHEAP-BADREALLOC\n");
+        return 0;
+    }
     kheap_diag(2, 1, size);
     {
         int dme = smp_cpu_id();
@@ -177,6 +184,40 @@ void free(void *ptr)
     unsigned long flags;
     devmgr_malloc_extension *dev_malloc;
 
+    /* Range-check before taking kheap_crit.  Enter+reject+leave sampled a
+       leftover current and leaked the crit (cert ramdisk hang after
+       KHEAP-BADFREE, non-owner leave does not unlock). */
+    if (ptr && !kheap_ptr_in_range((unsigned long)(uintptr)ptr)) {
+        static volatile unsigned long badfree_n;
+        if (++badfree_n <= 8) {
+            char hex[24];
+            unsigned long p = (unsigned long)(uintptr)ptr;
+            unsigned long rip = (unsigned long)(char *)__builtin_return_address(0);
+            int i;
+            serial_puts("KHEAP-BADFREE ");
+            hex[0] = '0';
+            hex[1] = 'x';
+            for (i = 15; i >= 0; i--) {
+                unsigned d = (unsigned)((p >> (i * 4)) & 0xfUL);
+                hex[2 + (15 - i)] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+            }
+            hex[18] = ' ';
+            hex[19] = 0;
+            serial_puts(hex);
+            serial_puts("rip=");
+            hex[0] = '0';
+            hex[1] = 'x';
+            for (i = 15; i >= 0; i--) {
+                unsigned d = (unsigned)((rip >> (i * 4)) & 0xfUL);
+                hex[2 + (15 - i)] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+            }
+            hex[18] = '\n';
+            hex[19] = 0;
+            serial_puts(hex);
+        }
+        return;
+    }
+
     kheap_diag(3, 1, 0);
     {
         int dme = smp_cpu_id();
@@ -192,7 +233,6 @@ void free(void *ptr)
                    (fme >= 0 && fme < 8) ? kheap_free_rip[fme] : 0);
     }
 
-    //Use the default realloc function if there is no other malloc module installed.
     if (auxillary_malloc_base == 0 || (uintptr)ptr < auxillary_malloc_base)
     {
         dlfree(ptr);

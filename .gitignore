@@ -9,6 +9,7 @@ vmdex
 references/**
 refernces/**
 ics-os/*.img
+ics-os/*.img.zip
 ics-os/vmdex
 ics-os/vmdex-raw
 ics-os/kernel/Kernel32.bin

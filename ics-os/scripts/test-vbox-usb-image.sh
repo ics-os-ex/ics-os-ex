@@ -107,6 +107,9 @@ grep -a -q 'Root mount \[OK\]' "$SERIAL_LOG"
 if [ "$FIRMWARE" = bios ]; then
     grep -a -q 'boot_device_name=hdp0p0' "$SERIAL_LOG"
 fi
+if [ "${VBOX_EXPECT_GPT:-0}" = 1 ]; then
+    grep -a -q 'GPT_DETECT hdp0' "$SERIAL_LOG"
+fi
 ! grep -a -q 'General Protection fault\|Page fault\|Double fault' "$SERIAL_LOG"
 
 echo "test-vbox-usb-image PASS firmware=$FIRMWARE"

@@ -103,11 +103,11 @@ kernel32.o: kernel32.c build.h hardware/usb/uhci.c hardware/usb/xhci.c hardware/
 		hardware/floppy/floppy.c hardware/floppy/floppy.h \
 		memory/dexmem.c memory/dexmem.h memory/memlayout.h \
 		stdlib/time.c stdlib/time.h \
-		hardware/keyboard/keyboard.c console/dex_DDL.c \
+		hardware/keyboard/keyboard.c hardware/keyboard/kbd_boot_leds.h console/dex_DDL.c \
 		console/foreground.c process/dex_taskmgr.c process/pdispatch.c \
 		console/console.c console/selfhost.c console/tty.c console/tty.h \
 		console/tty_vt.c console/tty_tc.c console/dex_DDL.h \
-	hardware/chips/ports.c hardware/vga/dexvga.c hardware/vga/fbconsole.c hardware/vga/fbconsole.h stdlib/qsort.c \
+	hardware/chips/ports.c hardware/vga/dexvga.c hardware/vga/fbconsole.c hardware/vga/fbconsole.h hardware/vga/fbconsole_geom.h stdlib/qsort.c \
 		hardware/dexapm.c hardware/chips/irqhandlers.c memory/dlmalloc.c \
 		memory/bsdmallo.c vfs/vfs_core.c module/module.c module/elf_module.c console/dexio.c \
 		stdlib/stdlib.c hardware/keyboard/mouse.c hardware/exceptions.c \
@@ -176,7 +176,7 @@ irq_lifecycle.o: hardware/irq_lifecycle.c hardware/irq_lifecycle.h cpu/spinlock.
 vtd.o: hardware/vtd.c hardware/vtd.h hardware/iommu.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o vtd.o hardware/vtd.c
 
-lapic.o: cpu/lapic.c cpu/lapic.h
+lapic.o: cpu/lapic.c cpu/lapic.h cpu/lapic_x2.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o lapic.o cpu/lapic.c
 
 smp.o: cpu/smp.c cpu/smp.h process/process.h process/irq_kstack.h

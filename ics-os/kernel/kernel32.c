@@ -96,6 +96,7 @@ extern void textcolor(unsigned char c);
 #include "partition/partdev.h"
 #include "console/dexio.h"
 #include "hardware/keyboard/keyboard.h"
+#include "hardware/keyboard/kbd_boot_leds.h"
 #include "hardware/keyboard/mouse.h"
 #include "hardware/hardware.h"
 #include "hardware/chips/serial.h"
@@ -256,6 +257,9 @@ void main(){
    map_length = 0;
    acpi_rsdp_length = 0;
 
+   /* Caps Lock on: reached kernel C. Must run before serial_init so a
+      missing UART cannot hide the first breadcrumb on a laptop. */
+   kbd_boot_leds(0);
    serial_init();
    serial_puts("ICS-OS: serial console ready (x86_64)\n");
    kernel_kexeced = 0;
@@ -326,17 +330,6 @@ void main(){
                                    fb->r_shift, fb->r_size,
                                    fb->g_shift, fb->g_size,
                                    fb->b_shift, fb->b_size);
-               /* Direct-to-panel fb state (no serial on the N150). Visible only
-                  when the framebuffer is ready (fb_base != 0), so seeing it
-                  proves the fb console path is live. */
-               {
-                  char fbl[96];
-                  sprintf(fbl, "FB %ux%u bpp=%u pitch=%u active=%d",
-                          (unsigned)fb->width, (unsigned)fb->height,
-                          (unsigned)fb->bpp, (unsigned)fb->pitch,
-                          fbconsole_active());
-                  fbdbg_info(fbl);
-               }
             }
            if ((tag->type == 15 || (tag->type == 14 && !acpi_rsdp_length)) &&
                tag->size > 8) {
@@ -514,6 +507,9 @@ void main(){
     /* Verify the framebuffer renderer against the live panel before any
        user output; no-op (serial note) when the legacy text path is in use. */
     fbconsole_selftest();
+    /* Num only: left stage 3, about to printf. Caps+Num still means we
+       never entered startup (CreateDDL/selftest). */
+    kbd_boot_leds_raw(KBD_LED_NUM);
 
     /* Preliminary initializaation complete, start up the operating system*/
    dex32_startup(); 
@@ -533,9 +529,18 @@ void dex32_startup(){
     
    //obtain CPU information using the CPUID instruction
    printf("Obtaining CPU information...\n");
+    /* Startup walk (overrides fbdbg_stage LEDs so 4 and 5 are not
+       both Caps). Last pair is the step that hung. */
+    kbd_boot_leds_hold(KBD_LED_CAPS);
   hardware_getcpuinfo(&hardware_mycpu);
-    hardware_printinfo(&hardware_mycpu);
+    kbd_boot_leds_hold(KBD_LED_NUM);
+    if (serial_com1_present())
+       hardware_printinfo(&hardware_mycpu);
+    else
+       printf("CPU %s\n", hardware_mycpu.manufacturer);
+    kbd_boot_leds_hold(KBD_LED_CAPS | KBD_LED_NUM);
      fbdbg_stage(4, "CPU info");
+    kbd_boot_leds_hold(KBD_LED_CAPS | KBD_LED_NUM);
 
     printf("Available memory: %d KB\n", memamount/1024);
 
@@ -544,12 +549,14 @@ void dex32_startup(){
     extension_init();
     printf("[OK]\n");
     fbdbg_stage(5, "ext mgr");
+    kbd_boot_leds_hold(KBD_LED_CAPS);
 
    //initialize the device manager
 printf("Initializing the device manager...");
     devmgr_init();
     printf("[OK]\n");
     fbdbg_stage(6, "dev mgr");
+    kbd_boot_leds_hold(KBD_LED_NUM);
 
    //register the memory manager
    printf("Registering the memory manager and the memory allocator...");
@@ -592,6 +599,7 @@ printf("Initializing rtl8139 NIC...");
     //rtl8139_init();
     printf("[OK]\n");
     fbdbg_stage(10, "pci/nic");
+    kbd_boot_leds_hold(KBD_LED_NUM);
    //delay(400/80);
 				
    //initialize the API module
@@ -599,26 +607,34 @@ printf("Initializing rtl8139 NIC...");
 api_init();
     printf("[OK]\n");
     fbdbg_stage(11, "api");
+    kbd_boot_leds_hold(KBD_LED_CAPS | KBD_LED_NUM);
 
    //initialize the keyboard device driver
    printf("Initializing keyboard and mouse drivers...");
    irq_init();
+    kbd_boot_leds_hold(KBD_LED_CAPS);
    init_keyboard();
-installmouse();
+    kbd_boot_leds_hold(KBD_LED_NUM);
+    if (serial_com1_present())
+       installmouse();
     init_mouse();
     printf("[OK]\n");
     fbdbg_stage(12, "kbd/mouse");
+    kbd_boot_leds_hold(KBD_LED_CAPS | KBD_LED_NUM);
 
    /* x86_64: LAPIC probe early; AP bring-up after process manager is ready. */
    {
       extern void lapic_init(void);
       extern void smp_init(void);
       printf("Initializing LAPIC/SMP...");
+    kbd_boot_leds_hold(KBD_LED_CAPS);
 lapic_init();
+    kbd_boot_leds_hold(KBD_LED_NUM);
        smp_init();
        printf("[OK]\n");
     }
     fbdbg_stage(13, "lapic/smp");
+    kbd_boot_leds_hold(KBD_LED_CAPS | KBD_LED_NUM);
    
    //Initialize the process manager and the initial
    //processes
@@ -626,6 +642,7 @@ lapic_init();
 process_init();    //defined in process.c
     printf("[OK]\n");
     fbdbg_stage(14, "process mgr");
+    kbd_boot_leds_hold(KBD_LED_NUM);
 
    /* Start APs after process manager exists, but park them until root is mounted.
       (LAPIC timer on APs is deferred until smp_enable_scheduling.) */
@@ -640,7 +657,9 @@ process_init();    //defined in process.c
           normal "kexeced" command line and performs full SMP bring-up.
           The parallel self-host closure is the exception: it boots the APs so
           make/gcc can spread across CPUs, then parks them again before kexec. */
-       if (strcmp(kernel_cmdline, "selfhost-stage1") == 0)
+       if (!serial_com1_present())
+          printf("skipped (no COM1, BSP only)");
+       else if (strcmp(kernel_cmdline, "selfhost-stage1") == 0)
           printf("deferred for self-host kexec");
        else {
           extern volatile int user_procs_smp;
@@ -664,6 +683,7 @@ process_init();    //defined in process.c
         restoreflags(flags);
     }
     fbdbg_stage(15, "APs started");
+    kbd_boot_leds_hold(KBD_LED_CAPS | KBD_LED_NUM);
 
     /* BSP keeps PIT/LAPIC timer for scheduling; enable after AP probe. */
    {
@@ -673,6 +693,18 @@ process_init();    //defined in process.c
 
   //process manager is ready, pass execution to the taskswitcher
     fbdbg_stage(16, "taskswitcher");
+    kbd_boot_leds_hold(KBD_LED_CAPS);
+    {
+        int late = fbconsole_late_init();
+        /* After scheduler Caps: both = mapped+painted, Num = no GOP tag
+           or hung in the high map, Caps = still refused (too large). */
+        if (late == FBCONSOLE_LATE_OK)
+            kbd_boot_leds_hold(KBD_LED_CAPS | KBD_LED_NUM);
+        else if (late == FBCONSOLE_LATE_NO_TAG)
+            kbd_boot_leds_hold(KBD_LED_NUM);
+        else
+            kbd_boot_leds_hold(KBD_LED_CAPS);
+    }
     taskswitcher();      //defined in process.h
 
     //============ we should not reach this point at all =================
@@ -837,7 +869,9 @@ void dex_init(){
    //Initialize the task manager - a module program that monitors processes
    //for the user's convenience, as kernel thread
    printf("Initializing the task manager...");
-   tm_pid=createkthread((void*)dex32_tm_updateinfo,"task_mgr",3500);
+   /* ACCESS_SYS stays on this stack through timer C.  3500 overflowed
+      into neighbour heap / idle BSS (torn 64-bit slots, UD64 cpus[]). */
+   tm_pid=createkthread((void*)dex32_tm_updateinfo,"task_mgr",65536);
 
    printf("[OK]\n");   
 

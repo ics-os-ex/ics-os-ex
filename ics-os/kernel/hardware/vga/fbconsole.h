@@ -14,9 +14,10 @@
 #ifndef FBCONSOLE_H
 #define FBCONSOLE_H
 
-/* Record the multiboot2 framebuffer tag. Returns 1 when the console is
-   usable now, 0 when it must be retried after paging is fully up
-   (framebuffer above 4GiB) or is unusable. */
+#include "hardware/vga/fbconsole_geom.h"
+
+/* Record the multiboot2 framebuffer tag only. Does not map or write GOP
+   (that is unsafe before the IDT and mem_init). */
 int fbconsole_boot_init(unsigned long long addr, unsigned int pitch,
                         unsigned int width, unsigned int height,
                         unsigned int bpp, unsigned int ftype,
@@ -24,11 +25,21 @@ int fbconsole_boot_init(unsigned long long addr, unsigned int pitch,
                         unsigned int gshift, unsigned int gsize,
                         unsigned int bshift, unsigned int bsize);
 
-/* Complete deferred setup for a framebuffer above 4GiB. Call after
-   mem_init(); before the first DDL is created. */
+/* Map GOP after mem_init(). QEMU (COM1) maps immediately for FBCONSOLE_PASS.
+   A laptop with no COM1 waits for fbconsole_late_init() — early GOP stores
+   rebooted the N150. */
 void fbconsole_deferred_init(void);
 
+/* Laptop-only: map GOP write-combining after LAPIC/scheduler bring-up,
+   black-fill the panel, blit the 80x25 shadow, turn live-render on.
+   Returns FBCONSOLE_LATE_*. */
+int fbconsole_late_init(void);
+
 int fbconsole_active(void);
+
+/* Multiboot2 framebuffer info tag was accepted, even if this boot
+   skipped mapping GOP (no-COM1 laptop). Do not fall back to VGA CRTC. */
+int fbconsole_have_tag(void);
 
 /* Render one 8x16 cell (VGA attribute: low nibble fg, high nibble bg). */
 void fbconsole_cell_render(int x, int y, unsigned char c, unsigned char attr);
@@ -43,7 +54,9 @@ void fbconsole_clear_screen(void);
 void fbconsole_cursor_to(int x, int y);
 
 /* Guest selftest: absolute pixel, glyph, and cursor checks. Prints
-   FBCONSOLE_PASS / FBCONSOLE_FAIL on the serial console. */
+   FBCONSOLE_PASS / FBCONSOLE_FAIL on the serial console. Leaves live GOP
+   blitting on when COM1 is absent (laptop panel); leaves it off when COM1
+   is present (QEMU serial oracle). */
 void fbconsole_selftest(void);
 
 /* Fill buf (>= 40 bytes) with the framebuffer info tag so a kexeced
@@ -55,7 +68,8 @@ void fbconsole_selftest(void);
     to call from kernel fault handlers; no-op when the framebuffer is not
     ready (legacy VGA path unaffected). */
 
- /* Record a boot stage on the bottom row; the last badge is where boot stopped. */
+ /* Record a boot stage on the bottom row; the last badge is where boot stopped.
+    Also programs i8042 Caps/Num/Scroll even when the framebuffer is unmapped. */
  void fbdbg_stage(int n, const char *name);
 
  /* One-shot info line on row 0 (fb console state, right after tag parse). */

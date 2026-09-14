@@ -254,7 +254,7 @@ void time_incrementtime()
                  (unsigned)current_process->cursyscall[1],
                  wd_frame_cpu[me][15],
                  sync_wait_var[me], sync_wait_owner[me], sync_wait_spins[me],
-                 current_process->held_crit_n, current_process->crit_wait);
+                 pcb_held_n(current_process), current_process->crit_wait);
          serial_puts(wline);
       }
       return;
@@ -418,6 +418,10 @@ void time_incrementtime()
  //the timer handler used by the task switcher
  void time_handler()
     {
+     {
+        extern void smp_repair_stale_current(void);
+        smp_repair_stale_current();
+     }
      {
         extern volatile unsigned int *lapic_mmio;
         extern volatile unsigned long long lapic_expected_base;

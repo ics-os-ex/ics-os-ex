@@ -82,6 +82,14 @@ void hardware_getcpuinfo(hardware_cpuinfo *cpuinfo)
     hardwareinfo hw;
     
     memset(cpuinfo,0,sizeof(hardware_cpuinfo));
+    /* N150: CPUID (leaf 0/1 or 0x80000000) never returned — Caps held
+       after the first printf, no Num after getcpuinfo. Skip on no-COM1
+       so boot can continue; QEMU still runs the real probe. */
+    if (!serial_com1_present()) {
+        memcpy(cpuinfo->manufacturer, "Skipped", 8);
+        memcpy(cpuinfo->modelstring, "CPUID skipped (no COM1)", 24);
+        return;
+    }
     getcpubrand(cpuinfo->manufacturer);    
     //get feature information
     getcpuid(1,&hw.a,&hw.b,&hw.c,&hw.d);
@@ -98,27 +106,38 @@ void hardware_getcpuinfo(hardware_cpuinfo *cpuinfo)
 
 void getcpubrand(char *s)
 {
-   hardwareinfo hw; //used for getcpuid() information
-   getcpuid(0,&hw.a,&hw.b,&hw.d,&hw.c); //get manufacturer string
-   hw.p=0;
-   strcpy(s,(char*)&hw.b);
-;};
+   hardwareinfo hw;
+   memset(&hw, 0, sizeof(hw));
+   memset(s, 0, 13);
+   /* Vendor bytes are EBX, EDX, ECX. The 3rd/4th outs are swapped so
+      strcpy from &hw.b reads ebx,edx,ecx. */
+   getcpuid(0, &hw.a, &hw.b, &hw.d, &hw.c);
+   memcpy(s, &hw.b, 4);
+   memcpy(s + 4, &hw.c, 4);
+   memcpy(s + 8, &hw.d, 4);
+   s[12] = 0;
+}
 
 void getcpumodel(char *s)
 {
-   hardwareinfo hw; //used for getcpuid() information
-   getcpuid(0x80000002,&hw.a,&hw.b,&hw.c,&hw.d); //get manufacturer string
-   hw.p=0;
-   strcpy(s,(char*)&hw);
-   getcpuid(0x80000003,&hw.a,&hw.b,&hw.c,&hw.d); //get manufacturer string
-   hw.p=0;
-   strcat(s,(char*)&hw);
-   getcpuid(0x80000004,&hw.a,&hw.b,&hw.c,&hw.d); //get manufacturer string
-   hw.p=0;
-   strcat(s,(char*)&hw);
+   hardwareinfo hw, lim;
 
-
-;};
+   memset(s, 0, 49);
+   memset(&lim, 0, sizeof(lim));
+   getcpuid(0x80000000, &lim.a, &lim.b, &lim.c, &lim.d);
+   if (lim.a < 0x80000004)
+      return;
+   memset(&hw, 0, sizeof(hw));
+   getcpuid(0x80000002, &hw.a, &hw.b, &hw.c, &hw.d);
+   memcpy(s, &hw, 16);
+   memset(&hw, 0, sizeof(hw));
+   getcpuid(0x80000003, &hw.a, &hw.b, &hw.c, &hw.d);
+   memcpy(s + 16, &hw, 16);
+   memset(&hw, 0, sizeof(hw));
+   getcpuid(0x80000004, &hw.a, &hw.b, &hw.c, &hw.d);
+   memcpy(s + 32, &hw, 16);
+   s[48] = 0;
+}
 
 /* Reboot via the keyboard controller, then QEMU ACPI/debug ports. */
 void machine_reboot(void)

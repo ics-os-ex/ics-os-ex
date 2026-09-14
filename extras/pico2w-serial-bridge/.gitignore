@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# Pico flash is the only artifact; nothing built on the host.
+ampy*

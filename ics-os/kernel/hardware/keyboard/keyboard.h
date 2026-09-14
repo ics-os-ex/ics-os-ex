@@ -123,6 +123,10 @@ sync_sharedvar kb_busywait;
 void write_kbd(unsigned adr, unsigned data);
 static int set1_scancode_to_ascii(unsigned code);
 void settogglebits(unsigned char b);
+void kbd_boot_leds(unsigned int stage);
+void kbd_boot_leds_raw(unsigned char bits);
+/* Set LEDs and, without COM1, spin so the pair is visible (~0.3s). */
+void kbd_boot_leds_hold(unsigned char bits);
 static int inq(queue_t *q, unsigned int data);
 static int deq(queue_t *q, unsigned int *data);
 static int empty(queue_t *q);

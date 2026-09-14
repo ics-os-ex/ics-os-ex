@@ -3,6 +3,7 @@
 
 /* COM1 (0x3F8): headless oracle console. */
 void serial_init(void);
+int serial_com1_present(void);
 void serial_putc(char c);
 void serial_puts(const char *s);
 void serial_write(const char *s, int n);

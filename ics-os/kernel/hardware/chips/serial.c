@@ -98,12 +98,29 @@ static int uart_getc_raw(uart_dev *u)
     return (int)inportb(u->base);
 }
 
+/* 16550 scratch-register presence test. N150-class laptops have no Super I/O
+   UART; floating 0x3F8 reads 0xFF and the scratch byte does not stick. */
+static int uart_port_present(unsigned int base)
+{
+    if (inportb(base + 5) == 0xFF)
+        return 0;
+    outportb(base + 7, 0x5A);
+    if (inportb(base + 7) != 0x5A)
+        return 0;
+    outportb(base + 7, 0xA5);
+    if (inportb(base + 7) != 0xA5)
+        return 0;
+    return 1;
+}
+
 static void uart_hw_init(uart_dev *u, unsigned int base)
 {
     u->base = base;
     u->ready = 0;
     u->owner = -1;
     spin_init(&u->lock);
+    if (!uart_port_present(base))
+        return;
     outportb(base + 1, 0x00);    /* disable UART interrupts */
     outportb(base + 3, 0x80);    /* enable DLAB */
     outportb(base + 0, 0x01);    /* 115200 baud */
@@ -118,6 +135,11 @@ void serial_init(void)
 {
     uart_hw_init(&uart1, SERIAL_COM1);
 };
+
+int serial_com1_present(void)
+{
+    return uart1.ready;
+}
 
 void serial_putc(char c)
 {

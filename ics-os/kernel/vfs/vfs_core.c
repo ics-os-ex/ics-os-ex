@@ -932,6 +932,10 @@ int file_ok(file_PCB* fhandle)
     int retval;
 
     if (fhandle==0) return 0;
+    /* Leftover idle / leftover USER on pagedir1 must not enter/leave
+       vfs_busy (cert 248132 minted token 0x1). */
+    if (sync_leftover_vfs())
+        return 0;
     /* Do not acquire when THIS process already entered vfs_busy.  The
        nest is on the PCB: a per-CPU nest survived fat_wait_io() yield
        and let the next process skip/leave the previous hold. */

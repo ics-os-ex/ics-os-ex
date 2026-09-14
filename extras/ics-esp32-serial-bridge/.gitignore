@@ -1,0 +1,9 @@
+# PlatformIO build products (not source)
+.pio/
+.venv/
+*.bin
+*.elf
+*.hex
+*.map
+firmware.bin
+firmware.elf

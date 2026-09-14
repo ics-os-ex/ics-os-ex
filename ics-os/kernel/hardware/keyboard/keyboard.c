@@ -29,6 +29,65 @@ void settogglebits(unsigned char b)
     write_kbd(0x60,b);
 ;};
 
+#include "hardware/keyboard/kbd_boot_leds.h"
+
+/* Bounded i8042 LED updates for headless laptop boot breadcrumbs.
+   A missing controller (0x64 == 0xFF) or a stuck input buffer latches
+   dead so later stages cannot busy-wait. */
+static int kbd_boot_leds_dead;
+#define KBD_BOOT_IO_SPINS 20000u
+
+static int kbd_boot_wait_inbuf(void)
+{
+    unsigned n;
+    unsigned char stat;
+
+    if (kbd_boot_leds_dead)
+        return 0;
+    for (n = 0; n < KBD_BOOT_IO_SPINS; n++) {
+        stat = inportb(0x64);
+        if (stat == 0xFF) {
+            kbd_boot_leds_dead = 1;
+            return 0;
+        }
+        if ((stat & 0x02) == 0)
+            return 1;
+        __asm__ __volatile__("pause");
+    }
+    kbd_boot_leds_dead = 1;
+    return 0;
+}
+
+void kbd_boot_leds_raw(unsigned char bits)
+{
+    if (!kbd_boot_wait_inbuf())
+        return;
+    outportb(0x60, 0xED);
+    if (!kbd_boot_wait_inbuf())
+        return;
+    outportb(0x60, bits);
+}
+
+void kbd_boot_leds_hold(unsigned char bits)
+{
+    unsigned long n;
+
+    kbd_boot_leds_raw(bits);
+    if (serial_com1_present())
+        return;
+    for (n = 0; n < 80000000UL; n++)
+        __asm__ __volatile__("pause");
+}
+
+void kbd_boot_leds(unsigned int stage)
+{
+    unsigned char bits = kbd_boot_led_bits(stage);
+
+    if (stage == 0)
+        kbd_boot_leds_raw(0);
+    kbd_boot_leds_raw(bits);
+}
+
 /*****************************************************************************
 *****************************************************************************/
 static int inq(queue_t *q, unsigned int data)
@@ -264,8 +323,16 @@ static int write_kbd_await_ack(unsigned val)
 
 static int init_kbd(unsigned ss, unsigned typematic, unsigned xlat)
 {
-	while(read_kbd() != -1)
-		/* nothing */;
+	{
+		int n;
+		for (n = 0; n < 64; n++)
+			if (read_kbd() == -1)
+				break;
+	}
+	/* Laptop USB RAX / no COM1: 0xF5+scancode programming can spin if
+	   OBF stays full. LED breadcrumbs already talk to the 8042. */
+	if (!serial_com1_present())
+		return 0;
 /* disable keyboard before programming it */
 	write_kbd_await_ack(0xF5);
 /* disable PS/2 mouse, set SYS bit, and Enable Keyboard Interrupt... */
@@ -545,9 +612,8 @@ unsigned int getchw()
 
 void installkeyboard()
  {
-   int c;
-   settogglebits(0);
-  
+    /* Do not clear LEDs here: kbd_boot_leds() owns the boot breadcrumb
+       pattern until the driver is fully initialized. */
  };
 
 void kb_pause()

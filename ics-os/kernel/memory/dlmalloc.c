@@ -637,7 +637,7 @@ static int dlm_free_check(unsigned long p, unsigned long old,
   else {
     struct dlm_fdwalk { unsigned long fd; };
     for (q = old, steps = 0; q && steps < 4096; steps++) {
-      if (!(q >= 0x02040000UL && q < 0x06000000UL && (q & 15UL) == 0)) {
+      if (!(q >= MEM_KHEAP_BASE && q < MEM_KHEAP_END && (q & 15UL) == 0)) {
         bad = 1;
         break;
       }

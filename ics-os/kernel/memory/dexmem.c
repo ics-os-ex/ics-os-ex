@@ -73,6 +73,7 @@ static const mem_range mem_reserved[] = {
    { MEM_USER_ELF_BASE,    MEM_USER_ELF_END,    "user-elf" },
    { MEM_KEXEC_STAGE,      MEM_KEXEC_STAGE_END, "kexec-stage" },
    { MEM_CPUIRQ_BASE,      MEM_CPUIRQ_END,      "cpu-irq-stack" },
+   { MEM_IDLE_STACK_BASE,  MEM_IDLE_STACK_END,  "cpu-idle-stack" },
    { MEM_KHEAP_BASE,       MEM_KHEAP_END,       "kheap" },
      { MEM_USER_WIN_BASE,    MEM_USER_WIN_END,    "user-windows" },
     /* The private-PD0 user stack VA [MEM_USER_STACK_GUARD, MEM_USER_STACK)
@@ -1208,13 +1209,18 @@ void *dex32_sbrk(unsigned int amt)
    {
      DWORD pages=(amt/4096)+1;
       DWORD flags;
-      char *ret=current_process->knext;
+      PCB386 *mm = current_mm_process();
+      char *ret;
+
+      if (!mm)
+         return (void*)-1;
+      ret=mm->knext;
       DWORD span_pages=pages;
       dex32_stopints(&flags);
       if (amt==0)
          {
          dex32_restoreints(flags);
-         return ((void*)current_process->knext);
+         return ((void*)mm->knext);
          };
   if (amt%4096==0) pages=amt/4096;
       /* knext starts at userheap+16 (the 16-byte parameter block) and is not
@@ -1230,13 +1236,13 @@ void *dex32_sbrk(unsigned int amt)
        map.  Stop below the stack guard so sbrk can never walk into the
        process stack (commit + reserve). */
     {
-       unsigned long long mmap_lim = current_process->mmap_brk
-          ? (unsigned long long)(uintptr)current_process->mmap_brk
+       unsigned long long mmap_lim = mm->mmap_brk
+          ? (unsigned long long)(uintptr)mm->mmap_brk
           : (unsigned long long)MEM_USER_HEAP_LIMIT;
        if (((unsigned long long)ret & ~0xFFFULL) + (unsigned long long)span_pages * 4096ULL > mmap_lim)
         {
         printf("sbrk DENIED %s: ret=0x%llx pages=%u span=%u limit=0x%llx\n",
-               current_process->name, (unsigned long long)ret, pages, span_pages,
+               mm->name, (unsigned long long)ret, pages, span_pages,
                mmap_lim);
        dex32_restoreints(flags);
        return (void*)-1;
@@ -1246,13 +1252,13 @@ void *dex32_sbrk(unsigned int amt)
    /* Commit pages into the process page directory so malloc/sbrk
         used by the in-OS compiler can grow beyond the initial heap. */
      if (!dex32_commit((DWORD)ret, span_pages,
-                         (DWORD*)current_process->pagedirloc, PG_USER | PG_WR))
+                         (DWORD*)mm->pagedirloc, PG_USER | PG_WR))
          {
          unsigned long heapbytes =
-            (unsigned long)(uintptr)current_process->knext -
+            (unsigned long)(uintptr)mm->knext -
             (unsigned long)(uintptr)userheap;
          printf("sbrk FAIL %s: want %u pages heap=%luKiB free=%llu/%llu\n",
-                 current_process->name, pages, heapbytes>>10,
+                 mm->name, pages, heapbytes>>10,
                  (unsigned long long)frame_free_count(),
                  (unsigned long long)frame_total_count());
          dex32_restoreints(flags);
@@ -1262,11 +1268,11 @@ void *dex32_sbrk(unsigned int amt)
       /* Log pool pressure as a user heap grows (power-of-two KiB marks). */
       {
          unsigned long hb =
-            (unsigned long)(uintptr)current_process->knext -
+            (unsigned long)(uintptr)mm->knext -
             (unsigned long)(uintptr)userheap;
          if (hb >= (1UL<<20) && (hb & (hb-1)) == 0)
             printf("sbrk: %s heap=%luKiB free=%llu/%llu\n",
-                    current_process->name, hb>>10,
+                    mm->name, hb>>10,
                     (unsigned long long)frame_free_count(),
                     (unsigned long long)frame_total_count());
       }
@@ -1290,7 +1296,7 @@ void *dex32_sbrk(unsigned int amt)
      memset(ret, 0, (size_t)(pages * 4096));
 #endif
 
-      current_process->knext+=pages*4096;
+      mm->knext+=pages*4096;
       dex32_restoreints(flags);
       return (void*)ret;
     };

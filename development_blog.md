@@ -1,6 +1,770 @@
 # Development blog
 
+## 2026-09-14 (Manila, UTC+8)
+
+### 21:55 — N150 GOP console qualified; next is physical xHCI
+
+**Current problem / activity:** Live 80x25 GOP console works (per-axis zoom
+from the Multiboot2 tag; high GOP via `KFB_BASE` WC). Cleanup stale probe-bar
+docs. Next: qualify USB root / writable `/icsos` on this N150; parse MADT
+before re-enabling APs. COM1 bridges are unused here (no 16550 header).
+
+### 21:50 — N150 console centered in black: GOP is not 1920x1200
+
+**Current problem / activity:** Blue bar gone, 80x25 terminal centered
+with black around it. Full WC fill worked. Uniform min() zoom on a
+1920x1080 GOP is 2x2 (1280x800). Use per-axis zoom (1080p is 3x2, full
+width, letterbox top/bottom; 1200p stays 3x3). Print `FB WxH zoom=XxY`
+after map. Keep `gfxpayload=keep`. QEMU still 1x1.
+
+### 21:40 — N150 Caps+Num, blue bar, live console: high GOP WC works
+
+**Current problem / activity:** User settled Caps+Num, saw the centered
+blue probe bar and a live text console that did not fill the panel.
+That is high GOP write-combining plus per-cell putc: only newly printed
+glyphs were painted, zoom>1 refresh skipped the rest, and a 1920x1080
+mode would leave margins. Black-fill the whole GOP, center the 80x25
+grid, blit the existing shadow. If that full WC fill reboots, shrink
+it; if the console now fills, GOP is qualified and USB/xHCI on the
+N150 is next. QEMU still maps early.
+
+### 21:30 — N150 Caps-only after WC late_init: GOP is above 4GiB
+
+**Current problem / activity:** After scheduler Caps, user settled Caps
+only, panel blank, powered. Num would mean no GRUB tag; both would mean
+the map ran. Caps-only is `FBCONSOLE_LATE_HIGH` / `BAD`: tag exists but
+identity WC refused it (phys >= 4GiB or the buffer crosses 4GiB). Map
+that range through `KFB_BASE` (PDPT[5], 2MiB WC pages, 64MiB cap). Set
+Num Lock before the map so a hang is Num, not Caps. Success still
+Caps+Num plus the centered bar. QEMU unchanged. Reflash.
+
+### 21:20 — N150 late GOP mapped or skipped, stores never reached iGPU
+
+**Current problem / activity:** Caps stayed, panel blank, no reboot after
+late identity WB + six corner glyphs. That is either (1) GRUB tag missing
+or GOP above 4GiB so `late_init` was a no-op, or (2) WB stores stuck in
+CPU cache / too small in the top-left corner. Program PAT PA4=WC, mark
+the GOP 2MiB PDEs with PAT bit 12 (not UC), `movnti` + `wbinvd`, paint a
+centered blue stripe with `ICS-OS`. After scheduler Caps: both = mapped,
+Num = no tag, Caps = high/bad. QEMU still maps early (COM1). Reflash;
+look at the middle of the panel.
+
+### 21:10 — N150 15-step walk, settle Caps: scheduler; late GOP next
+
+**Current problem / activity:** User reported Caps, Num, both, Caps,
+Num, both, Caps, Num, both, Caps, Num, both, Num, both, Caps stay.
+That is the full held walk through printf / CPU skip / ext / devmgr /
+alloc / vtd / pci / api / kbd / lapic / smp / process / AP-skip /
+`taskswitcher` (stage 16). Caps staying without reboot means the
+scheduler is running; the panel was blank because GOP was still
+skipped. `fbconsole_late_init()` now identity-maps GOP write-back after
+that Caps hold, paints `ICS-OS`, and turns live-render on. High GOP and
+fault-path full-panel fills stay off. QEMU (COM1) still maps early.
+Reflash; expect the same LED walk, then either `ICS-OS` on the panel
+or Caps-then-reboot if late GOP is still unsafe.
+
+### 20:55 — N150 12-step LED walk, settle Caps: APs / scheduler
+
+**Current problem / activity:** User reported Caps|Num columns (called
+"scroll"): both, Caps, Num, both, Caps, Num, both, Caps, Num, both,
+Num, Caps stay. That is the held walk through kbd + `lapic_init` (Num).
+Final Caps is `fbdbg_stage(13)` then `process_init` / `smp_start_aps`
+(INIT to APIC ids 1..7, no MADT) / `taskswitcher`. Skip AP start and
+the `0x80000000` CPUID in `smp_rdtscp_available` when COM1 is absent.
+`lapic_present()` so x2APIC timer/park work without `lapic_mmio`.
+QEMU still starts APs. Panel blank. Reflash; expect Num then both
+then Caps if the scheduler is reached.
+
+### 12:50 — N150 walked to Caps after second Num: kbd or x2APIC
+
+**Current problem / activity:** Sequence Caps → Num → both → Caps →
+Num → both → Num → Caps (stays). That is the held CPU/ext/devmgr/alloc
+walk, then PCI Num, then Caps: `init_keyboard` or `lapic_init`. N150
+UEFI leaves x2APIC on; `lapic_write` to FEE00000 hangs. Use x2APIC
+MSRs (`lapic_x2apic_msr`), 64-bit ICR, no INIT deassert. Bound the
+`init_kbd` OBF flush (stuck OBF is an infinite loop) and skip
+`installmouse` without COM1. Hold LEDs around kbd vs LAPIC.
+`make test-lapicx2-unit`. Panel blank. Reflash.
+
+### 12:35 — N150 Caps after both→Num: CPUID never returned
+
+**Current problem / activity:** Sequence both → Num → Caps and it
+stays Caps. That is stage 3, entered startup, first `printf`, then
+`hardware_getcpuinfo` (Caps is set *before* CPUID). No Num after
+getcpuinfo, so leaf 0/1 or `0x80000000` did not return. Skip all
+CPUID when COM1 is absent; zero `%ecx` before `cpuid`; hold each LED
+~0.3s on the laptop so the next pair cannot be missed. QEMU still
+probes CPUID. Panel blank. Reflash and report the held sequence.
+
+### 12:30 — N150 past VGA: Caps+Num → Num → Caps
+
+**Current problem / activity:** After the CRTC/`getcpuid` fix the panel
+is still blank but LEDs advance: both on (console), Num (entered
+startup), Caps (first `printf` returned). Hang is in
+`hardware_getcpuinfo` / `printinfo` / `extension_init` / early
+`devmgr_init` — stages 4 and 5 are both Caps so they look the same.
+Harden brand string (check `0x80000000`, memcpy + NUL). Skip the long
+`hardware_printinfo` dump without COM1. Override LEDs after CPUID
+(Num), after the CPU line (both), after ext (Caps), after devmgr
+(Num). Reflash and report the last pair and the sequence.
+
+### 12:20 — N150 Caps+Num hang/reboot is VGA CRTC + getcpuid leaf
+
+**Current problem / activity:** Latest no-GOP flash still blank; Caps+Num
+both on; sometimes immediate reboot, sometimes hang. That is stage 3
+(console up) then death before stage 4. GOP is already skipped, so the
+window is the first `printf` / `hardware_getcpuinfo`. `Dex32PutC` called
+`move_cursor` (VGA CRTC `0x3D4`/`0x3D5`) on every character after
+CreateDDL pointed `hdw_ptr` at `0xB8000` because `fbconsole_active()`
+was false. No VGA on this PCH: those outs hang or reset. `getcpuid` in
+`asmlib.S` also treated the leaf as a pointer and wrote CPUID results
+to addresses 0, 1, and `0x80000002`. Skip legacy VGA when a GOP tag
+exists or COM1 is absent; fix `getcpuid` to match the 32-bit leaf-in-
+`rdi` ABI; save `rbx` in `move_cursor`. LED split: Num after selftest,
+Caps after first printf. Panel stays blank. Reflash and report which
+pair sticks.
+
+### 12:10 — N150 still blank Caps+Num after GOP defer
+
+**Current problem / activity:** Same blank panel and both lock LEDs
+after the WB/clflush change. GOP paint at stage 2/3 or in the fault
+path is still the leading reboot theory (nested #PF while drawing).
+This boot skips all GOP MMIO when COM1 is absent. Fault LEDs are both
+off so they are not confused with stage 3. Panel stays blank on
+purpose. Next report is how far Caps/Num get and whether it still
+reboots.
+
+### 12:05 — N150 Caps+Num, blank GOP, reboot 2/3
+
+**Current problem / activity:** Both LEDs on (stage 3 console or fault)
+and the machine reboots most boots. Early `mmio_mark_uncacheable` +
+full-panel UC fill + 3x 80x25 refresh is millions of GOP stores, some
+before the IDT. Defer all GOP map/paint until after `mem_init`. Leave
+laptop GOP write-back and `clflush` glyphs. QEMU still UC for
+`FBCONSOLE_PASS` readback. Do not full-frame fill.
+
+### 11:55 — N150 Num on/Caps off; no Scroll LED; 640x400 on 1920x1200
+
+**Current problem / activity:** Hardware report: Num Lock on, Caps off,
+no Scroll LED. That matches old stage 2 (mem_init) or 3 (console), or
+firmware Num Lock if 0xED never ran. Remap LEDs to Caps+Num only; stage
+0 now clears all LEDs first. Zoom the 80x25 grid 3x on 1920x1200 so it
+is not a postage stamp in the corner. Skip GOP pixel readback without
+COM1. Reflash and check: Num must go off after GRUB.
+
+### 11:50 — i8042 Caps/Num/Scroll boot-stage LEDs
+
+**Current problem / activity:** N150 has no serial and may still blank
+the panel. `kbd_boot_leds()` sends bounded `0xED` Set LEDs from C entry
+(stage 0 = Caps) and every `fbdbg_stage`. Missing 8042 (0x64 == 0xFF)
+latches dead. USB HID keyboards will not light. Rebuild `make usb-etcher`
+and watch the keyboard LEDs if the screen stays black.
+
+### 11:40 — N150 blank screen after GRUB `com0 isn't found`
+
+**Current problem / activity:** SZBOX N150 1920x1200 booted the Etcher
+GPT image, printed `error: serial port 'com0' isn't found` then
+`Loading ICS-OS (multiboot2)..`, then a powered blank panel. GRUB serial
+probe is expected (no Super I/O UART). Kernel started; the panel went
+black because (1) GRUB used EFI text `console` without `gfxterm` /
+`gfxpayload=keep`, so Multiboot2 may omit the GOP tag, (2) fbconsole
+rejected padded Intel pitch (`pitch > width*(bpp/8)`), (3) live GOP
+blit was forced off after `FBCONSOLE_PASS`, so even a mapped FB stayed
+black with no COM1. Fix: gfxterm + ascii.pf2 + keep; accept padded
+pitch; keep live-render when COM1 scratch-register probe fails.
+Rebuild `make usb-etcher` and reflash. Emulator serial tests keep
+live-render off.
+
+### 10:20 — VirtualBox EFI/BIOS and Bochs BIOS boot the GPT ESP image
+
+**Current problem / activity:** `ics-os-uefi.img` now embeds i386-pc GRUB
+in the GPT gap (core at LBA 34) so BIOS emulators can boot the same
+Etcher image. `test-vbox-uefi-gpt` PASS (EFI), `test-vbox-uefi-gpt-bios`
+PASS, `test-bochs-uefi-gpt` PASS (`GPT_DETECT hdp0`, `Root mount [OK]`).
+N150 still uses UEFI; disable Secure Boot.
+
+### 10:00 — GPT ESP thumbdrive image for N150 / Balena Etcher
+
+**Current problem / activity:** `make usb-etcher` writes `ics-os-uefi.img`
+(GPT + FAT32 ESP + `EFI/BOOT/BOOTX64.EFI`) and `ics-os-uefi.img.zip`.
+USB `gpt_parse` used `!= 0` as failure (success is 1); that rejected a
+valid ESP. Fixed to match IDE. `test-usb-uefi-gpt` PASS (OVMF q35 xHCI:
+`GPT_DETECT usb0`, USB root, `FBCONSOLE_PASS`). Disable Secure Boot on
+the laptop. This does not qualify physical N150 xHCI.
+
+### 08:35 — Cert 248143 leftover-skip: same make scheduler GPF, then stall
+
+**Current problem / activity:** 248143 restored leftover-skip leftover
+advertised idle. `GPF64` at `scheduler.c:278` (`return best ? best :
+lastprocess`, `rip=0x1631c9`, `frsp=0x230`, leftover make pid=25).
+Other CPUs still wrote `GCC_DRIVER_OK` for alias.o, then serial stopped.
+QEMU killed. leftover-skip / leftover schedule / leftover_load_only all
+smash leftover make. Do not dest idle onto CPUIRQ. Certification is
+**not** claimed.
+
+### 08:27 — Cert 248140/248141 exit 2; leftover_load_only 248142 smash
+
+**Current problem / activity:** 248140 hung (backticks). 248141
+`GPF64 scheduler` after leftover-skip removal. 248142 leftover_load_only
+claimed idle `UD64` make + `GPF64` `context_switch` leftover idle
+(`rip=0x10047d`); guest halted, QEMU still up. Revert leftover_load_only;
+restore leftover-skip leftover advertised idle (248139 reached
+`GCC_DRIVER_OK`). Do not dest idle onto CPUIRQ. Kill 248142, `test-fork`,
+relaunch. Certification is **not** claimed.
+
+### 05:45 — Cert 248141 GPF in scheduler after leftover-skip removal
+
+**Current problem / activity:** Cert 248141 reached `GCC_DRIVER_OK` then
+`GPF64` in `scheduler` (`rip=0x163113`, `frsp=0x230`, `proc=make.exe`)
+and leftover `gcc.exe` WATCHDOG at `smp_cpu_idle` (`rip=0x101946`) with
+`IRETQ-BADRIP`. leftover-skip claimed idle on user CR3 hung 248140;
+leftover schedule smashed make. Claimed idle on reserved idle + user
+CR3 now leftover_load_only (do not dest idle onto CPUIRQ). Kill hung
+QEMU, `test-fork`, relaunch. Certification is **not** claimed.
+
+### 05:40 — Cert 248140 hung after first gcc -c (backtick flood)
+
+**Current problem / activity:** Cert 248140 reached `gcc.exe -c` for
+alias/alloc-pool/attribs then hung: 35k serial backticks, no
+`GCC_DRIVER_OK`, no GPF/UD64/WATCHDOG. Cause: leftover advertised idle
+on a user CR3 leftover-skipped even when claimed, so timer IRET'd idle
+and leftover cc1 never scheduled. Removed `leftover_idle_timer_must_skip`
+from `schedule_from_timer`. Dest'd leftover ACCESS_SYS on CPUIRQ still
+leftover-skips via `leftover_timer leftover_sys_on_cpuirq`. Do not dest
+idle onto CPUIRQ. Kill hung QEMU, `test-fork`, relaunch cert.
+Certification is **not** claimed.
+
+### 05:20 — Fix xHCI two-device compile, resume self-host cert
+
+**Current problem / activity:** xHCI two-device compile fixed;
+`test-usb-storage-xhci` PASS; `test-usb-cdc-console` PASS both orders
+(`devs=2`, MSC root intact). `test-fork` PASS on retry (one TCG
+77-storm GPF). Launching `test-selfhost-cert-parallel`. Certification
+is **not** claimed.
+
 ## 2026-09-13 (Manila, UTC+8)
+
+### 22:45 — Cert 248137: idle stack overflow, dest ACCESS_SYS idle to CPUIRQ
+
+**Current problem / activity:** Cert 248139 `GCC_DRIVER_OK` then
+leftover idle `UD64 rip=0xac10000` (64KiB idle, no overflow).
+Halting ACCESS_SYS IRET to user ELF and leftover-idle `#UD` retarget
+both GPF'd `fork_child_return`. Reverted those. Stay on 64KiB idle
+and leftover-skip dest'd ACCESS_SYS. Do not dest idle onto CPUIRQ.
+Certification is **not** claimed.
+
+### 22:50 — Phase 0: USB CDC console (ESP32-S3 log device) oracle
+
+**Current problem / activity:** Plan the ICS-OS -> ESP32-S3 (Waveshare
+LCD-1.47, native USB CDC-ACM) log path for the N150 laptop, where the OS
+must write debug strings to the device even in early boot. Decision:
+CDC-ACM over the existing xHCI host (HID is a dead end — the existing
+keyboard/mouse drivers are PS/2 ports 0x60/0x64, there is no USB-HID host
+driver, and HID data rides interrupt endpoints the host never exercises).
+Boot from USB thumb drive, so the ESP32 is a SECOND USB device on the same
+xHCI controller. Phase 0 (this entry) proves in QEMU that two devices can
+coexist on one xHCI controller before any kernel change.
+
+**Findings (QEMU 8.2, q35, `-device qemu-xhci` + `usb-storage` + `usb-serial`):**
+1. MSC-only boot: root hub port 1. A lone CDC-ACM device enumerates at
+   port 5, full-speed (`speed=1`) — QEMU places the CDC behind internal
+   routing, not on port 1.
+2. Both devices, any attach order: the xHCI driver's port scan
+   (`xhci_init_hcd`, xhci.c:1185, "first connected port, break") picks the
+   MSC port (1 or 2) because the CDC lands on port 5; `usb_parse_config`
+   never sees it. `Root mount [OK]`, `usb: registered usb0p0`, MSC
+   endpoints in=1 out=2, zero CDC bytes written (expected — the OS has no
+   CDC writer yet). `make test-usb-cdc-console` PASSES both orders.
+3. Explicit `port=` pinning: `port=0` does not exist (1-based); pinning
+   works per-device. Forcing CDC to a port lower than the MSC could not be
+   achieved in QEMU 8.2 (CDC-only pinned to `port=1` still enumerated at
+   port 5 — the property is not a hard root-hub port pin for this device
+   type). The "first connected port, break" hazard is therefore latent in
+   the kernel, not reproducible in this QEMU; the Phase 1 port scan must
+   be made device-class-aware (keep scanning after a non-MSC reject) so
+   the N150's real port order cannot steal the MSC root.
+
+**Oracle added:** `scripts/test-qemu-xhci-cdc-coexist.sh` +
+`make test-usb-cdc-console` (both attach orders; gates MSC root intact
+with a second device present; records CDC rejection + chardev bytes).
+Next: Phase 1 = `hardware/usb/usb_cdc_console.c` (enumerate device 2,
+bulk-OUT data EP, `DEVMGR_CHAR` usbcon0) + bounded xHCI 2nd-slot
+generalization + `main()` early bring-up (identity map is live before
+`main()`; earliest xHCI DMA point is post-`mem_init` at kernel32.c:483,
+with BSS DMA buffers + re-marking the xHCI BAR after `mem_init`).
+
+### 22:35 — Leftover timer must abandon waiters, not skip
+
+**Current problem / activity:** Cert 248136 leftover make spun on
+`io_devlock` because `schedule_from_timer` returned on leftover
+USER / FOREIGN current and never ran `disk_mgr` (still `on_cpu=0`).
+TAP 96/96 and `test-fork` PASS after narrowing abandon to leftover
+`crit_wait` only. Cert 248137 reached `GCC_DRIVER_OK` then
+`IDLE-STACK-OVERFLOW` on CPU 1 and `GPF64` in `timerwrapper` as
+leftover make (`rbp=0` on make's kstack). Guest killed. Current
+activity: leftover waiter abandon is in; next is idle-stack overflow
+/ timerwrapper leftover iretq. Certification is **not** claimed.
+
+### 22:25 — Cert 248135: IRETQ-BADRIP rip=0 on CPUIRQ killed make
+
+**Current problem / activity:** Cert 248135 reached `GCC_DRIVER_OK`
+then `GPF64` in `ps_switchto` `ret` as leftover idle (RBP=0 on the
+reserved idle stack), `WATCHDOG` make on `vfs_busy` (owner gcc 29),
+and `IRETQ-BADRIP rip=0 cs=0 rsp=0x2000130` which `exc_recover`'d
+make (`GCC_SELF_CERT_FAIL`). Cert 248136 reached `GCC_DRIVER_OK` then leftover make
+`CRIT-NONOWNER` on `io_devlock` (`busy=0x12` disk_mgr `self=0x1a`),
+GNU make `wait: error`, and a hang: disk_mgr blocked holding the
+device lock while leftover make spun on CPU 0 (`on_cpu` clash).
+`iomgr_lockdev` leftover skip failed `test-fork` at the first
+`waitpid`. Reverted. `file_ok` leftover skip stays. `test-fork`
+PASS on retry (one TCG 77-storm GPF is not a dest regression).
+Current activity: leftover make `CRIT-NONOWNER` on `io_devlock` /
+disk_mgr `on_cpu` clash (cert 248136). Do not dest leftover USER A
+on USER B. Certification is **not** claimed.
+
+### 22:20 — Cert 248133: scheduler GPF on torn next
+
+**Current problem / activity:** Cert 248133 reached `GCC_SELF_BEGIN`,
+two `gccdriver: cc1 ok`, then `GPF64` in `scheduler` at
+`lastprocess->next->before` (`rip=0x161d67`) as leftover make. next was
+non-NULL but torn (`0x100000001`). Re-validate/RLBAD/dequeue now use
+`sched_node_ok`/`sched_link_ok`. TAP 89/89 and `test-fork` PASS.
+248134 `mcopy` failed (work.img busy from leftover 248133 QEMU) and
+never booted the new kernel. Current activity: relaunch
+`test-selfhost-cert-parallel` now that the image is free. Certification
+is **not** claimed.
+
+### 22:14 — test-fork PASS; leftover vfs skip is file_ok only
+
+**Current problem / activity:** `test-fork` PASS after dropping the
+global leftover `sync_entercrit` no-op (that GPF'd `CPUintwrapper`
+`iretq` in the 77-storm). Leftover USER on `pagedir1` still keeps the
+USER token; leftover vfs skip is `file_ok` only. Current activity:
+launching `test-selfhost-cert-parallel CERT_TIMEOUT=28800`. Certification
+is **not** claimed.
+
+### 22:12 — test-fork 77-storm GPF after leftover-vfs skip
+
+**Current problem / activity:** After leftover-mm revert + leftover vfs
+skip, `test-fork` GPF'd at `CPUintwrapper` `iretq` (`err=0x4c` TSS-bad,
+user stack, leftover forktest on child CR3) during the status=77 storm.
+Global `sync_entercrit` leftover no-op is too broad (fork uses crits).
+Current activity: leftover vfs skip is `file_ok` only; leftover-mm is
+still USER A on USER B only. Re-run `test-fork` before cert. Certification
+is **not** claimed.
+
+### 22:05 — Leftover USER on pagedir1 must keep USER tokens
+
+**Current problem / activity:** Cert 248132 minted idle token `0x1` on
+`vfs_busy` (`CRIT-NONOWNER busy=0x12 self=0x1`) because
+`leftover_user_on_other_cr3` treated leftover USER on `pagedir1` as
+leftover-mm and `current_mm_process` retargeted to pid 0. Current
+activity: leftover-mm is USER A on USER B only; leftover USER on
+`pagedir1` keeps the USER token; leftover idle / leftover USER on
+kernel CR3 skip `vfs_busy` enter/leave (`leftover_vfs_must_skip`).
+TAP 64 flipped; TAP 84–87 added. Rebuild `kernel32.o`, then
+`test-smpclaim-unit` and `test-fork` before relaunch. Certification
+is **not** claimed.
+
+### 21:56 — Cert 248132: idle token on vfs_busy
+
+**Current problem / activity:** Cert 248132 reached `GCC_SELF_BEGIN`
+and started `alias.c`, then `CRIT-NONOWNER busy=0x12 self=0x1` on
+`vfs_busy` (disk_mgr pid 17 vs leftover kernel token) and
+`CRITHANG` / `WATCHDOG` gcc. Guest hung; killed. Fail-closed BADVA
+did not fire. Current activity: leftover ACCESS_SYS current minted
+token 0x1 while disk_mgr holds `vfs_busy`. Do not relaunch the same
+kernel. Certification is **not** claimed.
+
+### 21:48 — Leftover USER A on B: dest CPUIRQ
+
+**Current problem / activity:** Cert 248131 leftover gcc on cc1 CR3
+tore RIP slots. C-side schedule skip of leftover USER A/B failed
+`test-fork`. Current activity: dest=CPUIRQ for leftover USER A/B (all, then
+claimed-only) failed `test-fork` the same way — leftover parent
+often still has `on_cpu==me` on the child CR3. Reverted irqwrap
+CR3 dest. TAP dest_mm remains the intended dest. Do not relaunch
+until `test-fork` PASSes. Certification is **not** claimed.
+
+### 21:38 — Cert 248131: leftover gcc on cc1 CR3
+
+**Current problem / activity:** Cert 248131 compiled several objects
+then `PF64-BADVA` halt as leftover cc1 at torn `rip=0x300000003`
+(`(3<<32)|3`), then `PF64-STALE-CURRENT cur=35 cr3pid=33` (leftover
+gcc on cc1's AS), `GCC_DRV_FAIL`, and a second halt as gcc at
+`rip=0x200000002`. Fail-closed BADVA worked; schedule still treated
+leftover USER A as the runner on USER B. Guest killed. Current
+activity: skipping schedule on leftover USER A/B CR3 failed
+`test-fork` (`TSS-bad` `fork_child_return`); reverted that skip.
+TAP 79 still names the leftover-mm predicate. Do not relaunch
+until `test-fork` PASSes. Certification is **not** claimed.
+
+### 21:32 — Cert 248130: SYSCALL iretq guard false positive
+
+**Current problem / activity:** Cert 248130 reached `GCC_SELF_BEGIN`
+then `IRETQ-BADRIP rip=0 cs=0 rsp=0x3fffd300` as make and recovered
+it (`GCC_SELF_CERT_FAIL`). `SYSCALL` has no hardware RIP/CS after
+`PUSH_ALL`; the guard added on `syscallentry` read leftover stack
+zeros. A CR3-only guard there then failed `test-fork` (`TSS-bad`
+`fork_child_return`). Current activity: no iretq guard on
+`syscallentry`; RIP/CR3 checks stay on `int 0x30` and timer.
+`test-fork` then relaunch. Certification is **not** claimed.
+
+### 21:30 — Cert 248129: torn RIP recovered as userfault
+
+**Current problem / activity:** Cert 248129 reached `GCC_SELF_BEGIN`
+then `PF64-BADVA cr2=rip=0x10390d900` as leftover cc1
+(`(1<<32)|kheap`) and recovered it because any RIP ≥ 4MiB looked like
+user text. Leftover gcc then `#UD` at `rip=0x3fffe4c0` (user stack)
+and was killed (`GCC_DRV_FAIL`). Guest exit 2. Current activity:
+user-fault RIP is the ELF window only; torn, unwalkable, and
+user-stack RIPs halt (TAP 75–78). `test-fork` then relaunch.
+Certification is **not** claimed.
+
+### 21:23 — Cert 248128: syscallwrapper iretq on pagedir1
+
+**Current problem / activity:** Cert 248128 compiled several cc1
+objects (`GCC_DRIVER_OK` ×10+), then `PF64-BADVA` recovered leftover
+gcc executing kheap RIP `0x371a3bb`, then `GPF64` at
+`syscallwrapper` `iretq` (`rip=0x178fe4`) as leftover make on the
+user stack with `cr3=0x191000` (`pagedir1` does not map
+`0x3FFF****`). Guest halted; killed. Current activity: do not recover
+reserved RIP on `PF64-BADVA`; skip schedule for leftover USER on the
+user stack or kernel CR3; fail-closed `IRETQ-BADCR3` before walking
+the user frame; repair unclaimed leftover USER on user-stack+kernel
+CR3 (TAP 67–74). `test-fork` then relaunch. Certification is **not**
+claimed.
+
+### 21:21 — Cert 248127: IRETQ-BADRIP rip=0x18 as make
+
+**Current problem / activity:** Cert 248127 `GPF64` in cc1 (torn
+`cpus[]` slot), then `WATCHDOG` make on `vfs_busy`, then
+`IRETQ-BADRIP rip=0x18 cs=0 rsp=0x2060100` (CPU 3 idle-stack top).
+Leftover USER make with `on_cpu==me` was scheduled from MEM_CPUIRQ
+because the skip required `on_cpu < 0`. Current activity: any USER
+on MEM_CPUIRQ/idle stacks skips schedule (TAP 66). Kill guest,
+`test-fork`, relaunch. Certification is **not** claimed.
+
+### 21:16 — Cert 248126: task_mgr noncanonical RIP, guest wedged
+
+**Current problem / activity:** Cert 248126 reached `GCC_SELF_BEGIN`, then
+`PF64 cr2=rip=0x100000001` (`(1<<32)|1`) as `task_mgr` with `rdi=cpus[]`
+and torn RBX. Nested `GPF64` in `pagefaulthandler` (`rip=0x130179`)
+halted that CPU; two `GCC_DRIVER_OK` then silence. Guest killed.
+Certification is **not** claimed. Current activity: PF handler
+fail-closes on CR2/RIP outside identity/KDIRECT (TAP 64–65;
+`0x100000001` is canonical but not walkable). Leftover `task_mgr`
+still executed a torn RIP.
+
+### 21:14 — Cert 248125: leftover gcc on make CR3
+
+**Current problem / activity:** Cert 248125 reached `GCC_DRIVER_OK`, then
+`PF64-STALE-CURRENT cur=42 cr3pid=25` and `UD64 rip=0x10207` (opcodes
+`_getkey`) as make.exe, then torn RIP `0x3ad810<<32` (`cpus[]`).
+`current_mm_process` only retargeted leftover idle, so leftover USER
+gcc kept minting tokens on make's AS. Current activity: retarget MM
+identity when advertised USER CR3 ≠ HW CR3 (TAP 62–63). `getprocessid`
+stays on `current_process`. Kill guest, `test-fork`, relaunch.
+Certification is **not** claimed.
+
+### 21:11 — Cert 248124: IRETQ-BADRIP after GCC_DRIVER_OK
+
+**Current problem / activity:** Cert 248124 reached `GCC_DRIVER_OK` twice
+then `CRIT-NONOWNER` on `vfs_busy` (busy=0x1a make, self=0x1f gcc) and
+`IRETQ-BADRIP` halt as leftover idle — no RIP was printed. Current
+activity: print iretq RIP/CS/proc; reject BSS/kheap returns (TAP 59–61).
+Kill the halted guest, `test-fork`, relaunch. Certification is **not**
+claimed.
+
+### 21:06 — Cert 248123: KSTACK-FOREIGN tore kstack_top
+
+**Current problem / activity:** Cert 248123 reached `GCC_DRIVER_OK`, then
+`KSTACK-FOREIGN cpu=1 owner=895 pid=25` with torn
+`kstack_top=(0x400000<<32)|0x36d1490` and `UD64` in the heap
+(`userfault=0`). Leftover current stayed on make's kstack because the
+in-range stay used the torn top. Current activity: FOREIGN (and a torn
+64-bit top) goes to MEM_CPUIRQ before the in-range stay (TAP 57–58).
+Yanking FOREIGN off a valid kstack failed `test-fork` again
+(`TSS-bad` `fork_child_return`). Only a torn 64-bit top is rejected.
+`test-fork` then relaunch. Certification is **not** claimed.
+
+### 21:03 — Cert 248122: vfs_busy token mismatch
+
+**Current problem / activity:** Cert 248122 reached `GCC_SELF_BEGIN` then
+`CRIT-NONOWNER` / `CRITHANG` / `CRITCYCLE` on `vfs_busy` (busy=0x1f
+gcc pid 30, self=0x2a leftover gcc 41). `getprocessid` stays on
+`current_process` for fork identity; `sync_owner_token` was still
+using that leftover pid while nest was pushed on `current_mm_process`.
+Current activity: mint crit tokens from the MM PCB (TAP 55–56). Kill
+the hung guest, `test-fork`, relaunch. Certification is **not** claimed.
+
+### 20:56 — test-fork red: leftover idle on user stack
+
+**Current problem / activity:** After 248121, `test-fork` twice hit
+`GPF64 TSS-bad rip=fork_child_return` on the user stack during the
+status=77 storm. Leftover `current=idle` is ACCESS_SYS, so
+IRQ_KSTACK_ENTER stayed on the user stack. Current activity: divert
+ACCESS_SYS+user-stack to MEM_CPUIRQ and skip schedule from there
+(TAP 52–54). Reserved-RIP classifier kept. Do not relaunch cert
+until `test-fork` PASSes. `test-smpclaim-unit` 54/54 and `test-fork`
+PASS. Relaunching cert. Certification is **not** claimed.
+
+### 20:53 — Cert 248121: #SS then UD64 at kheap+0x41
+
+**Current problem / activity:** Cert 248120 exit 2 (24KiB idle overflow).
+248121 reserved 32KiB idle stacks (`cpu-idle-stack 2040000-2082000`),
+reached `GCC_DRIVER_OK`, then `#SS` ("Stack segment error") and
+`UD64 rip=0x2082041` (MEM_KHEAP_BASE+0x41, cs=0x8). That RIP was
+classified as a user fault (`rip >= MEM_USER_ELF_BASE`) and killed
+make.exe; shell2 then `GPF64` in `context_switch` on make's kstack.
+No `IDLE-STACK-OVERFLOW`. Current activity: fail-closed reserved-RIP
+classifier (TAP 48–51); `#SS` wrapper prints RIP/RSP; dlmalloc
+free-walk uses `MEM_KHEAP_BASE` so idle stacks are not heap.
+`test-fork` then relaunch. Certification is **not** claimed.
+
+### 20:50 — Cert 248120 failed; reserved idle stacks + getprocessid stay on current
+
+**Current problem / activity:** Cert 248120 reached `GCC_DRIVER_OK`, then
+`IDLE-STACK-OVERFLOW cpu=1` (word=15) and `GPF64` in `sync_owner_pcb`
+on as.exe — 24KiB BSS idle stacks still overflowed. Idle stacks are now
+32KiB at `MEM_IDLE_STACK_*` (after `MEM_CPUIRQ`; kheap starts at
+`0x02082000`). `getprocessid` must stay on `current_process`: routing
+it through `current_mm_process` broke `test-fork` (child exit / parent
+wait identity). `current_mm_process` remains for sbrk/`crit_current`
+only. `test-smpclaim-unit` 47/47 and `test-fork` PASS. Current activity:
+relaunch `test-selfhost-cert-parallel CERT_TIMEOUT=28800`. Certification
+is **not** claimed.
+
+### 20:48 — Cert 248120: 24KiB idle stack still overflows
+
+**Current problem / activity:** Cert reached `GCC_DRIVER_OK`, then
+`IDLE-STACK-OVERFLOW cpu=1` (word=15) and `GPF64` in `sync_owner_pcb`
+on as.exe. 24KiB BSS idle stacks were still too small; 32KiB×8 misses
+the BSS limit. Current activity: idle stacks moved to
+`MEM_IDLE_STACK_*` (32KiB after `MEM_CPUIRQ`, TAP 42). Rebuild,
+`test-fork`, relaunch. Certification is **not** claimed.
+
+### 20:44 — Cert 248119: sbrk/file_ok as leftover idle
+
+**Current problem / activity:** Cert reached parallel gcc, then
+`CRIT-NONOWNER self=0x7f0003` (idle token), `sbrk FAIL cpu_idle`
+(knext=0 → huge heap), cc1 OOM, `PF64-STALE-CURRENT` idle vs cc1
+CR3, and `GPF64` in `ps_switchto` as idle under cc1's CR3. Current
+activity: `current_mm_process` / getprocessid / sbrk / crit nest
+follow HW CR3 when current is idle on a user AS; idle loop must not
+force-drop leftover while CR3 is still user (TAP 45–46). Rebuild,
+`test-fork`, relaunch. Certification is **not** claimed.
+
+### 20:40 — Cert 248118: leftover USER scheduled from MEM_CPUIRQ
+
+**Current problem / activity:** Cert reached parallel `gcc.exe`/`cc1`,
+then `CRIT-NONOWNER` on `vfs_busy` and dual `UD64` (`gcc` RIP in
+`frame_refs`, `task_mgr` at `context_switch`). Unclaimed leftover USER
+parked on `MEM_CPUIRQ` still ran `schedule_from_timer` because
+`crit_wait` disables the coop no-preempt guard. Current activity: do
+not schedule when `on_cpu < 0` and RSP is `MEM_CPUIRQ` (TAP 43–44).
+Rebuild, `test-fork`, relaunch. Certification is **not** claimed.
+
+### 20:36 — Cert 248117: 16KiB idle stack overflow
+
+**Current problem / activity:** Cert reached `GCC_DRIVER_OK`, then
+`IDLE-STACK-OVERFLOW` on CPUs 1/2/3 (word=15) and `GPF64` in
+`ps_switchto` on cpu_idle pid=-65534 (CPU 2) with CPU 3's stores in
+the neighbour stack. Timer + `schedule_from_timer` overflowed 16KiB
+BSS idle stacks through the 128-byte guard. Current activity: idle
+stacks are 24KiB (`MEM_IDLE_STACK_SIZE`; 32KiB×8 misses
+`MEM_KERNEL_BSS_LIMIT`). TAP 42. Rebuild, `test-fork`, relaunch.
+Certification is **not** claimed.
+
+### 20:28 — Cert 248116: FOREIGN stay on cc1 kstack
+
+**Current problem / activity:** Cert reached `GCC_DRIVER_OK`, then
+`CRIT-NONOWNER` (`vfs_busy` busy=cc1 self=make) and `GPF64` in
+`sync_owner_pcb` (`rip=0x13553a`). cc1 kstack bounds were intact but
+KRAW slots were torn (`0x2b<<32` token, `cpus[]` in high32). IRQ
+already-on-kstack stayed even when `on_cpu` was FOREIGN. Current
+activity: FOREIGN on a process kstack goes to `MEM_CPUIRQ`;
+`sync_owner_pcb` refuses a non-PCB `next`. Yanking FOREIGN off a
+process kstack failed `test-fork` (`GPF64 TSS-bad` on the user
+stack during straddle). irqwrap stay-on-kstack is restored; the
+ready-walk rejects only a non-canonical `next`. `test-fork` PASS
+after stopping the halted 4GiB cert guest (TCG starved). Relaunch
+cert. Certification is **not** claimed.
+
+### 20:20 — Torn 64-bit slots: leftover task_mgr on idle BSS
+
+**Current problem / activity:** Live `/tmp/icsos-gccself-dbg.log`:
+`PF64` in `ps_switchto` with torn RBP `0x10253e5d0`, then `UD64`
+into `cpus[]`, orphaned `vfs_busy`, `GPF64 TSS-bad` on shell2, and
+`WATCHDOG held=0x35BC8E0` (kheap pointer in `held_crit_n`). Same
+torn signature on RSI/R14/RBP: one half a kheap pointer, the other
+a small int or `smp_cpu_id`. Original cause is leftover unclaimed
+`task_mgr` advertised while this CPU is on idle BSS; ACCESS_SYS
+stays, timer C overflows 16KiB, ignore-and-return retries the torn
+RIP. Current activity: repair unclaimed kernel leftover only from
+idle BSS (keep kheap RSP as release-before-switch); enlarge
+`task_mgr` stack; halt ACCESS_SYS not-present; clamp `held_crit_n`
+(TAP 34–38). `test-smpclaim-unit` 38/38 and `test-fork` PASS.
+Cert 248116 launched (`CERT_TIMEOUT=28800`). Certification is
+**not** claimed.
+
+### 11:50 — Cert 248114: do not repair release-before-switch
+
+**Current problem / activity:** Cert ran ~2 min then `UD64` in
+`disk_mgr` (`rip=0x2571ed1`) after `STALE-CURRENT-REPAIR`. Idle
+token `0x7f0003` left `vfs_busy` held by gcc (CRITCYCLE). Unclaimed
+leftover repair treated release-before-switch as idle. Current
+activity: leftover kernel is FOREIGN-only; unclaimed USER on kernel
+CR3 repairs only from idle BSS (TAP 32–33). Rebuild, `test-fork`,
+relaunch. Certification is **not** claimed.
+
+### 11:25 — Unclaimed leftover kernel current (task_mgr)
+
+**Current problem / activity:** Live cert: 2× `GCC_DRIVER_OK`, then
+`task_mgr` `#UD` into BSS and `GPF64` in `spin_lock`
+(`cr2=0x300000003`) on an idle BSS stack (`rsp=0x253e170`).
+Unclaimed leftover ACCESS_SYS (`on_cpu < 0`) was never repaired, so
+timer C ran as `task_mgr` on 16KiB idle BSS and overflowed. Current
+activity: leftover kernel repairs whenever `on_cpu != me` (TAP 32).
+Rebuild, `test-fork`, relaunch. Certification is **not** claimed.
+
+### 11:22 — Cert 248112 died on vfs_busy non-owner flood
+
+**Current problem / activity:** QEMU exited in ~40s after 1
+`GCC_DRIVER_OK`. Leftover `as.exe` (pid 44) left `vfs_busy` held by
+make (token `0x1a`) from `file_ok` ~20k times; serial flood killed
+the guest mid-line. Current activity: throttle `CRIT-NONOWNER` to 8
+lines. Rebuild, `test-fork`, relaunch. Certification is **not**
+claimed.
+
+### 11:20 — Do not idle-repair leftover A on user B's CR3
+
+**Current problem / activity:** Cert 248111 was killed after
+`GPF64 rip=ps_switchto` on make (leftover cc1, CR3=make,
+`STALE-CURRENT-REPAIR` set current=idle). Pulling timer repair
+then failed `test-fork` straddle (`TSS-bad` at
+`fork_child_return`). Current activity: leftover repair must not
+idle while HW CR3 is another user AS (TAP 31); timer repair
+returns with that predicate. Rebuild, `test-fork`, relaunch.
+Certification is **not** claimed.
+
+### 11:15 — Pull leftover repair off the timer again
+
+**Current problem / activity:** Live cert: ramdisk OK, `GCC_SELF_BEGIN`,
+then cc1 `UD64` + `STALE-CURRENT-REPAIR` and `GPF64 rip=0x13c6b4`
+(`ps_switchto` `ret`, make kstack smash, high-half `&cpus`).
+Timer/schedule `smp_repair_stale_current` is pulled back; idle-only
+repair and the FOREIGN kernel predicate stay. Rebuild, `test-fork`,
+relaunch. Certification is **not** claimed.
+
+### 11:35 — zombie_reclaim was freeing ready_lock and cpus
+
+**Current problem / activity:** New cert hung in ramdisk again.
+`KHEAP-BADFREE` of `ready_lock`/`cpus[]` came from
+`zombie_reclaim` (`rip=0x13cad0`) — leftover smash put BSS
+addresses on `zombie_head`. Current activity: enqueue/reclaim only
+heap PCBs (`ZOMBIE-BAD`); TAP 30. Rebuild, `test-fork`, relaunch.
+Certification is **not** claimed.
+
+### 11:30 — test-fork GPF in fork_child_return
+
+**Current problem / activity:** Skip-only `CURRENT-BAD` treated a
+NULL early `current` as smash (`CURRENT-BAD` ×8 before
+`FBCONSOLE_PASS`). `test-fork` then `GPF64 TSS-bad` at
+`fork_child_return`/`syscallentry` on the user stack after
+`FORK_STRESS_PASS`. Current activity: NULL current uses idle for
+nest only (no slot write); non-canonical still skips. Rebuild and
+re-run `test-fork` before cert. Certification is **not** claimed.
+
+### 11:25 — Do not store idle over a torn current
+
+**Current problem / activity:** `pcb_ptr_ok` is keep; storing
+`current=idle` on a failed check was a torn-slot false positive.
+This cert killed make (`PF64 cr2=0xffffffffb848fc46`,
+`KSTACK-SHARED` pid=25 cpu=0/2) before any `GCC_DRIVER_OK`.
+Current activity: nest helpers skip a bad pointer and do not write
+the slot. Rebuild, `test-fork`, relaunch. Certification is **not**
+claimed.
+
+### 11:15 — crit_nest_push #GP on non-canonical current
+
+**Current problem / activity:** Ramdisk hang is gone (`ramdisk: 16384
+KiB ready`, `Root mount [OK]`, `GCC_SELF_BEGIN`, 2× `GCC_DRIVER_OK`).
+Then `GPF64 rip=0x1357ba` in `crit_nest_push` (`mov 0xdf0(%rax)`) —
+`cpus[].current` was non-canonical. Kernel-RIP halt stopped cc1.
+Current activity: `pcb_ptr_ok` before nest/token deref; replace a
+wild current with idle (`CURRENT-BAD`); TAP 28–29. Rebuild,
+`test-fork`, relaunch cert. Certification is **not** claimed.
+
+### 11:00 — FOREIGN leftover kernel current (disk_mgr)
+
+**Current problem / activity:** After the pre-crit `KHEAP-BADFREE`
+guard, cert still hung in ramdisk init. Rejected pointers were
+`ready_lock` (`0x3c1178`) and `cpus[]` (`0x3cc7c0`) — leftover
+`disk_mgr` on an AP `free()`ing BSS. Kernel leftover never repaired
+because CR3 matches idle. Current activity: FOREIGN leftover
+ACCESS_SYS drops (`on_cpu != me`); timer/idle call
+`smp_repair_stale_current`; TAP 26–27. Rebuild, `test-fork`,
+relaunch cert. Certification is **not** claimed.
+
+### 10:50 — Unstick ramdisk after KHEAP-BADFREE
+
+**Current problem / activity:** Cert printed `KHEAP-BADFREE` during
+ramdisk init, then leftover `current` made `sync_leavecrit` sample
+kernel token `0x1` while `kheap_crit.busy` was disk_mgr `0x12`.
+Non-owner leave returns without unlocking, so ramdisk malloc spun
+forever. Current activity: range-check `free`/`realloc` *before*
+taking `kheap_crit`; leave pops nest from the lock-owner PCB (TAP
+24–25); print the rejected pointer. Rebuild, `test-fork`, relaunch
+cert. Certification is **not** claimed.
+
+### 14:25 — Unclaimed user stack is leftover-executing, not FOREIGN
+
+**Current problem / activity:** Sending `on_cpu < 0` user-stack IRQs
+to MEM_CPUIRQ left forktest on the user stack (`GPF64 TSS-bad`).
+Fork children start unclaimed. Current activity: user stack +
+`on_cpu < 0` uses process kstack again; only FOREIGN and idle-BSS
+leftover use MEM_CPUIRQ. `irq_user_rsp` is still user-stack-only;
+`KHEAP-BADFREE` stays. Re-run fork, then cert. Certification is
+**not** claimed.
+
+### 14:15 — Reject leftover irq_user_rsp and wild kheap free
+
+**Current problem / activity:** Leftover `on_cpu < 0` recorded
+MEM_CPUIRQ/kheap RSP as `irq_user_rsp`, and `free()` passed
+`0x800250d58` to `dlfree` (disk_mgr livelock / gcc kill). Current
+activity: only a claimed user-stack RSP updates `irq_user_rsp`;
+`free()` refuses pointers outside `MEM_KHEAP_*` (`KHEAP-BADFREE`).
+TAP 23–24 are that address. Rebuild, re-gate, relaunch cert.
+Certification is **not** claimed.
+
+### 14:00 — Cert: 1 object then cc1 OOM and gcc WATCHDOG
+
+**Current problem / activity:** After leftover `on_cpu < 0` →
+MEM_CPUIRQ, cert reached `GCC_SELF_BEGIN` and 1 `GCC_DRIVER_OK`.
+`cc1.exe: out of memory` (heap size smashed to ~2^54 KiB), then
+kernel `dlfree` `PF64 cr2=0x800250d58` killed gcc;
+`GCC_DRV_FAIL cc1 spawn`; CPU 3 WATCHDOG on gcc with idle RIP.
+Hung QEMU stopped. Certification is **not** claimed.
+
+### 13:50 — IPI stack switch reverted; leftover kstack rule stays
+
+**Current problem / activity:** First launch after the leftover
+`on_cpu < 0` wrapper fix livelocked in `disk_mgr` `dlfree`
+(`cr2=0x800250d58`, 90k ignored ACCESS_SYS PFs) before root mount.
+IPI `IRQ_KSTACK_ENTER` is reverted; timer `irq_iretq_guard` and the
+unclaimed-user MEM_CPUIRQ rule stay. Relaunch cert. Certification
+is **not** claimed.
+
+### 13:40 — Leftover on_cpu&lt;0 must not take process kstack_top
+
+**Current problem / activity:** Cert `#GP` on `timerwrapper` `iretq`
+(`rip=0x178818`) after a leftover advertisement reset a process
+`kstack_top`. `irq_kstack_dest(claimed=0)` already said MEM_CPUIRQ;
+the wrapper treated `on_cpu < 0` as claimed. Current activity: ASM
+matches the TAP; IPI wrappers switch stacks; smashed dest RIP aborts
+the switch; `irq_iretq_guard` fails closed. Relaunch cert.
+Certification is **not** claimed.
 
 ### 13:25 — Kernel-RIP recover no longer kills as.exe; smash remains
 

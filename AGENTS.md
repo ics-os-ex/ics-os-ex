@@ -41,6 +41,10 @@ Useful individual targets (from `ics-os/`):
 | `test-iobench` | CD sequential map; 4KiB page cache hits; `IOBENCH_PASS` + `IOBENCH_CACHE_OK` |
 | `test-usb-storage` | UHCI USB root; guest write + SCSI cache sync + host readback |
 | `test-usb-uefi` | OVMF UEFI boot of the USB thumbdrive image via USB mass-storage; USB root + AP scheduling; GOP framebuffer console (`FBCONSOLE_PASS`) |
+| `test-usb-uefi-gpt` | OVMF q35 xHCI boot of the GPT ESP image (`ics-os-uefi.img`); firmware `BOOTX64.EFI`, `GPT_DETECT usb0`, USB root, AP scheduling, GOP (`FBCONSOLE_PASS`) |
+| `test-vbox-uefi-gpt` | VirtualBox EFI boot of `ics-os-uefi.img` (IDE); `GPT_DETECT hdp0`, FAT root, persistent write/readback |
+| `test-vbox-uefi-gpt-bios` | VirtualBox BIOS boot of the same GPT image (GRUB in the GPT gap) |
+| `test-bochs-uefi-gpt` | Bochs BIOS boot of `ics-os-uefi.img`; `GPT_DETECT hdp0`, `Root mount [OK]` |
  | `test-ide-thumbdrive` | IDE/PATA thumbdrive image booted via GRUB; MBR parses (partition registered) + FAT root mount (signed-`char` MBR magic regression); VBE framebuffer console (`FBCONSOLE_PASS`) |
  | `test-dist` | BIOS+UEFI FAT thumb-drive image with the full in-OS GCC toolchain; `gccdrv` drives cc1/as/ld against a long-named ldscript and runs the resulting ELF (`GCC_DRIVER_OK` + `DIST_GCC_OK` + `GCC_DRV_RUN_OK`); regression for FAT long-name (LFN) padding that corrupted VFS node names |
  | `test-usb-storage-xhci` | q35 xHCI USB root; guest write + SCSI cache sync + host readback |
@@ -82,6 +86,10 @@ Useful individual targets (from `ics-os/`):
 | `test-vim` | FEAT_TINY vim ELF64 TUI; non-interactive `vim --version` prints the real banner + exits cleanly |
 | `test-dup` | Runtime `dup(2)` (`0xC5`) self-test: dup'd tty fd allocable+closable; dup'd file fd write read back through the original (`DUPT_PASS`) |
 | `test-partition-unit` | Host-native TAP unit tests for partition-layer logic: IEEE CRC-32 vectors/chunking and ATA LBA28/LBA48 capacity decode (`tests/partition_unit.c`) |
+| `test-fbconsole-unit` | Host-native TAP for GOP/VBE pitch, late map, PAT-WC, 80x25 origin, and per-axis zoom (`tests/fbconsole_geom_unit.c`) |
+| `test-kbdleds-unit` | Host-native TAP for i8042 boot-stage Caps/Num/Scroll encoding (`tests/kbd_boot_leds_unit.c`) |
+| `test-lapicx2-unit` | Host-native TAP for x2APIC MSR numbers (`tests/lapic_x2_unit.c`) |
+| `test-bridge-console-unit` | Host-native TAP for the ESP32 debug-bridge LCD line buffer (`tests/bridge_console_unit.c`) |
 | `test-vfsgrow-unit` | Host-native TAP for VFS `vfs_units_covering` (exact cluster-size grow; `tests/vfs_grow_unit.c`) |
 | `test-smpclaim-unit` | Host-native TAP for the one-PCB-one-CPU claim/publish protocol, crit nest tokens, and `irq_kstack_dest` (process kstack top only from the user stack; `tests/smp_claim_unit.c`) |
 | `test-integration` | `test-boot` + `test-smp` + `test-exec` |
@@ -185,7 +193,8 @@ Make sure it contains the current problem and the activity currently being perfo
 
 ## Suggested next work
 
-1. Complete strict GCC self-host certification (see `ics-os/docs/gcc-selfhost.md`): `test-kbuild` passes with a host-seeded compiler, but GCC must still rebuild itself in-OS and that rebuilt compiler must build the kernel before the loop is closed.
-2. Richer io_uring (registered buffers, linked SQEs) if needed. Async virtio CQEs and `/dev/vblk` are in. `posix_spawn` / `waitpid` / `/work` are in (`make test-spawn`).
-3. Allow user processes on any CPU and validate remote COW TLB shootdown during migration; harden `waitpid`/exit migration first.
-4. Full ring-3 user mode (today user ELFs still enter with kernel CS).
+1. Qualify physical N150 xHCI USB root and writable `/icsos`. GOP console is live; parse MADT before re-enabling APs. Pico/ESP32 bridges need a 16550 COM1 header (USB gadget is not COM1).
+2. Complete strict GCC self-host certification (see `ics-os/docs/gcc-selfhost.md`): `test-kbuild` passes with a host-seeded compiler, but GCC must still rebuild itself in-OS and that rebuilt compiler must build the kernel before the loop is closed.
+3. Richer io_uring (registered buffers, linked SQEs) if needed. Async virtio CQEs and `/dev/vblk` are in. `posix_spawn` / `waitpid` / `/work` are in (`make test-spawn`).
+4. Allow user processes on any CPU and validate remote COW TLB shootdown during migration; harden `waitpid`/exit migration first.
+5. Full ring-3 user mode (today user ELFs still enter with kernel CS).

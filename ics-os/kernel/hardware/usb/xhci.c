@@ -6,6 +6,7 @@
 #define XHCI_EVENT_TRBS       256
 #define XHCI_MAX_SLOTS        8
 #define XHCI_MAX_HCDS         8
+#define XHCI_MAX_USBDEVS      2
 #define XHCI_TIMEOUT          4000000
 
 #define XHCI_CMD_RUN          (1u << 0)
@@ -62,6 +63,15 @@ typedef struct {
     DWORD link_chain;
 } xhci_ring;
 
+/* Per-device port/slot state. Device 0 is the enumerated primary (normally
+   the MSC root); device 1 is the optional secondary (CDC-ACM console). */
+typedef struct {
+    DWORD port;
+    DWORD speed;
+    DWORD slot;
+    DWORD ep0_mps;
+} xhci_usbdev;
+
 typedef struct {
     u64 *dcbaa;
     xhci_trb *event_trbs;
@@ -74,21 +84,27 @@ typedef struct {
     volatile DWORD *doorbell;
     DWORD context_size;
     DWORD max_ports;
-    DWORD port;
-    DWORD speed;
-    DWORD slot;
-    DWORD ep0_mps;
+    xhci_usbdev usbdevs[XHCI_MAX_USBDEVS];
+    DWORD usbdev_count;
     DWORD event_dequeue;
     DWORD event_cycle;
     xhci_ring cmd_ring;
     xhci_ring ep0_ring;
     xhci_ring ep_in_ring;
     xhci_ring ep_out_ring;
+    xhci_ring cdc_ep0_ring;
+    xhci_ring cdc_ep_out_ring;
     dma_region dcbaa_dma;
     dma_region event_dma;
     dma_region erst_dma;
     dma_region input_ctx_dma;
     dma_region device_ctx_dma;
+    dma_region cdc_input_ctx_dma;
+    dma_region cdc_device_ctx_dma;
+    dma_region cdc_ep0_dma;
+    dma_region cdc_ep_out_dma;
+    BYTE *cdc_input_ctx;
+    BYTE *cdc_device_ctx;
     dma_region scratchpad_array_dma;
     dma_region scratchpad_pages_dma;
     dma_device stream_dma;
@@ -216,23 +232,82 @@ static int xhci_wait32(volatile BYTE *base, DWORD off, DWORD mask,
     return 0;
 }
 
-static int xhci_device_connected(xhci_hcd *hcd)
-{
-    if (!hcd->op || !hcd->port)
-        return 0;
-    return (xhci_r32(hcd->op, 0x400 + (hcd->port - 1) * 0x10) &
-            XHCI_PORT_CCS) != 0;
-}
-
 static int xhci_device_attached(xhci_hcd *hcd)
 {
-    DWORD port;
-    if (!hcd->op)
-        return 0;
-    for (port = 1; port <= hcd->max_ports; port++)
-        if (xhci_r32(hcd->op, 0x400 + (port - 1) * 0x10) & XHCI_PORT_CCS)
-            return 1;
-    return 0;
+   DWORD port;
+   if (!hcd->op)
+       return 0;
+   for (port = 1; port <= hcd->max_ports; port++)
+       if (xhci_r32(hcd->op, 0x400 + (port - 1) * 0x10) & XHCI_PORT_CCS)
+           return 1;
+   return 0;
+}
+
+/* Per-device accessors. Device 0 (the MSC root) always exists once the HCD
+  has a primary; device 1 is the optional CDC-ACM console. */
+static xhci_usbdev *xhci_ud(xhci_hcd *hcd, DWORD index)
+{
+   if (!hcd || index >= XHCI_MAX_USBDEVS)
+       return 0;
+   return &hcd->usbdevs[index];
+}
+
+static xhci_ring *xhci_ep0_ring_for(xhci_hcd *hcd, DWORD dev)
+{
+   return dev ? &hcd->cdc_ep0_ring : &hcd->ep0_ring;
+}
+
+static xhci_ring *xhci_ep_out_ring_for(xhci_hcd *hcd, DWORD dev)
+{
+   return dev ? &hcd->cdc_ep_out_ring : &hcd->ep_out_ring;
+}
+
+static xhci_ring *xhci_ep_in_ring_for(xhci_hcd *hcd, DWORD dev)
+{
+   return dev ? 0 : &hcd->ep_in_ring;
+}
+
+static BYTE *xhci_input_ctx_base(xhci_hcd *hcd, DWORD dev)
+{
+   return dev ? hcd->cdc_input_ctx : hcd->input_ctx;
+}
+
+static DWORD *xhci_input_context_dev(xhci_hcd *hcd, DWORD dev, DWORD index)
+{
+   return (DWORD *)(xhci_input_ctx_base(hcd, dev) +
+                    index * hcd->context_size);
+}
+
+static void xhci_fill_slot_context_dev(xhci_hcd *hcd, DWORD dev, DWORD *slot,
+                                      DWORD entries)
+{
+   xhci_usbdev *ud = xhci_ud(hcd, dev);
+   if (!ud)
+       return;
+   memset(slot, 0, hcd->context_size);
+   slot[0] = (ud->speed << 20) | (entries << 27);
+   slot[1] = ud->port << 16;
+}
+
+static int xhci_usbdev_connected(xhci_hcd *hcd, DWORD dev)
+{
+   xhci_usbdev *ud = xhci_ud(hcd, dev);
+   if (!hcd->op || !ud || !ud->port)
+       return 0;
+   return (xhci_r32(hcd->op, 0x400 + (ud->port - 1) * 0x10) &
+           XHCI_PORT_CCS) != 0;
+}
+
+/* Any active device still connected (used to gate event waits). */
+static int xhci_device_connected(xhci_hcd *hcd)
+{
+   DWORD dev;
+   if (!hcd || !hcd->op)
+       return 0;
+   for (dev = 0; dev < hcd->usbdev_count; dev++)
+       if (xhci_usbdev_connected(hcd, dev))
+           return 1;
+   return 0;
 }
 
 static DWORD xhci_discover_hcds(void)
@@ -483,16 +558,20 @@ static xhci_trb *xhci_ring_buffer(xhci_ring *ring, u64 phys, DWORD len,
     return last;
 }
 
+/* Transfer events are matched against wanted_ring by TRB pointer (in_td) and
+   by endpoint; each USB device owns distinct rings, so this already
+   disambiguates the MSC (device 0) and CDC (device 1) completions on the
+   shared event ring. */
 static int xhci_next_event(xhci_hcd *hcd, DWORD wanted_type, u64 wanted_ptr,
                            xhci_ring *wanted_ring, DWORD first,
-                           DWORD wanted_endpoint, DWORD *completion,
-                           DWORD *slot)
+                           DWORD wanted_endpoint,
+                           DWORD *completion, DWORD *slot)
 {
     DWORD spins;
     DWORD flags;
     volatile BYTE *intr = hcd->runtime + 0x20;
     for (spins = 0; spins < XHCI_TIMEOUT; spins++) {
-        if (hcd->slot && !xhci_device_connected(hcd)) {
+        if (hcd->usbdev_count && !xhci_device_connected(hcd)) {
             hcd->connection_lost = 1;
             return 0;
         }
@@ -521,8 +600,7 @@ static int xhci_next_event(xhci_hcd *hcd, DWORD wanted_type, u64 wanted_ptr,
                             index < XHCI_TRBS - 1 &&
                             ((first < end && index >= first && index < end) ||
                              (first > end && (index >= first || index < end)));
-                if (!in_td || event_endpoint != wanted_endpoint ||
-                    event_slot != hcd->slot)
+                if (!in_td || event_endpoint != wanted_endpoint)
                     continue;
             } else if (type != wanted_type ||
                        (wanted_ptr && pointer != wanted_ptr)) {
@@ -570,6 +648,8 @@ static int xhci_command(xhci_hcd *hcd, u64 parameter, DWORD status,
     xhci_mb();
     if (!xhci_next_event(hcd, XHCI_TRB_COMMAND_EV, trb_dma, 0, 0, 0,
                          &cc, slot)) {
+        /* command events match by TRB pointer; no ring/slot filter needed */
+
         if (hcd->connection_lost)
             return 0;
         printf("xhci: command timeout type=%u\n", (control >> 10) & 0x3F);
@@ -597,6 +677,10 @@ static void xhci_free_dma_storage(xhci_hcd *hcd)
     dma_free_coherent(&hcd->ep0_ring.dma, free);
     dma_free_coherent(&hcd->ep_in_ring.dma, free);
     dma_free_coherent(&hcd->ep_out_ring.dma, free);
+    dma_free_coherent(&hcd->cdc_ep0_ring.dma, free);
+    dma_free_coherent(&hcd->cdc_ep_out_ring.dma, free);
+    dma_free_coherent(&hcd->cdc_input_ctx_dma, free);
+    dma_free_coherent(&hcd->cdc_device_ctx_dma, free);
     dma_free_coherent(&hcd->dcbaa_dma, free);
     dma_free_coherent(&hcd->erst_dma, free);
     dma_free_coherent(&hcd->input_ctx_dma, free);
@@ -634,6 +718,16 @@ static int xhci_alloc_dma_storage(xhci_hcd *hcd)
         !dma_alloc_coherent(&hcd->input_ctx_dma, 33 * 64, 64,
                             0xFFFFFFFFULL, malloc, free) ||
         !dma_alloc_coherent(&hcd->device_ctx_dma, 32 * 64, 64,
+                            0xFFFFFFFFULL, malloc, free) ||
+        !dma_alloc_coherent(&hcd->cdc_input_ctx_dma, 33 * 64, 64,
+                            0xFFFFFFFFULL, malloc, free) ||
+        !dma_alloc_coherent(&hcd->cdc_device_ctx_dma, 32 * 64, 64,
+                            0xFFFFFFFFULL, malloc, free) ||
+        !dma_alloc_coherent(&hcd->cdc_ep0_ring.dma,
+                            sizeof(xhci_trb) * XHCI_TRBS, 64,
+                            0xFFFFFFFFULL, malloc, free) ||
+        !dma_alloc_coherent(&hcd->cdc_ep_out_ring.dma,
+                            sizeof(xhci_trb) * XHCI_TRBS, 64,
                             0xFFFFFFFFULL, malloc, free)) {
         xhci_free_dma_storage(hcd);
         return 0;
@@ -643,14 +737,15 @@ static int xhci_alloc_dma_storage(xhci_hcd *hcd)
     hcd->erst = (xhci_erst_entry *)hcd->erst_dma.cpu_addr;
     hcd->input_ctx = (BYTE *)hcd->input_ctx_dma.cpu_addr;
     hcd->device_ctx = (BYTE *)hcd->device_ctx_dma.cpu_addr;
+    hcd->cdc_input_ctx = (BYTE *)hcd->cdc_input_ctx_dma.cpu_addr;
+    hcd->cdc_device_ctx = (BYTE *)hcd->cdc_device_ctx_dma.cpu_addr;
     return 1;
 }
 
-static void xhci_fill_slot_context(xhci_hcd *hcd, DWORD *slot, DWORD entries)
+static void xhci_fill_slot_context(xhci_hcd *hcd, DWORD dev, DWORD *slot,
+                                   DWORD entries)
 {
-    memset(slot, 0, hcd->context_size);
-    slot[0] = (hcd->speed << 20) | (entries << 27);
-    slot[1] = hcd->port << 16;
+    xhci_fill_slot_context_dev(hcd, dev, slot, entries);
 }
 
 static void xhci_fill_ep_context(xhci_hcd *hcd, DWORD *ep, DWORD type,
@@ -710,32 +805,43 @@ static int xhci_setup_scratchpads(xhci_hcd *hcd, DWORD hcs2)
     return 1;
 }
 
-static int xhci_address_device(xhci_hcd *hcd, int block_set_address)
+static int xhci_address_device(xhci_hcd *hcd, DWORD dev,
+                               int block_set_address)
 {
     DWORD *control;
     DWORD *slot;
     DWORD *ep0;
-    memset(hcd->input_ctx, 0, hcd->input_ctx_dma.length);
-    control = xhci_input_context(hcd, 0);
-    slot = xhci_input_context(hcd, 1);
-    ep0 = xhci_input_context(hcd, 2);
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    xhci_ring *ep0_ring;
+    if (!ud)
+        return 0;
+    ep0_ring = xhci_ep0_ring_for(hcd, dev);
+    memset(xhci_input_ctx_base(hcd, dev), 0,
+           dev ? hcd->cdc_input_ctx_dma.length
+               : hcd->input_ctx_dma.length);
+    control = xhci_input_context_dev(hcd, dev, 0);
+    slot = xhci_input_context_dev(hcd, dev, 1);
+    ep0 = xhci_input_context_dev(hcd, dev, 2);
     control[1] = 3;
-    xhci_fill_slot_context(hcd, slot, 1);
-    xhci_fill_ep_context(hcd, ep0, 4, hcd->ep0_mps, 0,
-                         &hcd->ep0_ring, 8);
-    return xhci_command(hcd, hcd->input_ctx_dma.dma_addr, 0,
+    xhci_fill_slot_context(hcd, dev, slot, 1);
+    xhci_fill_ep_context(hcd, ep0, 4, ud->ep0_mps, 0, ep0_ring, 8);
+    return xhci_command(hcd,
+                        dev ? hcd->cdc_input_ctx_dma.dma_addr
+                            : hcd->input_ctx_dma.dma_addr, 0,
                         XHCI_TRB_ADDRESS | (block_set_address ? (1u << 9) : 0) |
-                        (hcd->slot << 24), 0);
+                        (ud->slot << 24), 0);
 }
 
-static int xhci_set_ep0_packet_size(xhci_hcd *hcd, BYTE encoded)
+static int xhci_set_ep0_packet_size(xhci_hcd *hcd, DWORD dev, BYTE encoded)
 {
-    DWORD size = hcd->speed >= 4 ? (1u << encoded) : encoded;
-    if (size != 8 && size != 16 && size != 32 && size != 64 && size != 512) {
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    DWORD size = (ud && ud->speed >= 4) ? (1u << encoded) : encoded;
+    if (!ud ||
+        size != 8 && size != 16 && size != 32 && size != 64 && size != 512) {
         printf("xhci: invalid EP0 packet size=%u encoded=%u\n", size, encoded);
         return 0;
     }
-    hcd->ep0_mps = size;
+    ud->ep0_mps = size;
     return 1;
 }
 
@@ -753,10 +859,12 @@ static DWORD xhci_buffer_trb_count(u64 dma_addr, DWORD len)
     return count;
 }
 
-static int xhci_transfer_sg(xhci_hcd *hcd, xhci_ring *ring, DWORD endpoint,
-                            const dma_segment *segments, DWORD segment_count,
-                            DWORD control, DWORD direction)
+static int xhci_transfer_sg(xhci_hcd *hcd, DWORD dev, xhci_ring *ring,
+                            DWORD endpoint, const dma_segment *segments,
+                            DWORD segment_count, DWORD control,
+                            DWORD direction)
 {
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
     DWORD cc = 0;
     DWORD first = ring->enqueue;
     DWORD index;
@@ -766,7 +874,9 @@ static int xhci_transfer_sg(xhci_hcd *hcd, xhci_ring *ring, DWORD endpoint,
     int result = 0;
     dma_sg_mapping mapping = { { { 0 } }, 0, 0, 0 };
     xhci_trb *last;
-    if (!xhci_device_connected(hcd)) {
+    if (!ud)
+        return 0;
+    if (ud->slot && !xhci_usbdev_connected(hcd, dev)) {
         hcd->connection_lost = 1;
         return 0;
     }
@@ -794,7 +904,7 @@ static int xhci_transfer_sg(xhci_hcd *hcd, xhci_ring *ring, DWORD endpoint,
         hcd->fault_drop_next = 0;
         printf("xhci: test dropping bulk doorbell ep=%u\n", endpoint);
     } else {
-        hcd->doorbell[hcd->slot] = endpoint;
+        hcd->doorbell[ud->slot] = endpoint;
         xhci_mb();
     }
     if (hcd->fault_disconnect_inflight) {
@@ -802,12 +912,11 @@ static int xhci_transfer_sg(xhci_hcd *hcd, xhci_ring *ring, DWORD endpoint,
         hcd->fault_disconnect_inflight = 0;
         printf("XHCI_DISCONNECT_INFLIGHT\n");
            for (waits = 0; waits < XHCI_TIMEOUT &&
-               xhci_device_connected(hcd); waits++)
+               xhci_usbdev_connected(hcd, dev); waits++)
             usb_io_delay();
     }
     if (!xhci_next_event(hcd, XHCI_TRB_TRANSFER_EV, 0,
-                         ring, first, endpoint,
-                         &cc, 0)) {
+                         ring, first, endpoint, &cc, 0)) {
         if (hcd->connection_lost)
             goto out;
         printf("xhci: transfer timeout ep=%u len=%u\n", endpoint, len);
@@ -841,66 +950,72 @@ out:
     return result;
 }
 
-static int xhci_transfer(xhci_hcd *hcd, xhci_ring *ring, DWORD endpoint,
-                         BYTE *data, DWORD len, DWORD control,
+static int xhci_transfer(xhci_hcd *hcd, DWORD dev, xhci_ring *ring,
+                         DWORD endpoint, BYTE *data, DWORD len, DWORD control,
                          DWORD direction)
 {
     dma_segment segment;
     segment.cpu_addr = data;
     segment.length = len;
-    return xhci_transfer_sg(hcd, ring, endpoint, &segment, 1, control,
+    return xhci_transfer_sg(hcd, dev, ring, endpoint, &segment, 1, control,
                             direction);
 }
 
-static int xhci_control(xhci_hcd *hcd, usb_setup *setup, void *data, int len)
+static int xhci_control(xhci_hcd *hcd, DWORD dev, usb_setup *setup,
+                        void *data, int len)
 {
-    DWORD first = hcd->ep0_ring.enqueue;
-    DWORD direction = (setup->bmRequestType & 0x80)
-                      ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    xhci_ring *ep0;
+    DWORD first;
+    DWORD direction;
     u64 setup_value = 0;
     int result = 0;
     dma_mapping mapping = {0};
-    DWORD trt = len ? ((setup->bmRequestType & 0x80) ? 3 : 2) : 0;
+    DWORD trt;
+    DWORD cc = 0;
+    if (!ud)
+        return 0;
+    ep0 = xhci_ep0_ring_for(hcd, dev);
+    first = ep0->enqueue;
+    direction = (setup->bmRequestType & 0x80)
+                ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+    trt = len ? ((setup->bmRequestType & 0x80) ? 3 : 2) : 0;
     if (len && !dma_map_single_device(&mapping, data, (DWORD)len, direction,
                                       &hcd->stream_dma))
         return 0;
     memcpy(&setup_value, setup, 8);
-    xhci_ring_put(&hcd->ep0_ring, setup_value, 8,
+    xhci_ring_put(ep0, setup_value, 8,
                   XHCI_TRB_SETUP | XHCI_TRB_IDT | XHCI_TRB_CHAIN |
                   (trt << 16));
     if (len) {
-        if (!xhci_ring_buffer(&hcd->ep0_ring, mapping.dma_addr, (DWORD)len,
+        if (!xhci_ring_buffer(ep0, mapping.dma_addr, (DWORD)len,
                       XHCI_TRB_DATA |
                       ((setup->bmRequestType & 0x80)
                        ? XHCI_TRB_DIR_IN : 0),
                       XHCI_TRB_CHAIN))
             goto out;
     }
-        xhci_ring_put(&hcd->ep0_ring, 0, 0,
-              XHCI_TRB_STATUS | XHCI_TRB_IOC |
-              ((!len || !(setup->bmRequestType & 0x80))
-               ? XHCI_TRB_DIR_IN : 0));
+    xhci_ring_put(ep0, 0, 0,
+                  XHCI_TRB_STATUS | XHCI_TRB_IOC |
+                  ((!len || !(setup->bmRequestType & 0x80))
+                   ? XHCI_TRB_DIR_IN : 0));
     xhci_mb();
-    hcd->doorbell[hcd->slot] = 1;
+    hcd->doorbell[ud->slot] = 1;
     xhci_mb();
-    {
-        DWORD cc = 0;
-        if (!xhci_next_event(hcd, XHCI_TRB_TRANSFER_EV, 0,
-                 &hcd->ep0_ring, first,
-                     1, &cc, 0)) {
-            if (hcd->connection_lost)
-                goto out;
-            printf("xhci: control timeout request=%u\n", setup->bRequest);
-            hcd->recovery_needed = 1;
+    if (!xhci_next_event(hcd, XHCI_TRB_TRANSFER_EV, 0,
+                         ep0, first, 1, &cc, 0)) {
+        if (hcd->connection_lost)
             goto out;
-        }
-        xhci_mb();
-        if (cc != XHCI_CC_SUCCESS && cc != XHCI_CC_SHORT_PACKET) {
-            printf("xhci: control failed request=%u cc=%u\n",
-                   setup->bRequest, cc);
-                hcd->recovery_needed = 1;
-            goto out;
-        }
+        printf("xhci: control timeout request=%u\n", setup->bRequest);
+        hcd->recovery_needed = 1;
+        goto out;
+    }
+    xhci_mb();
+    if (cc != XHCI_CC_SUCCESS && cc != XHCI_CC_SHORT_PACKET) {
+        printf("xhci: control failed request=%u cc=%u\n",
+               setup->bRequest, cc);
+        hcd->recovery_needed = 1;
+        goto out;
     }
     result = 1;
 out:
@@ -914,11 +1029,14 @@ static DWORD xhci_endpoint_id(BYTE endpoint, int in)
     return (DWORD)endpoint * 2 + (in ? 1 : 0);
 }
 
-static int xhci_bulk(xhci_hcd *hcd, BYTE endpoint, int in, BYTE *data,
-                     int len)
+static int xhci_bulk(xhci_hcd *hcd, DWORD dev, BYTE endpoint, int in,
+                     BYTE *data, int len)
 {
     DWORD endpoint_id = xhci_endpoint_id(endpoint, in);
-    xhci_ring *ring = in ? &hcd->ep_in_ring : &hcd->ep_out_ring;
+    xhci_ring *ring = in ? xhci_ep_in_ring_for(hcd, dev)
+                         : xhci_ep_out_ring_for(hcd, dev);
+    if (!ring)
+        return 0;
     if (len > 1 && strstr(kernel_cmdline, "xhci-sg-test")) {
         dma_segment segments[2];
         int result;
@@ -926,7 +1044,7 @@ static int xhci_bulk(xhci_hcd *hcd, BYTE endpoint, int in, BYTE *data,
         segments[0].length = (DWORD)len / 2;
         segments[1].cpu_addr = data + segments[0].length;
         segments[1].length = (DWORD)len - segments[0].length;
-        result = xhci_transfer_sg(hcd, ring, endpoint_id, segments, 2,
+        result = xhci_transfer_sg(hcd, dev, ring, endpoint_id, segments, 2,
                                   XHCI_TRB_NORMAL,
                                   in ? DMA_FROM_DEVICE : DMA_TO_DEVICE);
         if (result && !hcd->sg_qualified_reported) {
@@ -935,68 +1053,85 @@ static int xhci_bulk(xhci_hcd *hcd, BYTE endpoint, int in, BYTE *data,
         }
         return result;
     }
-    return xhci_transfer(hcd, ring, endpoint_id, data, (DWORD)len,
+    return xhci_transfer(hcd, dev, ring, endpoint_id, data, (DWORD)len,
                          XHCI_TRB_NORMAL,
                          in ? DMA_FROM_DEVICE : DMA_TO_DEVICE);
 }
 
-static int xhci_recover_endpoint(xhci_hcd *hcd, DWORD endpoint,
+static int xhci_recover_endpoint(xhci_hcd *hcd, DWORD dev, DWORD endpoint,
                                  xhci_ring *ring)
 {
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
     u64 dequeue;
     unsigned long long trb_dma;
+    if (!ud || !ring)
+        return 1;
     if (endpoint >= 32 || !(hcd->stalled_endpoints & (1u << endpoint)))
         return 1;
     if (!xhci_command(hcd, 0, 0, XHCI_TRB_RESET_EP |
-                      (endpoint << 16) | (hcd->slot << 24), 0))
+                      (endpoint << 16) | (ud->slot << 24), 0))
         return 0;
     if (!dma_region_map(&ring->dma, &ring->trbs[ring->enqueue],
                         sizeof(xhci_trb), &trb_dma))
         return 0;
     dequeue = trb_dma | ring->cycle;
     if (!xhci_command(hcd, dequeue, 0, XHCI_TRB_SET_DEQUEUE |
-                      (endpoint << 16) | (hcd->slot << 24), 0))
+                      (endpoint << 16) | (ud->slot << 24), 0))
         return 0;
     hcd->stalled_endpoints &= ~(1u << endpoint);
     return 1;
 }
 
-static int xhci_recover_bulk_endpoints(xhci_hcd *hcd, BYTE ep_in,
+static int xhci_recover_bulk_endpoints(xhci_hcd *hcd, DWORD dev, BYTE ep_in,
                                        BYTE ep_out)
 {
     DWORD in_id = xhci_endpoint_id(ep_in, 1);
     DWORD out_id = xhci_endpoint_id(ep_out, 0);
-    if (!xhci_recover_endpoint(hcd, in_id, &hcd->ep_in_ring) ||
-        !xhci_recover_endpoint(hcd, out_id, &hcd->ep_out_ring))
+    if (!xhci_recover_endpoint(hcd, dev, in_id,
+                               xhci_ep_in_ring_for(hcd, dev)) ||
+        !xhci_recover_endpoint(hcd, dev, out_id,
+                               xhci_ep_out_ring_for(hcd, dev)))
         return 0;
     return hcd->stalled_endpoints == 0;
 }
 
-static int xhci_configure_endpoints(xhci_hcd *hcd, BYTE ep_in, WORD mps_in,
-                                    BYTE burst_in, BYTE ep_out, WORD mps_out,
-                                    BYTE burst_out)
+static int xhci_configure_endpoints(xhci_hcd *hcd, DWORD dev, BYTE ep_in,
+                                    WORD mps_in, BYTE burst_in, BYTE ep_out,
+                                    WORD mps_out, BYTE burst_out)
 {
-    DWORD in_id = xhci_endpoint_id(ep_in, 1);
-    DWORD out_id = xhci_endpoint_id(ep_out, 0);
-    DWORD entries = in_id > out_id ? in_id : out_id;
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    xhci_ring *in_ring = xhci_ep_in_ring_for(hcd, dev);
+    xhci_ring *out_ring = xhci_ep_out_ring_for(hcd, dev);
+    DWORD in_id, out_id, entries;
     DWORD *control;
-    memset(hcd->input_ctx, 0, hcd->input_ctx_dma.length);
-    if (!xhci_ring_init(&hcd->ep_in_ring, XHCI_TRB_CHAIN) ||
-        !xhci_ring_init(&hcd->ep_out_ring, XHCI_TRB_CHAIN)) {
+    if (!ud || !out_ring)
+        return 0;
+    out_id = xhci_endpoint_id(ep_out, 0);
+    in_id = in_ring ? xhci_endpoint_id(ep_in, 1) : 0;
+    entries = in_id > out_id ? in_id : out_id;
+    memset(xhci_input_ctx_base(hcd, dev), 0,
+           dev ? hcd->cdc_input_ctx_dma.length : hcd->input_ctx_dma.length);
+    if ((in_ring && !xhci_ring_init(in_ring, XHCI_TRB_CHAIN)) ||
+        !xhci_ring_init(out_ring, XHCI_TRB_CHAIN)) {
         printf("xhci: bulk ring DMA mapping failed\n");
         return 0;
     }
-    control = xhci_input_context(hcd, 0);
-    control[1] = (1u << 0) | (1u << in_id) | (1u << out_id);
-    xhci_fill_slot_context(hcd, xhci_input_context(hcd, 1), entries);
-    xhci_fill_ep_context(hcd, xhci_input_context(hcd, in_id + 1), 6,
-                         mps_in, burst_in, &hcd->ep_in_ring, USB_BULK_MAX);
-    xhci_fill_ep_context(hcd, xhci_input_context(hcd, out_id + 1), 2,
-                         mps_out, burst_out, &hcd->ep_out_ring, USB_BULK_MAX);
-    if (!xhci_command(hcd, hcd->input_ctx_dma.dma_addr, 0,
-                      XHCI_TRB_CONFIG_EP | (hcd->slot << 24), 0))
+    control = xhci_input_context_dev(hcd, dev, 0);
+    control[1] = (1u << 0) | (in_id ? (1u << in_id) : 0) | (1u << out_id);
+    xhci_fill_slot_context(hcd, dev, xhci_input_context_dev(hcd, dev, 1),
+                           entries);
+    if (in_ring)
+        xhci_fill_ep_context(hcd, xhci_input_context_dev(hcd, dev, in_id + 1),
+                             6, mps_in, burst_in, in_ring, USB_BULK_MAX);
+    xhci_fill_ep_context(hcd, xhci_input_context_dev(hcd, dev, out_id + 1), 2,
+                         mps_out, burst_out, out_ring, USB_BULK_MAX);
+    if (!xhci_command(hcd,
+                      dev ? hcd->cdc_input_ctx_dma.dma_addr
+                          : hcd->input_ctx_dma.dma_addr, 0,
+                      XHCI_TRB_CONFIG_EP | (ud->slot << 24), 0))
         return 0;
-    printf("xhci: configured bulk endpoints in=%u out=%u\n", in_id, out_id);
+    printf("xhci: configured bulk endpoints in=%u out=%u (dev=%u)\n",
+           in_id, out_id, dev);
     return 1;
 }
 
@@ -1025,10 +1160,14 @@ static int xhci_legacy_handoff(xhci_hcd *hcd, DWORD hcc, u64 bar_size)
     return 1;
 }
 
-static int xhci_reset_port(xhci_hcd *hcd)
+static int xhci_reset_port_dev(xhci_hcd *hcd, DWORD dev)
 {
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
     DWORD p;
-    DWORD off = 0x400 + (hcd->port - 1) * 0x10;
+    DWORD off;
+    if (!ud || !ud->port)
+        return 0;
+    off = 0x400 + (ud->port - 1) * 0x10;
     p = xhci_r32(hcd->op, off);
     if (!(p & XHCI_PORT_CCS))
         return 0;
@@ -1036,13 +1175,13 @@ static int xhci_reset_port(xhci_hcd *hcd)
     if (!xhci_wait32(hcd->op, off, XHCI_PORT_RESET, 0))
         return 0;
     p = xhci_r32(hcd->op, off);
-    hcd->speed = XHCI_PORT_SPEED(p);
-    if (hcd->speed >= 4)
-        hcd->ep0_mps = 512;
-    else if (hcd->speed == 3)
-        hcd->ep0_mps = 64;
+    ud->speed = XHCI_PORT_SPEED(p);
+    if (ud->speed >= 4)
+        ud->ep0_mps = 512;
+    else if (ud->speed == 3)
+        ud->ep0_mps = 64;
     else
-        hcd->ep0_mps = 8;
+        ud->ep0_mps = 8;
     return (p & (XHCI_PORT_CCS | XHCI_PORT_PED)) ==
            (XHCI_PORT_CCS | XHCI_PORT_PED);
 }
@@ -1052,7 +1191,7 @@ static int xhci_init_hcd(xhci_hcd *hcd)
     BYTE bus, slot, func;
     u64 bar = 0, bar_size = 0, required;
     DWORD caplen, hcs1, hcs2, hcc, dboff, rtsoff, found = 0;
-    DWORD port;
+    DWORD port, dev;
     volatile BYTE *intr;
     if (!hcd)
         return 0;
@@ -1182,13 +1321,22 @@ static int xhci_init_hcd(xhci_hcd *hcd)
         return 0;
     }
 
-    for (port = 1; port <= hcd->max_ports; port++) {
-        DWORD p = xhci_r32(hcd->op, 0x400 + (port - 1) * 0x10);
-        if (p & XHCI_PORT_CCS) {
-            hcd->port = port;
-            if (xhci_reset_port(hcd)) {
+    /* Walk every connected port and remember up to two reset-ready devices.
+       Device 0 is the first usable port (normally the MSC root); device 1
+       is a later port (CDC-ACM). usb_enumerate_msc still talks to device 0. */
+    {
+        DWORD dev = 0;
+        memset(hcd->usbdevs, 0, sizeof(hcd->usbdevs));
+        hcd->usbdev_count = 0;
+        for (port = 1; port <= hcd->max_ports && dev < XHCI_MAX_USBDEVS; port++) {
+            DWORD p = xhci_r32(hcd->op, 0x400 + (port - 1) * 0x10);
+            if (!(p & XHCI_PORT_CCS))
+                continue;
+            hcd->usbdevs[dev].port = port;
+            if (xhci_reset_port_dev(hcd, dev)) {
+                dev++;
+                hcd->usbdev_count = dev;
                 found = 1;
-                break;
             }
         }
     }
@@ -1196,18 +1344,23 @@ static int xhci_init_hcd(xhci_hcd *hcd)
         printf("xhci: no enabled device port\n");
         return 0;
     }
-    hcd->slot = 0;
-    hcd->connection_lost = 0;
-    hcd->stalled_endpoints = 0;
-    if (!xhci_command(hcd, 0, 0, XHCI_TRB_ENABLE_SLOT, &hcd->slot) ||
-        !hcd->slot)
-        return 0;
-    hcd->dcbaa[hcd->slot] = hcd->device_ctx_dma.dma_addr;
-    if (!xhci_address_device(hcd, 1))
-        return 0;
-    printf("xhci: controller at PCI %u:%u.%u port=%u speed=%u slot=%u ctx=%u\n",
-           bus, slot, func, hcd->port, hcd->speed, hcd->slot,
-           hcd->context_size);
+    for (dev = 0; dev < hcd->usbdev_count; dev++) {
+        xhci_usbdev *ud = &hcd->usbdevs[dev];
+        ud->slot = 0;
+        hcd->connection_lost = 0;
+        hcd->stalled_endpoints = 0;
+        if (!xhci_command(hcd, 0, 0, XHCI_TRB_ENABLE_SLOT, &ud->slot) ||
+            !ud->slot)
+            return 0;
+        hcd->dcbaa[ud->slot] = dev ? hcd->cdc_device_ctx_dma.dma_addr
+                                   : hcd->device_ctx_dma.dma_addr;
+        if (!xhci_address_device(hcd, dev, 1))
+            return 0;
+    }
+    printf("xhci: controller at PCI %u:%u.%u devs=%u port=%u speed=%u slot=%u ctx=%u\n",
+           bus, slot, func, hcd->usbdev_count,
+           hcd->usbdevs[0].port, hcd->usbdevs[0].speed,
+           hcd->usbdevs[0].slot, hcd->context_size);
     return 1;
 }
 

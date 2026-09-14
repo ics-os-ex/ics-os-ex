@@ -48,6 +48,8 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
                        unsigned long rip, unsigned long *saved_regs);
 void exc_doublefault(unsigned long rip, unsigned long cs,
                      unsigned long rflags, unsigned long cr2);
+void exc_stack_segment(unsigned long rip, unsigned long cs,
+                       unsigned long rsp, unsigned long err);
 void exc_showdump(DWORD location,int type,DWORD pf_info);
 void exc_invalidtss(DWORD address);
 void exc_recover();

@@ -12,6 +12,53 @@ partition starting at LBA 2048. It contains GRUB for legacy BIOS and
 `EFI/BOOT/BOOTX64.EFI` for 64-bit UEFI. Both paths load the ELF64 Multiboot2
 kernel.
 
+For Intel N150-class laptops (64-bit UEFI, typically no CSM) flash
+`ics-os-uefi.img` instead. That image is a GPT disk with a protective MBR and
+one FAT32 EFI System Partition that holds `EFI/BOOT/BOOTX64.EFI`. Build it
+with `make usb-etcher` (also writes `ics-os-uefi.img.zip` for Balena Etcher).
+`make test-usb-uefi-gpt` boots that image under OVMF on q35 xHCI.
+
+On the physical N150, GRUB may print `error: serial port 'com0' isn't found`.
+That is expected (no COM0). After `Loading ICS-OS (multiboot2)...` the kernel
+keeps the GOP linear framebuffer (`gfxterm` + `gfxpayload=keep`) and live-
+blits the 80x25 console after the scheduler, including Intel-padded pitch.
+
+Keyboard LEDs remain a boot breadcrumb. This laptop has no Scroll Lock LED,
+so only Caps and Num count. Stage 0 first turns **both off** (clears firmware
+Num Lock) then Caps on.
+
+| Caps | Num | Last stage reached |
+| --- | --- | --- |
+| on | off | **0** kernel C, **1** IDT, **4** CPU info, **5** ext, **8** VT-d, **9** ports, **12** kbd, **13** LAPIC, **16** taskswitcher |
+| off | on | **2** mem_init, **6** device mgr, **10** pci/nic, **14** process mgr |
+| on | on | **3** console, **7** alloc, **11** API, **15** APs, or a kernel halt |
+
+GOP is mapped write-combining after the scheduler Caps hold (identity if the
+buffer is below 4 GiB, otherwise `KFB_BASE`). Treat the two columns as **Caps**
+and **Num** (never Scroll Lock):
+
+| Caps | Num | After scheduler |
+| --- | --- | --- |
+| on | on | GOP mapped; live 80x25 console |
+| off | on | no framebuffer tag, **or** hung while mapping a high GOP |
+| on | off | map still refused (buffer larger than 64 MiB) |
+
+The 80x25 grid uses per-axis zoom from the Multiboot2 tag. A line
+`FB WxH pitch=… zoom=XxY` is printed after GOP maps. 1920x1200 is 3x3 (fills
+the panel). 1920x1080 is 3x2 (full width, letterbox top/bottom).
+
+This image skips AP bring-up without COM1 (BSP only), skips the extra CPUID
+in `smp_rdtscp_available`, and programs the LAPIC timer via x2APIC MSRs
+(`lapic_present()`). Pico/ESP32 serial bridges need a real 16550 COM1 header;
+a USB plug is not COM1.
+
+**Next on this laptop:** qualify physical xHCI USB root and writable `/icsos`.
+Do not re-enable APs until MADT is parsed.
+
+`make test-vbox-uefi-gpt` and `make test-vbox-uefi-gpt-bios` boot it in
+VirtualBox EFI and BIOS. `make test-bochs-uefi-gpt` boots it under Bochs
+BIOS (i386-pc GRUB lives in the GPT gap so ESP remains partition 0).
+
 The following VirtualBox 7.1 checks pass with the image attached as a PIIX4 IDE
 disk:
 
@@ -260,7 +307,7 @@ production-grade N150 laptop experience:
 |---|---|---|
 | Firmware | UEFI works in VirtualBox; Secure Boot is unsupported | Disable Secure Boot initially; later sign a measured boot chain and define key/update policy |
 | ACPI | Modern topology, interrupt routing, power, battery, lid, and sleep support is incomplete | Parse required ACPI tables, validate APIC routing, orderly poweroff, thermal and battery reporting |
-| Graphics | Legacy VGA is the current display path | GOP framebuffer handoff or native Intel graphics modesetting; resolution and console tests |
+| Graphics | GOP handoff via GRUB `gfxterm` + `gfxpayload=keep`; kernel late-maps write-combining GOP after the scheduler on no-COM1; QEMU still maps early for `FBCONSOLE_PASS` | Physical N150 1920x1200 panel must show a centered `ICS-OS` bar after Caps+Num; `test-usb-uefi-gpt` still only proves OVMF GOP |
 | Input | Legacy keyboard/mouse assumptions | xHCI HID keyboard/touchpad support or laptop-specific PS/2 validation |
 | Internal storage | IDE and virtio paths do not cover typical NVMe hardware | NVMe queues, DMA, MSI-X, flush/FUA, timeout/reset, and power-loss tests |
 | Networking | RTL8139 does not match typical N150 laptop Ethernet/Wi-Fi | Driver for the exact PCI/USB NIC; Wi-Fi also needs firmware, regulatory, authentication, and crypto support |
@@ -276,21 +323,31 @@ actual byte capacity, leaving margin for vendor size differences. For example:
 
 ```bash
 cd ics-os
-ICSOS_USB_SIZE_MB=14000 make usb
+ICSOS_USB_SIZE_MB=14000 make usb-etcher
 ```
 
-Do not select a size larger than the target device. Check the device immediately
-before flashing and ensure none of its partitions are mounted:
+Do not select a size larger than the target device.
+
+### Balena Etcher (N150)
+
+1. On the laptop firmware setup, disable Secure Boot and enable USB boot.
+2. Build `make usb-etcher` and open `ics-os-uefi.img` or `ics-os-uefi.img.zip`
+   in Balena Etcher. Select the whole thumb drive, then Flash.
+3. Etcher writes a raw GPT disk image. Do not unzip onto the stick as files.
+4. Boot from the USB device (UEFI, not legacy/CSM).
+
+Alternatively, check the device immediately before flashing and ensure none of
+its partitions are mounted:
 
 ```bash
 lsblk -o NAME,PATH,SIZE,MODEL,SERIAL,TRAN,MOUNTPOINTS
 sudo umount /dev/sdX1
-sudo dd if=ics-os-usb.img of=/dev/sdX bs=4M status=progress conv=fsync
+sudo dd if=ics-os-uefi.img of=/dev/sdX bs=4M status=progress conv=fsync
 sync
 ```
 
 Replace `/dev/sdX` with the whole thumb drive, never a partition. All data on
-that drive is destroyed. Do not flash while the VirtualBox gates fail.
+that drive is destroyed. Do not flash while `make test-usb-uefi-gpt` fails.
 
 ## Physical acceptance gate
 

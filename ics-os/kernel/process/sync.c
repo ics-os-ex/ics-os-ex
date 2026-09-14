@@ -10,6 +10,7 @@
 #include "../cpu/smp.h"
 #include "../memory/memlayout.h"
 #include "process.h"
+#include "irq_kstack.h"
 
 extern void taskswitch(void);
 extern void serial_puts(const char *s);
@@ -65,6 +66,13 @@ static PCB386 *sync_owner_pcb(int owner)
     if (!head)
         return 0;
     do {
+        /* Torn next (cert 248116 GPF64 err=0 in this walk).  Do not
+           require pcb_ptr_ok: idle/sPCB live in BSS. */
+        {
+            long s = (long)(uintptr)p;
+            if (((s << 16) >> 16) != s)
+                return 0;
+        }
         if ((p->processid & 0x007FFFFF) == want)
             return p;
         p = p->next;
@@ -107,7 +115,7 @@ static void sync_report_owner(sync_sharedvar *var, int owner)
                    "wants=0x%lx sc=%02x/%02x rip=0x%llx\n",
                 n, (unsigned long)(uintptr)v, (int)p->processid, p->name,
                 (unsigned)p->status, p->on_cpu, p->cpu_affinity,
-                (int)p->waiting, p->held_crit_n, p->crit_wait,
+                (int)p->waiting, pcb_held_n(p), p->crit_wait,
                 (unsigned long)(uintptr)p->crit_wait_var,
                 (unsigned)p->cursyscall[0], (unsigned)p->cursyscall[1],
                 (unsigned long long)p->ctx.rip);
@@ -156,23 +164,62 @@ static void sync_bad_var(const char *op, const sync_sharedvar *var)
 
 #define CRIT_NEST_MAX 16
 
-static void crit_nest_push(sync_sharedvar *var, int tok)
+static PCB386 *crit_current(void)
 {
     PCB386 *p = current_process;
-    if (!p || p->crit_nest_n >= CRIT_NEST_MAX)
-        return;
-    p->crit_nest_var[p->crit_nest_n] = var;
-    p->crit_nest_tok[p->crit_nest_n] = tok;
-    p->crit_nest_n++;
+    int me;
+
+    /* NULL current is early boot / idle, not smash.  Use the idle PCB
+       for nest without writing the slot (torn current must not become
+       idle while still on a user CR3). */
+    if (!p) {
+        me = smp_cpu_id();
+        if (me >= 0 && me < MAX_CPUS && cpus[me].idle)
+            return (PCB386 *)cpus[me].idle;
+        return 0;
+    }
+    if (!pcb_ptr_ok((unsigned long)(uintptr)p)) {
+        static volatile unsigned long bad_n;
+        if (++bad_n <= 8)
+            serial_puts("CURRENT-BAD\n");
+        return 0;
+    }
+    return current_mm_process();
 }
 
-static int crit_nest_pop(sync_sharedvar *var, int fallback)
+static int nest_n_sanitize(PCB386 *p)
 {
-    PCB386 *p = current_process;
+    int n;
+    if (!p)
+        return 0;
+    n = p->crit_nest_n;
+    if (n < 0 || n > CRIT_NEST_MAX) {
+        p->crit_nest_n = 0;
+        return 0;
+    }
+    return n;
+}
+
+static void crit_nest_push(sync_sharedvar *var, int tok)
+{
+    PCB386 *p = crit_current();
+    int n;
+    if (!p)
+        return;
+    n = nest_n_sanitize(p);
+    if (n >= CRIT_NEST_MAX)
+        return;
+    p->crit_nest_var[n] = var;
+    p->crit_nest_tok[n] = tok;
+    p->crit_nest_n = n + 1;
+}
+
+static int crit_nest_pop_on(PCB386 *p, sync_sharedvar *var, int fallback)
+{
     int n;
     if (!p)
         return fallback;
-    n = p->crit_nest_n;
+    n = nest_n_sanitize(p);
     if (n <= 0)
         return fallback;
     if (p->crit_nest_var[n - 1] != var)
@@ -181,13 +228,33 @@ static int crit_nest_pop(sync_sharedvar *var, int fallback)
     return p->crit_nest_tok[n - 1];
 }
 
+static int crit_nest_pop(sync_sharedvar *var, int fallback)
+{
+    PCB386 *p = crit_current();
+    int busy;
+
+    /* Leftover current (or an smp_cpu_id flip onto another cpu_local)
+       can point p at the wrong PCB.  Nest was pushed on the lock owner.
+       Cert ramdisk: busy=0x12 (disk_mgr) leave sampled kernel 0x1 and
+       leaked kheap_crit (non-owner leave does not unlock). */
+    if (var) {
+        busy = __sync_val_compare_and_swap(&var->busy, 0, 0);
+        if (busy > 0) {
+            PCB386 *owner = sync_owner_pcb(busy);
+            if (owner)
+                p = owner;
+        }
+    }
+    return crit_nest_pop_on(p, var, fallback);
+}
+
 int sync_cpu_holds(const sync_sharedvar *var)
 {
-    PCB386 *p = current_process;
+    PCB386 *p = crit_current();
     int i;
     if (!var || !p)
         return 0;
-    for (i = 0; i < p->crit_nest_n; i++)
+    for (i = 0; i < nest_n_sanitize(p); i++)
         if (p->crit_nest_var[i] == var)
             return 1;
     return 0;
@@ -195,24 +262,70 @@ int sync_cpu_holds(const sync_sharedvar *var)
 
 static int sync_owner_token(void)
 {
-    /* A process is scheduled on at most one CPU at a time, so the owner token
-       must identify the process only. Including the CPU made a crit released
-       after the owning process migrated to another CPU look like a
-       non-owner release and left the crit locked forever. */
-    return (int)((getprocessid() & 0x007FFFFF) + 1);
+    /* Token must name the MM PCB (crit_current), not leftover current.
+       getprocessid() stays on current_process for fork/wait identity;
+       routing it through current_mm_process broke test-fork.
+       Cert 248122: leftover gcc41 on gcc30's CR3 entered vfs_busy with
+       tok 0x2a pushed on gcc30, leave busy=0x1f self=0x2a, CRITCYCLE. */
+    PCB386 *mm = current_mm_process();
+    PCB386 *cur = current_process;
+    DWORD leftover_pid = 0, mm_pid = 0;
+
+    if (cur && pcb_ptr_ok((unsigned long)(uintptr)cur) &&
+        cur->accesslevel == ACCESS_USER)
+        leftover_pid = cur->processid;
+    if (mm && pcb_ptr_ok((unsigned long)(uintptr)mm))
+        mm_pid = mm->processid;
+    else if (cur && pcb_ptr_ok((unsigned long)(uintptr)cur))
+        mm_pid = cur->processid;
+    return crit_token_for_pids((unsigned)leftover_pid, (unsigned)mm_pid);
+}
+
+int sync_leftover_vfs(void)
+{
+    int me = smp_cpu_id();
+    PCB386 *p = current_process;
+    PCB386 *idle = 0;
+    unsigned long cr3, rsp;
+
+    if (!p)
+        return 0;
+    if (me >= 0 && me < MAX_CPUS)
+        idle = (PCB386 *)cpus[me].idle;
+    if (!pcb_ptr_ok((unsigned long)(uintptr)p) && !(idle && p == idle))
+        return 0;
+    __asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
+    __asm__ __volatile__("movq %%rsp, %0" : "=r"(rsp));
+    return leftover_vfs_must_skip(p->accesslevel == ACCESS_USER,
+                                  (unsigned long)(uintptr)p->pagedirloc,
+                                  cr3, rsp, idle && p == idle);
+}
+
+static int held_n_sanitize(PCB386 *p)
+{
+    int n;
+    if (!p)
+       return 0;
+    n = p->held_crit_n;
+    if (n < 0 || n > 16) {
+       p->held_crit_n = 0;
+       return 0;
+    }
+    return n;
 }
 
 static void sync_track_hold(sync_sharedvar *var)
 {
-    PCB386 *p = current_process;
-    int i;
+    PCB386 *p = crit_current();
+    int i, n;
 
     if (!p)
        return;
-    for (i = 0; i < p->held_crit_n; i++)
+    n = held_n_sanitize(p);
+    for (i = 0; i < n; i++)
         if (p->held_crits[i] == var)
            return;
-     if (p->held_crit_n < 16)
+     if (n < 16)
         p->held_crits[p->held_crit_n++] = var;
      else {
         /* DECISIVE probe: the 16-slot cap is being hit and this crit is
@@ -229,18 +342,34 @@ static void sync_track_hold(sync_sharedvar *var)
      }
 }
 
-static void sync_untrack_hold(sync_sharedvar *var)
+static void sync_untrack_hold_on(PCB386 *p, sync_sharedvar *var)
 {
-    PCB386 *p = current_process;
     int i;
 
     if (!p)
        return;
-    for (i = 0; i < p->held_crit_n; i++) {
+    for (i = 0; i < held_n_sanitize(p); i++) {
        if (p->held_crits[i] == var) {
           p->held_crits[i] = p->held_crits[--p->held_crit_n];
           return;
        }
+    }
+}
+
+static void sync_untrack_hold(sync_sharedvar *var)
+{
+    PCB386 *p = crit_current();
+    int busy;
+
+    sync_untrack_hold_on(p, var);
+    if (!var)
+       return;
+    /* busy is still the enter token when leave calls this before release. */
+    busy = __sync_val_compare_and_swap(&var->busy, 0, 0);
+    if (busy > 0) {
+        PCB386 *owner = sync_owner_pcb(busy);
+        if (owner && owner != p)
+            sync_untrack_hold_on(owner, var);
     }
 }
 
@@ -261,7 +390,7 @@ void sync_release_process_crits(void *pcb, int owner)
        no-ops. */
     if (__sync_lock_test_and_set(&p->crits_freed, 1))
         return;
-    for (i = 0; i < p->held_crit_n; i++) {
+    for (i = 0; i < held_n_sanitize(p); i++) {
        sync_sharedvar *v = p->held_crits[i];
        if (v && __sync_val_compare_and_swap(&v->busy, 0, 0) == owner) {
           v->wait = 0;
@@ -316,7 +445,7 @@ void sync_entercrit(sync_sharedvar *var){
        (no yield).  That is safe because the timer IRQ still preempts the spin,
        so the inner-crit owner is not starved; we simply cannot sleep holding an
        outer lock. */
-    int nested = (current_process && current_process->held_crit_n > 0);
+    int nested = (pcb_held_n(current_process) > 0);
 
     if (__sync_val_compare_and_swap(&var->busy,0,0)==owner) {
          __sync_add_and_fetch(&var->wait, 1);
@@ -447,24 +576,28 @@ void sync_leavecrit(sync_sharedvar *var){
    }
 
    if (__sync_val_compare_and_swap(&var->busy,0,0)!=owner) {
-        /* Do not walk __builtin_return_address(1..5): a smashed RBP (cert
-           GPF64 rip=sync_leavecrit rbp=0 on gcc.exe) makes that #GP.
-           printf also re-enters libc on the same stack; keep this atomic. */
-        char line[192];
-        sprintf(line,
-                "sync: warning critical section released by non-owner! "
-                "crit=0x%lx busy=0x%x self=0x%x wait=%d rip=0x%lx\n",
-                (unsigned long)(uintptr)var,
-                __sync_val_compare_and_swap(&var->busy,0,0),
-                owner,
-                (int)var->wait,
-                (unsigned long)(char *)__builtin_return_address(0));
-        serial_puts(line);
+        /* Leftover current can hit this in a tight file_ok loop
+           (cert 248112: 20k lines, qemu died mid-print). */
+        static volatile unsigned long nonowner_n;
+        if (++nonowner_n <= 8) {
+           char line[192];
+           sprintf(line,
+                   "CRIT-NONOWNER crit=0x%lx busy=0x%x self=0x%x wait=%d "
+                   "rip=0x%lx\n",
+                   (unsigned long)(uintptr)var,
+                   __sync_val_compare_and_swap(&var->busy,0,0),
+                   owner,
+                   (int)var->wait,
+                   (unsigned long)(char *)__builtin_return_address(0));
+           serial_puts(line);
+        }
         return;
     }
+   /* Untrack on the owner PCB while busy still names that owner.
+      Releasing first made leftover-current untrack miss disk_mgr. */
    if (__sync_sub_and_fetch(&var->wait, 1) == 0) {
-       __sync_lock_release(&var->busy);
        sync_untrack_hold(var);
+       __sync_lock_release(&var->busy);
     }
 };
 

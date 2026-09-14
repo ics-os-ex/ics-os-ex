@@ -391,8 +391,31 @@ DWORD getparentid(){
 };
 
 //returns the process id of the current process
+/* Leftover current=idle during a user syscall (cert 248119). */
+PCB386 *current_mm_process(void)
+{
+    PCB386 *p = current_process;
+    unsigned long cr3;
+    PCB386 *by;
+
+    if (!p || !pcb_ptr_ok((unsigned long)(uintptr)p))
+        return p;
+    __asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
+    if (!leftover_user_on_other_cr3(p->accesslevel == ACCESS_USER,
+                                    (unsigned long)(uintptr)p->pagedirloc,
+                                    cr3))
+        return p;
+    by = ps_find_by_cr3(cr3);
+    return by ? by : p;
+}
+
 DWORD getprocessid(){
-    return current_process->processid;
+    PCB386 *p = current_process;
+    if (!p)
+        return 0;
+    if (!pcb_ptr_ok((unsigned long)(uintptr)p))
+        return 0;
+    return p->processid;
 };
 
 
@@ -701,9 +724,7 @@ void irq_kstack_enter(u64 current_rsp)
       }
       /* Do not record irq_user_rsp or reuse this PCB's kstack: the owner is
          still running it.  The wrapper has moved us onto this CPU's
-         irq_safe_stack.  Leave current pointing at p: this CPU may still be
-         executing it until the next real context_switch, and retargeting
-         current to idle here would save that execution into the idle ctx. */
+         irq_safe_stack. */
       return;
    }
 
@@ -745,8 +766,78 @@ void irq_kstack_enter(u64 current_rsp)
       }
    }
 
+   if (current_rsp<MEM_USER_STACK_GUARD || current_rsp>=MEM_USER_STACK)
+      return;
    p->irq_user_rsp=current_rsp;
    p->irq_kframe=current_rsp;
+}
+
+/* PUSH_ALL frame RIP is at offset 120.  A leftover current that reset
+   kstack_top left a non-canonical RIP; timerwrapper then #GP'd on iretq
+   (cert rip=0x178818).  Fail closed instead of returning into smash. */
+void irq_iretq_cr3_guard(u64 *frame)
+{
+   unsigned long cr3 = 0;
+   unsigned long frsp;
+
+   if (!frame)
+      return;
+   frsp = (unsigned long)(uintptr)frame;
+   __asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
+   if (irq_iretq_frame_cr3_ok(frsp, cr3))
+      return;
+   {
+      char b[192];
+      sprintf(b, "IRETQ-BADCR3 cr3=0x%lx rsp=0x%lx proc=%s pid=%d\n",
+              cr3, frsp,
+              current_process && current_process->name
+              ? current_process->name : "?",
+              current_process ? (int)current_process->processid : -1);
+      serial_puts(b);
+   }
+   serial_puts("IRETQ-BADCR3: kernel fault -> halt\n");
+   while (1)
+      __asm__ volatile ("hlt");
+}
+
+void irq_iretq_guard(u64 *frame)
+{
+   extern void exc_recover(void);
+   u64 rip;
+   int ok;
+
+   irq_iretq_cr3_guard(frame);
+   if (!frame)
+      return;
+   rip = frame[15];
+   ok = irq_iretq_rip_ok((unsigned long)rip);
+   if (ok)
+      return;
+   {
+      char b[192];
+      sprintf(b, "IRETQ-BADRIP rip=0x%llx cs=0x%llx rsp=0x%llx proc=%s pid=%d\n",
+              (unsigned long long)rip,
+              (unsigned long long)frame[16],
+              (unsigned long long)(uintptr)frame,
+              current_process && current_process->name
+              ? current_process->name : "?",
+              current_process ? (int)current_process->processid : -1);
+      serial_puts(b);
+   }
+   if (leftover_iretq_must_not_kill_user((unsigned long)(uintptr)frame,
+                                         (unsigned long)rip)) {
+      serial_puts("IRETQ-BADRIP leftover-cpuirq\n");
+      serial_puts("IRETQ-BADRIP: kernel fault -> halt\n");
+      while (1)
+         __asm__ volatile ("hlt");
+   }
+   if (current_process && current_process->accesslevel == ACCESS_USER) {
+      exc_recover();
+      /* not reached */
+   }
+   serial_puts("IRETQ-BADRIP: kernel fault -> halt\n");
+   while (1)
+      __asm__ volatile ("hlt");
 }
 
 /* irqwrap.S IRQ_KSTACK_ENTER walks these offsets without a C helper. */
@@ -2472,6 +2563,17 @@ void ps_switchto(PCB386 *process){
                  (unsigned long)process->regs.EIP,
                  (unsigned long long)process->ctx.rsp);
          serial_puts(cb);
+         if (process != prev) {
+            if (process->on_cpu == me)
+               process->on_cpu = -1;
+            if (prev)
+               ps_publish_current(me, prev);
+            if (prev)
+               fpu_restore(&prev->fpu);
+         }
+         ps_switchto_in_progress[me] = 0;
+         startints();
+         return;
        }
     }
 
@@ -2480,6 +2582,39 @@ void ps_switchto(PCB386 *process){
      else
        context_load(&process->ctx, me);
 };
+
+/* Leftover timer abandon: load dest without saving prev from this RSP.
+   context_switch from a leftover user/CPUIRQ stack smashed idle/make
+   (cert 248136). */
+static void ps_switchto_load_only(PCB386 *process)
+{
+   int me = smp_cpu_id();
+   PCB386 *prev;
+
+   if (!process)
+      return;
+   if (me < 0 || me >= MAX_CPUS)
+      return;
+   if (ps_switchto_in_progress[me] || ctx_load_in_progress[me])
+      return;
+   prev = (PCB386 *)cpus[me].current;
+   if (process->on_cpu >= 0 && process->on_cpu != me)
+      return;
+   if (process->on_cpu < 0 &&
+       !__sync_bool_compare_and_swap(&process->on_cpu, -1, me))
+      return;
+   ps_switchto_in_progress[me] = 1;
+   stopints();
+   if (process->on_cpu != me) {
+      ps_switchto_in_progress[me] = 0;
+      startints();
+      return;
+   }
+   (void)prev;
+   ps_publish_current(me, process);
+   fpu_restore(&process->fpu);
+   context_load(&process->ctx, me);
+}
 
 
 /* Notify a parent that one of its children has reached the waitq.  Under
@@ -2509,7 +2644,11 @@ static void zombie_enqueue(PCB386 *z)
 {
    PCB386 *old;
 
-   if (!z)
+   /* Only heap-allocated PCBs are reclaimed.  Leftover current / smash
+      enqueued &ready_lock and &cpus (cert ramdisk KHEAP-BADFREE
+      rip=zombie_reclaim).  Writing zombie_next through those BSS
+      objects corrupts the scheduler. */
+   if (!z || !kheap_ptr_in_range((unsigned long)(uintptr)z))
       return;
    do {
       old = zombie_head;
@@ -2541,6 +2680,12 @@ static void zombie_reclaim(PCB386 *z)
 {
    if (!z)
       return;
+   if (!kheap_ptr_in_range((unsigned long)(uintptr)z)) {
+      static volatile unsigned long badz;
+      if (++badz <= 8)
+         serial_puts("ZOMBIE-BAD\n");
+      return;
+   }
    if (zombie_still_live(z)) {
       zombie_enqueue(z);
       return;
@@ -2602,6 +2747,12 @@ static void zombie_drain(void)
       if (!__sync_bool_compare_and_swap(&zombie_head, z, 0))
          continue;
       while (z) {
+         if (!kheap_ptr_in_range((unsigned long)(uintptr)z)) {
+            static volatile unsigned long badn;
+            if (++badn <= 8)
+               serial_puts("ZOMBIE-BADNEXT\n");
+            return;
+         }
          n = z->zombie_next;
          z->zombie_next = 0;
          zombie_reclaim(z);
@@ -2646,6 +2797,8 @@ static void self_exit_current(void)
    int me = smp_cpu_id();
 
    if (!dying)
+       return;
+   if (!kheap_ptr_in_range((unsigned long)(uintptr)dying))
        return;
 
   /* Close files before processmgr_busy so teardown I/O cannot invert with
@@ -2770,9 +2923,55 @@ void schedule_from_timer(void){
     PCB386 *readyprocess;
     devmgr_scheduler_extension *cursched;
    int me=smp_cpu_id();
-    int voluntary = voluntary_switch[me];
+    int voluntary;
+    int leftover_load_only = 0;
+
+    {
+       extern void smp_repair_stale_current(void);
+       smp_repair_stale_current();
+    }
+    voluntary = voluntary_switch[me];
     voluntary_switch[me] = 0;
- 
+
+   if (ctx_load_in_progress[me] || ps_switchto_in_progress[me])
+      return;
+
+   if (sigwait || !current_process)
+      return;
+   {
+      unsigned long rsp, cr3;
+      int access_user = current_process->accesslevel == ACCESS_USER;
+      int crit_wait = current_process->crit_wait;
+      PCB386 *idle = (me >= 0 && me < MAX_CPUS)
+                     ? (PCB386 *)cpus[me].idle : 0;
+      __asm__ __volatile__("movq %%rsp, %0" : "=r"(rsp));
+      __asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
+      /* leftover_load_only claimed idle smashed 248142 (UD64 make,
+         GPF64 context_switch leftover idle). leftover schedule smashed
+         248141. leftover-skip leftover advertised idle on a user AS
+         (248139 reached GCC_DRIVER_OK). Dest'd leftover ACCESS_SYS on
+         CPUIRQ leftover-skips via leftover_timer. */
+      if (leftover_idle_timer_must_skip(idle && current_process == idle,
+                                        cr3, rsp)) {
+         return;
+      } else if (leftover_timer_must_abandon(current_process->on_cpu, me,
+                                      access_user, rsp,
+                                      (unsigned long)(uintptr)
+                                      current_process->pagedirloc,
+                                      cr3, crit_wait)) {
+         extern void smp_abandon_leftover_current(void);
+         smp_abandon_leftover_current();
+         leftover_load_only = 1;
+         if (!current_process)
+            return;
+      } else if (leftover_timer_must_skip(current_process->on_cpu, me,
+                                          access_user, rsp,
+                                          (unsigned long)(uintptr)
+                                          current_process->pagedirloc,
+                                          cr3, crit_wait))
+         return;
+   }
+
     /* Long GCC cc1 runs expose a legacy timer-context race.  Stage-1
        certification (serial "selfhost-stage1" and parallel
        "selfhost-stage1-parallel") is cooperatively scheduled: spawned tools
@@ -2788,7 +2987,7 @@ void schedule_from_timer(void){
             with mkdir.exe holding fat_volume_busy and spinning on pc_busy while
             pc_busy's owner sat in the ready queue (CRITHANG).  scheduler()
             already declines to pin a crit_wait task; it just never got asked. */
-         if (!voluntary && selfhost_cooperative_ready &&
+         if (!leftover_load_only && !voluntary && selfhost_cooperative_ready &&
             (selfhost_stage1_cmdline() || sched_coop_user_force) &&
             current_process &&
             current_process->accesslevel == ACCESS_USER &&
@@ -2797,21 +2996,6 @@ void schedule_from_timer(void){
           return;
          }
     }
-
-   /* If context_load is in progress, the new task's context has been
-      fully loaded (RSP, GPRs, RFLAGS all restored) but the flag was
-      left set because context_load cannot clear it before `ret` without
-      opening a race window.  Clear it here — the new task is already
-      running, so it is safe to proceed with scheduling. */
-   if (ctx_load_in_progress[me] || ps_switchto_in_progress[me])
-      return;
-
-   if (sigwait || !current_process)
-      return;
-   /* Stale current_process: another CPU owns the PCB.  Do not walk its
-      kstack or context_load it (KSTACK-SHARED). */
-   if (current_process->on_cpu >= 0 && current_process->on_cpu != me)
-      return;
 
 #ifdef __x86_64__
    {
@@ -2852,6 +3036,12 @@ void schedule_from_timer(void){
 
    readyprocess = (PCB386*)bridges_link((devmgr_generic*)cursched, &cursched->scheduler,
                                           current_process,0,0,0,0,0);
+    if (leftover_load_only) {
+       if (!readyprocess)
+          readyprocess = current_process;
+       ps_switchto_load_only(readyprocess);
+       return;
+    }
     if (!readyprocess || readyprocess == current_process)
        return;
 

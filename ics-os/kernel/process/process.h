@@ -342,6 +342,8 @@ typedef struct _PCB386 {
        later acquire spins forever. */
     sync_sharedvar *held_crits[16];
       int held_crit_n;
+      /* held_crit_n is a nest count 0..16.  A torn 32-bit store can
+         leave a kheap pointer here (cert WATCHDOG held=0x35BC8E0). */
       /* Enter/leave nest lives on the PCB, not the CPU.  fat_wait_io()
          yields while holding vfs+FAT; a per-CPU nest then let the next
          process unlock the previous hold (non-owner leave, wait stuck). */
@@ -368,6 +370,18 @@ typedef struct _PCB386 {
    struct _PCB386 *zombie_next;
 
 }PCB386;
+
+/* Nest count, not a pointer.  Cert WATCHDOG held=0x35BC8E0. */
+static inline int pcb_held_n(const PCB386 *p)
+{
+   int n;
+   if (!p)
+      return 0;
+   n = p->held_crit_n;
+   if (n < 0 || n > 16)
+      return 0;
+   return n;
+}
 
 
 //currently unused
@@ -470,6 +484,7 @@ DWORD    fork();
 DWORD    forkprocess();
 PCB386  *sched_gethead(void);
 PCB386  *ps_find_by_cr3(unsigned long cr3);
+PCB386  *current_mm_process(void);
 
 /* Retained child-status queue (posix waitpid). Serialized by waitq_lock in
    process.c; the exit paths publish, sys_waitpid reaps. */
@@ -482,6 +497,8 @@ long     user_fork_frame(u64 *frame);
 int      pcb_alloc_irq_kstack(PCB386 *p);
 void     pcb_free_irq_kstack(PCB386 *p);
 void     irq_kstack_enter(u64 current_rsp);
+void     irq_iretq_guard(u64 *frame);
+void     irq_iretq_cr3_guard(u64 *frame);
 #endif
 DWORD    free_semaphore(DWORD handle);
 void     freeprocessmemory(process_mem *memptr,DWORD *pagedir);

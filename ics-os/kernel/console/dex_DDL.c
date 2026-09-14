@@ -15,6 +15,11 @@
 DEX32_DDL_INFO *ActiveDDL=0;
 int totalDDL=0;
 
+static int ddl_legacy_vga(const DEX32_DDL_INFO *dev)
+{
+   return dev && (unsigned long)dev->hdw_ptr == 0xB8000UL;
+}
+
 /* Identity-map kernel / heap pointers live in the low 4GiB. A non-canonical
    or NULL DDL (stale PCB.outdev before process_init) must not be followed:
    Dex32PutC would #GP(0) on the first VGA putc. */
@@ -54,22 +59,20 @@ DEX32_DDL_INFO *Dex32CreateDDL(){
    if (!dev->mem_ptr)
       return 0; 
    memset(dev->mem_ptr,0,80*25*2*sizeof(char));
-   dev->buf_ptr=dev->mem_ptr;
+    dev->buf_ptr=dev->mem_ptr;
     dev->hdw_ptr=0;
-    if (fbconsole_active()) {
-       /* Framebuffer mode: the "hardware" buffer is a text shadow; the
-          visible pixels are rendered into the linear framebuffer by
-          fbconsole. */
+    if (fbconsole_use_legacy_vga(fbconsole_have_tag(),
+                                serial_com1_present(),
+                                fbconsole_active())) {
+       dev->hdw_ptr=(char*)0xB8000;
+    } else {
+       /* GOP shadow, or a laptop with no VGA: never poke 0xB8000 / 0x3D4. */
        dev->hdw_ptr=(char*)malloc(80*25*2*sizeof(char));
-       if (dev->hdw_ptr)
-          memset(dev->hdw_ptr,0,80*25*2*sizeof(char));
-    }
-    if (!dev->hdw_ptr) {
-       if (fbconsole_active()) {
+       if (!dev->hdw_ptr) {
           free(dev->mem_ptr);
           return 0;
        }
-       dev->hdw_ptr=(char*)0xB8000;
+       memset(dev->hdw_ptr,0,80*25*2*sizeof(char));
     }
     dev->type=DDL_CGA;
    dev->active=0;
@@ -146,7 +149,7 @@ DEX32_DDL_INFO *Dex32SetActiveDDL(DEX32_DDL_INFO *dev){
        if (fbconsole_active())
           fbconsole_screen_refresh();
 
-       if (!dev->bufmode)
+       if (!dev->bufmode && ddl_legacy_vga(dev))
           move_cursor(dev->cury,dev->curx);
        return temp_ptr;
    };
@@ -183,7 +186,8 @@ void Dex32SetTextColor(DEX32_DDL_INFO *dev, char color){
 //move the cursor to a new location
 void Dex32MoveCursor(DEX32_DDL_INFO *dev, int y, int x){
     if (dev->active && !dev->bufmode) {
-       move_cursor(y,x);
+       if (ddl_legacy_vga(dev))
+          move_cursor(y,x);
        fbconsole_cursor_to(x,y);
     };
 };
@@ -214,7 +218,7 @@ void Dex32NextLn(DEX32_DDL_INFO *dev){
    };
                  
    Dex32PutChar(dev,dev->curx,dev->cury,' ',dev->attb);
-    if (dev->active && !dev->bufmode)
+    if (dev->active && !dev->bufmode && ddl_legacy_vga(dev))
        move_cursor(dev->cury,dev->curx);
     /* The scroll refresh (above) ran before the bottom line was cleared;
        redraw so the cleared line is not stale on the framebuffer. */
@@ -225,7 +229,8 @@ void Dex32NextLn(DEX32_DDL_INFO *dev){
 //update the cursor position
 void Dex32UpdateCursor(DEX32_DDL_INFO *dev, int y, int x){
     if (dev->active && !dev->bufmode) {
-       move_cursor(y,x);
+       if (ddl_legacy_vga(dev))
+          move_cursor(y,x);
        fbconsole_cursor_to(x,y);
     };
     dev->curx = x;

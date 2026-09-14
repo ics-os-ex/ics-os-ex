@@ -11,6 +11,7 @@ extern volatile int ps_switchto_in_progress[];
 extern int printf(const char *fmt, ...);
 extern int sprintf(char *str, const char *fmt, ...);
 extern void serial_puts(const char *s);
+extern int serial_com1_present(void);
 extern void *memset(void *s, int c, unsigned long n);
 extern void *memcpy(void *d, const void *s, unsigned long n);
 extern char *strcpy(char *d, const char *s);
@@ -48,21 +49,26 @@ static PCB386 ap_idle_pcb[MAX_CPUS];
    from "another CPU is writing my frames".  IDLE_GUARD words below each
    stack turn a future overflow into a report instead of silent corruption
    of another CPU. */
-/* Sized to fit the BSS budget: the kernel image must stay below the 4MiB user
-   ELF window (lscript64.ld enforces it), and these are MAX_CPUS deep. */
-#define IDLE_STACK_SIZE   0x4000UL
+#define IDLE_STACK_SIZE   MEM_IDLE_STACK_SIZE
 #define IDLE_GUARD_WORDS  16
 #define IDLE_GUARD_MAGIC  0x1D1E57AC61D1E57AULL
 
 /* guard[] sits immediately BELOW stack[] inside each element, so an overflow of
    this CPU's stack lands in its own guard before it can reach the previous
-   element's stack. */
+   element's stack.  Slots live at MEM_IDLE_STACK_BASE (not BSS). */
 typedef struct {
     u64 guard[IDLE_GUARD_WORDS];
     u8  stack[IDLE_STACK_SIZE];
 } idle_stack_t;
 
-static idle_stack_t ap_idle_stack[MAX_CPUS] __attribute__((aligned(16)));
+typedef char idle_slot_matches[
+    (sizeof(idle_stack_t) == MEM_IDLE_STACK_SLOT) ? 1 : -1];
+
+static idle_stack_t *idle_stk(int id)
+{
+    return (idle_stack_t *)(MEM_IDLE_STACK_BASE +
+                            (unsigned long)id * sizeof(idle_stack_t));
+}
 
 /* Only APs get an ap_prepare_idle(); the BSP never runs on ap_idle_stack[0], so
    its guard is never armed and must not be checked. */
@@ -72,7 +78,7 @@ static void ap_idle_guard_arm(int id)
 {
     int i;
     for (i = 0; i < IDLE_GUARD_WORDS; i++)
-        ap_idle_stack[id].guard[i] = IDLE_GUARD_MAGIC;
+        idle_stk(id)->guard[i] = IDLE_GUARD_MAGIC;
     ap_idle_guard_armed[id] = 1;
 }
 
@@ -87,13 +93,13 @@ int smp_idle_guard_check(int id)
     /* Walk downward from the word nearest the stack: that is the first one an
        overflow touches, so it names the smallest overrun. */
     for (i = IDLE_GUARD_WORDS - 1; i >= 0; i--) {
-        if (ap_idle_stack[id].guard[i] != IDLE_GUARD_MAGIC) {
+        if (idle_stk(id)->guard[i] != IDLE_GUARD_MAGIC) {
             char b[160];
             reported[id] = 1;
             sprintf(b, "IDLE-STACK-OVERFLOW cpu=%d word=%d val=0x%llx "
                        "base=0x%lx\n",
-                    id, i, (unsigned long long)ap_idle_stack[id].guard[i],
-                    (unsigned long)(uintptr)&ap_idle_stack[id].stack[0]);
+                    id, i, (unsigned long long)idle_stk(id)->guard[i],
+                    (unsigned long)(uintptr)&idle_stk(id)->stack[0]);
             serial_puts(b);
             return 1;
         }
@@ -165,7 +171,7 @@ static int smp_cpu_id_from_lapic(void)
 {
     u32 apic;
     int i;
-    if (!lapic_mmio)
+    if (!lapic_present())
         return -1;
     apic = lapic_get_id();
     for (i = 0; i < MAX_CPUS; i++) {
@@ -183,6 +189,12 @@ static int smp_rdtscp_available(void)
     u32 a, b, c, d, maxext;
     if (smp_have_rdtscp >= 0)
         return smp_have_rdtscp;
+    /* N150 hung in CPUID during getcpuinfo; do not probe extended
+       leaves again. Intel 64 has RDTSCP; QEMU still probes (has COM1). */
+    if (!serial_com1_present()) {
+        smp_have_rdtscp = 1;
+        return 1;
+    }
     __asm__ __volatile__("cpuid"
                          : "=a"(maxext), "=b"(b), "=c"(c), "=d"(d)
                          : "a"(0x80000000u)
@@ -272,9 +284,10 @@ void smp_enable_scheduling(void) {
     smp_reschedule_others();
 }
 
-/* Drop a leftover USER advertisement when this CPU is not executing that
-   process (CR3 mismatch) and is not mid-switch.  No sprintf: idle BSS
-   stacks are 8KiB and a format buffer there has already smashed frames. */
+/* Drop a leftover advertisement when this CPU is not executing that
+   process and is not mid-switch.  USER leftover uses a CR3 mismatch;
+   leftover kernel is FOREIGN, or unclaimed only while RSP is idle BSS.
+   No sprintf: idle BSS stacks are 16KiB. */
 void smp_repair_stale_current(void)
 {
     int me;
@@ -293,12 +306,17 @@ void smp_repair_stale_current(void)
     if (cur->ctx.cr3 &&
         ((unsigned long)cur->ctx.cr3 & ~0xFFFUL) == (hw_cr3 & ~0xFFFUL))
         pcb_cr3 = (unsigned long)cur->ctx.cr3;
-    if (!leftover_current_should_repair(cur->on_cpu, me,
-                                       cur->accesslevel == ACCESS_USER,
-                                       pcb_cr3, hw_cr3,
-                                       ctx_load_in_progress[me] ||
-                                       ps_switchto_in_progress[me]))
-        return;
+    {
+        unsigned long rsp;
+        __asm__ __volatile__("movq %%rsp, %0" : "=r"(rsp));
+        if (!leftover_current_should_repair(cur->on_cpu, me,
+                                           cur->accesslevel == ACCESS_USER,
+                                           pcb_cr3, hw_cr3,
+                                           ctx_load_in_progress[me] ||
+                                           ps_switchto_in_progress[me],
+                                           rsp))
+            return;
+    }
     /* Never clear a FOREIGN on_cpu; that claim belongs to the owner. */
     if (cur->on_cpu == me)
         cur->on_cpu = -1;
@@ -308,6 +326,28 @@ void smp_repair_stale_current(void)
         if (++repair_n <= 8)
             serial_puts("STALE-CURRENT-REPAIR\n");
     }
+    if (idle->on_cpu < 0)
+        idle->on_cpu = me;
+    __sync_synchronize();
+}
+
+/* Drop a leftover advertisement without saving that PCB from this RSP.
+   FOREIGN on_cpu is left alone (the owner still has the claim).
+   Cert 248136: leftover make on CPU 0 while disk_mgr.on_cpu==0. */
+void smp_abandon_leftover_current(void)
+{
+    int me = smp_cpu_id();
+    PCB386 *idle, *cur;
+
+    if (me < 0 || me >= MAX_CPUS)
+        return;
+    idle = (PCB386 *)cpus[me].idle;
+    cur = (PCB386 *)cpus[me].current;
+    if (!idle || !cur || cur == idle)
+        return;
+    if (cur->on_cpu == me)
+        cur->on_cpu = -1;
+    cpus[me].current = idle;
     if (idle->on_cpu < 0)
         idle->on_cpu = me;
     __sync_synchronize();
@@ -326,6 +366,12 @@ void smp_cpu_idle(void) {
        Once we are in the idle loop we are not that USER process. */
     idle = (me >= 0 && me < MAX_CPUS) ? (PCB386 *)cpus[me].idle : 0;
     cur = (me >= 0 && me < MAX_CPUS) ? (PCB386 *)cpus[me].current : 0;
+    {
+        unsigned long hw_cr3;
+        __asm__ __volatile__("movq %%cr3, %0" : "=r"(hw_cr3));
+        if ((hw_cr3 & ~0xFFFUL) >= MEM_KERNEL_LIMIT)
+            goto idle_loop;
+    }
     if (idle && cur && cur != idle &&
         !ctx_load_in_progress[me] && !ps_switchto_in_progress[me]) {
         if (cur->on_cpu == me)
@@ -335,6 +381,7 @@ void smp_cpu_idle(void) {
             idle->on_cpu = me;
         __sync_synchronize();
     }
+idle_loop:
     for (;;) {
         __asm__ __volatile__("sti; hlt");
     }
@@ -509,14 +556,14 @@ static void ap_prepare_idle(int id) {
     strcpy(idle->name, "cpu_idle");
     ap_idle_guard_arm(id);
     idle->regs.EIP = (DWORD)(uintptr)smp_cpu_idle;
-    idle->regs.ESP = (DWORD)(uintptr)&ap_idle_stack[id].stack[IDLE_STACK_SIZE];
+    idle->regs.ESP = (DWORD)(uintptr)&idle_stk(id)->stack[IDLE_STACK_SIZE];
     idle->regs.EFLAGS = 0x202;
     idle->regs.CS = 0x08; /* SYS_CODE_SEL */
     idle->regs.SS = 0x10; /* SYS_DATA_SEL */
     idle->regs.DS = 0x10;
     idle->ctx.rip = (u64)(uintptr)smp_cpu_idle;
     {
-        uintptr top = (uintptr)&ap_idle_stack[id].stack[IDLE_STACK_SIZE];
+        uintptr top = (uintptr)&idle_stk(id)->stack[IDLE_STACK_SIZE];
         top &= ~(uintptr)15;
         top -= 8;
         idle->regs.ESP = (DWORD)top;
@@ -621,6 +668,7 @@ void smp_init(void) {
           irq_safe_stack_top[i] =
              irq_safe_stack_base[i] + MEM_CPUIRQ_STACK;
        }
+       memset((void *)MEM_IDLE_STACK_BASE, 0, MEM_IDLE_STACK_BYTES);
     }
     cpus[0].cpu_id = 0;
     cpus[0].apic_id = lapic_get_id();
@@ -736,7 +784,7 @@ void smp_park_aps(void) {
     int i;
     unsigned int flags;
 
-    if (cpu_count < 2 || !lapic_mmio)
+    if (cpu_count < 2 || !lapic_present())
         return;
 
     storeflags(&flags);

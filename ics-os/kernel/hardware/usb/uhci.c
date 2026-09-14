@@ -482,14 +482,14 @@ static int uhci_bulk(BYTE endp, int in, BYTE *data, int len, BYTE *toggle)
 static int usb_ctrl(usb_setup *setup, void *data, int len)
 {
     if (usb_host == USB_HOST_XHCI)
-        return xhci_control(usb_xhci_hcd, setup, data, len);
+        return xhci_control(usb_xhci_hcd, 0, setup, data, len);
     return uhci_ctrl(setup, data, len);
 }
 
 static int usb_bulk(BYTE endp, int in, BYTE *data, int len, BYTE *toggle)
 {
     if (usb_host == USB_HOST_XHCI)
-        return xhci_bulk(usb_xhci_hcd, endp, in, data, len);
+        return xhci_bulk(usb_xhci_hcd, 0, endp, in, data, len);
     return uhci_bulk(endp, in, data, len, toggle);
 }
 
@@ -513,7 +513,7 @@ static int usb_set_address(BYTE addr)
 {
     usb_setup s;
     if (usb_host == USB_HOST_XHCI) {
-        if (!xhci_address_device(usb_xhci_hcd, 0))
+        if (!xhci_address_device(usb_xhci_hcd, 0, 0))
             return 0;
         usb_devaddr = addr;
         return 1;
@@ -604,7 +604,7 @@ static int usb_xhci_recover_stall(void)
     if (!usb_ctrl(&setup, 0, 0) ||
         !usb_clear_endpoint_halt((BYTE)(usb_ep_in | 0x80)) ||
         !usb_clear_endpoint_halt(usb_ep_out) ||
-        !xhci_recover_bulk_endpoints(usb_xhci_hcd, usb_ep_in,
+        !xhci_recover_bulk_endpoints(usb_xhci_hcd, 0, usb_ep_in,
                          usb_ep_out)) {
         usb_xhci_hcd->recovery_needed = 1;
         return 0;
@@ -909,7 +909,10 @@ static void usb_register_gpt(int deviceid, u64 total_blocks)
     gpt_disk gpt;
     char guidbuf[40];
     int i;
-    if (gpt_parse(usb_gpt_read, NULL, total_blocks, &gpt) != 0) {
+    /* gpt_parse returns 1 on success (same contract as ide_register_gpt).
+       The inverted != 0 check rejected a valid GPT ESP and left usb0
+       unpartitioned (test-usb-uefi-gpt / N150 Etcher image). */
+    if (!gpt_parse(usb_gpt_read, NULL, total_blocks, &gpt)) {
         printf("GPT_WARN usb0 GPT detected but failed validation; no partitions registered\n");
         return;
     }
@@ -1164,7 +1167,7 @@ static int usb_enumerate_msc(void)
     if (!usb_get_desc(USB_DESC_DEVICE, 0, devdesc, 8))
         return 0;
     if (usb_host == USB_HOST_XHCI &&
-        !xhci_set_ep0_packet_size(usb_xhci_hcd, devdesc[7]))
+        !xhci_set_ep0_packet_size(usb_xhci_hcd, 0, devdesc[7]))
         return 0;
     if (!usb_set_address(1))
         return 0;
@@ -1185,7 +1188,7 @@ static int usb_enumerate_msc(void)
     if (!usb_set_config(cfgval))
         return 0;
     if (usb_host == USB_HOST_XHCI &&
-        !xhci_configure_endpoints(usb_xhci_hcd,
+        !xhci_configure_endpoints(usb_xhci_hcd, 0,
                       usb_ep_in, usb_ep_in_mps,
                                   usb_ep_in_burst, usb_ep_out,
                                   usb_ep_out_mps, usb_ep_out_burst))

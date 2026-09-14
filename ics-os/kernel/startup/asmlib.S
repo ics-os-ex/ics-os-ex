@@ -139,15 +139,19 @@ reptrans:
     rep insb
     ret
 
-/* void getcpuid(unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx) */
+/* void getcpuid(DWORD leaf, DWORD *eax, DWORD *ebx, DWORD *ecx, DWORD *edx)
+   SysV: rdi=leaf, rsi=a, rdx=b, rcx=c, r8=d. The 32-bit port passed the
+   leaf by value; treating rdi as a pointer wrote CPUID results to
+   addresses 0, 1 and 0x80000002 (getcpuid(0)/ (1)/ brand-string). */
 .globl getcpuid
 getcpuid:
     pushq %rbx
-    movq %rdi, %r8
-    movq %rsi, %r9
-    movq %rdx, %r10
-    movq %rcx, %r11
-    movl (%r8), %eax
+    movq %r8, %r11
+    movl %edi, %eax
+    movq %rsi, %r8
+    movq %rdx, %r9
+    movq %rcx, %r10
+    xorl %ecx, %ecx
     cpuid
     movl %eax, (%r8)
     movl %ebx, (%r9)
@@ -316,12 +320,14 @@ gotoxy:
     movb %sil, CsrY
     ret
 
+/* void move_cursor(unsigned char row, unsigned int col). rbx is
+   callee-saved; the old sequence clobbered it and ignored the args. */
 .globl move_cursor
 move_cursor:
-    movzbl CsrY, %eax
+    pushq %rbx
+    movzbl %dil, %eax
     imull $80, %eax
-    movzbl CsrX, %edx
-    addl %edx, %eax
+    addl %esi, %eax
     movl %eax, %ebx
     movw $0x3D4, %dx
     movb $0x0F, %al
@@ -335,6 +341,7 @@ move_cursor:
     movw $0x3D5, %dx
     movb %bh, %al
     outb %al, %dx
+    popq %rbx
     ret
 
 /* COM1/COM2 TX using only GPRs. C uart_putc_raw reloaded uart_dev* from the

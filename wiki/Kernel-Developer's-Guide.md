@@ -168,6 +168,33 @@ PCB with one stack, so two CPUs falling back to it resume one context on one
 stack. Any shared-stack bug shows up as a 64-bit stack slot whose high half
 holds another CPU's 32-bit `smp_cpu_id()` result — a return address read back as
 `0x1_xxxxxxxx`, usually faulting in the serial path with `rdi = &uart1`.
+Leftover ACCESS_SYS on idle BSS (`task_mgr` advertised while RSP is below
+4MiB) is the same class: timer C tears RSI/R14/RBP and `held_crit_n`.
+`leftover_current_should_repair` drops that advertisement; unclaimed kernel
+on a kheap stack is still release-before-switch. ACCESS_SYS `#PF` that is
+not a restored identity page must halt — ignore-and-return retried a torn
+RIP into `cpus[]` (`UD64`). Leftover USER advertised on `pagedir1` must
+keep that USER for crit tokens (`current_mm_process` must not retarget
+to idle pid 0). Leftover idle on a user CR3 / user stack / CPUIRQ / kheap
+RSP, and leftover USER on `pagedir1`, must not enter or leave `vfs_busy`
+(`CRIT-NONOWNER busy=0x12 self=0x1`). Do not dest leftover USER A onto
+CPUIRQ while HW CR3 is USER B — that breaks the fork 77-storm.
+`irq_iretq_guard` must not `exc_recover` a leftover USER when the
+frame is on `MEM_CPUIRQ` or the reserved idle stack with a bad RIP
+(`rip=0` there killed `make` during cert 248135). A leftover timer
+that is FOREIGN, leftover idle on a user/CPUIRQ stack, or leftover
+USER `crit_wait` on a bad stack/CR3 must abandon the advertisement
+and `context_load` a local task without saving the leftover RSP
+(cert 248136 leftover `make` spun on `io_devlock` while `disk_mgr`
+stayed claimed on CPU 0). Do not skip-schedule a leftover waiter.
+Do not dest ACCESS_SYS on a reserved idle stack onto `MEM_CPUIRQ`
+(leftover user-stack dests already use that stack; a second dest
+GPF'd `fork_child_return` in the 77-storm). Cert 248137 overflowed
+32KiB idle under nested timer C; reserved idle slots are 64KiB.
+Leftover advertised idle still on a user CR3 must skip.
+Leftover idle `#UD` while HW CR3 is a user AS retargets that owner
+(cert 248139 `UD64 rip=0xac10000`). Do not reject ACCESS_SYS `iretq`
+into the user ELF window — that is the fork 77-storm.
 
 A task spinning in `sync_entercrit` must never outrank the lock's owner. User
 processes get `priority = 1` and kernel threads keep `0`, so comparing raw
@@ -192,8 +219,12 @@ the original cause over another cert loop.
 
 Do not load the kernel PML4 while RSP
 still points at a user-private page. `getphys64` must walk the full CR2 through `KDIRECT`. Sparse APIC IDs,
-MADT/x2APIC discovery, NUMA, and CPU hotplug are not implemented and must not be
-claimed.
+MADT discovery, NUMA, and CPU hotplug are not implemented and must not be
+claimed. Local APIC read/write uses x2APIC MSRs when `IA32_APIC_BASE.EXTD`
+is set (UEFI on the N150); MMIO at `0xFEE00000` hangs in that mode.
+`lapic_present()` is true for MMIO or x2APIC. Without COM1, `smp_start_aps`
+is skipped (APIC ids are not 1..7) and `smp_rdtscp_available` does not
+run CPUID. `make test-lapicx2-unit` checks the MSR numbers.
 
 The FAT cluster-chain walk is bounded and fail-closed. `get_sector_fromcluster`
 (`filesystem/fat12.c`) advances a file's clusters one step at a time and must not
@@ -239,6 +270,13 @@ synchronize IRQ/work/timer callbacks, stop and revoke DMA, release managed resou
 and wait for object/module references. Never cast a CPU pointer to a DMA address,
 free a timed-out descriptor still owned by hardware, invoke driver callbacks under
 a global registry lock, or force-unload active in-kernel driver text.
+
+An xHCI HCD keeps up to two per-port slots (`usbdevs[0]` MSC root,
+`usbdevs[1]` optional CDC-ACM). The port scan walks every CCS port instead
+of stopping at the first connect. `usb_enumerate_msc` still addresses
+device 0; a CDC-first physical order can still lose the MSC root until
+class-aware selection is finished. `make test-usb-cdc-console` is the
+two-device QEMU oracle.
 
 The current USB compatibility path uses `kernel/hardware/dma.h` to validate its
 identity-mapped bus addresses against alignment, overflow, the 32-bit DMA mask,
@@ -409,10 +447,17 @@ The target writes `/tmp/icsos-ext4-e2fsck.log` and
  The framebuffer console lives in `ics-os/kernel/hardware/vga/fbconsole.{c,h}`.
  When the bootloader provides a Multiboot2 framebuffer *info* tag (type 8),
  `main()` in `kernel32.c` hands it to `fbconsole_boot_init()`, the console
- renderer is switched to the framebuffer (1024x768x32 RGB), and a self-test
- prints `FBCONSOLE_PASS`. Without the tag the legacy VGA text driver remains
- active and no FBCONSOLE marker appears; serial stays the headless oracle
- either way.
+ renderer is switched to the framebuffer (RGB 16/24/32 bpp; pitch may be padded
+ past `width*(bpp/8)`, as Intel GOP does on 1920x1200 N150 panels; glyph zoom is
+ per-axis so 1920x1200 is 3x3 and fills the panel, while 1920x1080 is 3x2
+ with letterbox top/bottom), and a
+ self-test prints `FBCONSOLE_PASS`. A machine with no COM1 skips GOP MMIO
+ until `fbconsole_late_init()` (after LAPIC/scheduler, identity
+ write-combining via PAT PA4, live-render on). Early GOP and VGA CRTC
+ `0x3D4` / `0xB8000` rebooted the N150. QEMU has COM1, maps GOP in
+ `fbconsole_deferred_init()`, and keeps live-blit off after the self-test.
+ Without a framebuffer tag and with COM1 present, the legacy VGA text driver
+ remains active. Serial stays the headless oracle either way.
  
  Keep these Multiboot2 v2.0 invariants in `kernel/startup/startup.S` — GRUB
  fails the whole boot with `error: unsupported tag: 0x8` if they break:
@@ -429,17 +474,45 @@ The target writes `/tmp/icsos-ext4-e2fsck.log` and
    kernel must still boot without it.
  
  The info tag is consumed in two phases: `fbconsole_boot_init()` records the
- geometry, and `fbconsole_deferred_init()` maps it. Framebuffers below 4 GiB
- are mapped immediately via `mmio_mark_uncacheable`; framebuffers at or above
- 4 GiB (BIOS VBE on QEMU, e.g. `0xfd000000`) must wait until after memory
- initialization.
+ geometry only (no GOP MMIO — early writes triple-faulted the N150 before
+ the IDT), and `fbconsole_deferred_init()` maps it after `mem_init()`.
+ QEMU marks a low framebuffer uncacheable so the pixel selftest can
+ read back. A machine with no COM1 skips that early map (N150 rebooted
+ when the console or fault path painted GOP) and keeps a RAM DDL shadow
+ instead of `0xB8000`. After stage 16 (scheduler), `fbconsole_late_init()`
+ identity-maps GOP write-combining below 4 GiB, or maps a high GOP
+ through `KFB_BASE` (`boot_pdpt_high[5]`, 2MiB WC pages, 64 MiB cap),
+ black-fills the panel, blits the 80x25 shadow (per-axis zoom; 1920x1080
+ letterboxes top/bottom), prints `FB WxH pitch=… zoom=XxY`, and turns
+ live-render on.
+ Fault LEDs are both off so they do not look like stage 3 (Caps+Num);
+ the fault path does not fill GOP without COM1. `getcpuid` takes the leaf in `rdi`
+ by value (SysV) and zeros `%ecx` before `cpuid`; treating the leaf as
+ a pointer wrote CPUID results to addresses 0, 1 and `0x80000002`.
+ Without COM1, `hardware_getcpuinfo` skips CPUID (N150 hung in leaf
+ 0/1 / `0x80000000`). `init_kbd` flush is bounded; PS/2 mouse
+ programming is skipped (USB RAX / no aux).
  
  GRUB only emits the info tag when its video subsystem is present. The EFI
  image and the BIOS `CORE_IMG` embedded in the thumbdrive MBR gap are built
  in `scripts/mkusb.sh`; both module lists must keep `video all_video`.
- `make test-boot`, `make test-usb-uefi`, and `make test-ide-thumbdrive` all
- assert `FBCONSOLE_PASS` and cover the three GRUB paths (BIOS VBE, UEFI GOP,
- embedded i386-pc core).
+ `scripts/mkusb-uefi.sh` builds the GPT ESP image (`make usb-etcher`) with
+ `EFI/BOOT/BOOTX64.EFI`, `efi_gop`, `gfxterm`, a baked-in ASCII font, and
+ `gfxpayload=keep` so N150 firmware hands a linear GOP framebuffer to
+ Multiboot2. Do not probe GRUB `serial` on that image: laptops without COM0
+ print `serial port 'com0' isn't found` and then look hung.
+ `make test-fbconsole-unit` is the host TAP for packed vs padded pitch
+ and per-axis zoom (1920x1080 is 3x2).
+ `kbd_boot_leds()` programs i8042 Caps/Num/Scroll as a 3-bit boot-stage
+ breadcrumb (`make test-kbdleds-unit`). Stage 0 is Caps (kernel C);
+ `fbdbg_stage` updates the LEDs even when GOP is unmapped. A missing
+ 8042 latches dead and cannot stall boot. USB-only HID keyboards will
+ not light until an HID driver exists; Intel laptop internals are
+ usually i8042.
+ `make test-boot`, `make test-usb-uefi`, `make test-usb-uefi-gpt`, and
+ `make test-ide-thumbdrive` all assert `FBCONSOLE_PASS` and cover the GRUB
+ paths (BIOS VBE, UEFI GOP on MBR FAT, UEFI GOP on GPT ESP, embedded
+ i386-pc core).
  
  # 4. Source Code Directory Structure
 Top level directories.

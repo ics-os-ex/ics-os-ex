@@ -24,6 +24,7 @@ unsigned long sync_entercrit_irqsave(sync_sharedvar *var);
 void sync_leavecrit_irqrestore(sync_sharedvar *var,unsigned long flags);
 void sync_release_process_crits(void *pcb, int owner);
 int  sync_cpu_holds(const sync_sharedvar *var);
+int  sync_leftover_vfs(void);
 
 extern sync_sharedvar elf_map_crit;
 

@@ -25,6 +25,8 @@
     Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA. 
 */
 
+#include "../process/irq_kstack.h"
+
 void GPFhandler(DWORD address)
   {
   char temp[255];
@@ -114,8 +116,7 @@ void GPFhandler64(struct gpf_info *fi, unsigned long saved_rax, unsigned long sa
         /* Kernel-image RIP is a kernel bug (cert ps_switchto GPF).  Do not
            retarget current to the CR3 user and kill it: that leaked vfs_busy
            and WATCHDOG-spun gcc after as.exe was recovered. */
-        int kernel_rip = (fi->rip >= 0x100000ULL &&
-                          fi->rip < (unsigned long long)MEM_KERNEL_LIMIT);
+        int kernel_rip = exc_kernel_reserved_rip((unsigned long)fi->rip);
         PCB386 *owner = kernel_rip ? 0
                           : ps_find_by_cr3((unsigned long)fi->cr3);
         if (owner && owner->accesslevel == ACCESS_USER &&
@@ -124,9 +125,9 @@ void GPFhandler64(struct gpf_info *fi, unsigned long saved_rax, unsigned long sa
            cpus[cpu].current = owner;
      }
 #endif
-     if (current_process && current_process->accesslevel == ACCESS_USER
-         && (fi->rip < 0x100000ULL
-             || fi->rip >= (unsigned long long)MEM_USER_ELF_BASE)) {
+     if (exc_user_fault_rip(
+            current_process && current_process->accesslevel == ACCESS_USER,
+            (unsigned long)fi->rip)) {
           /* User-process fault: recover like the page-fault path. exc_recover()
              sets dex32_child_faulted and calls exit(1), which kills the faulted
              child and context-switches to its parent, abandoning this wrapper's
@@ -140,6 +141,7 @@ void GPFhandler64(struct gpf_info *fi, unsigned long saved_rax, unsigned long sa
 
     gpf_busy[cpu] = 0;
     serial_puts("\nGPF64: kernel fault -> halt\n");
+    kbd_boot_leds_raw(0);
     while (1) {}
   };
   
@@ -165,6 +167,22 @@ void exc_doublefault(unsigned long rip, unsigned long cs,
     stopints();
     sprintf(line, "DBLFLT: rip=0x%lx cs=0x%04lx rflags=0x%lx cr2=0x%lx\n",
             rip, cs & 0xFFFF, rflags, cr2);
+    serial_puts(line);
+    while (1) {}
+  };
+
+/* #SS (vector 12) pushes an error code. The old bare C stack_error()
+   hid RIP/RSP; cert 248121 printed only "Stack segment error" then
+   UD64 at kheap+0x41. */
+void exc_stack_segment(unsigned long rip, unsigned long cs,
+                       unsigned long rsp, unsigned long err)
+  {
+    char line[192];
+    stopints();
+    sprintf(line, "SS64: err=0x%lx rip=0x%lx cs=0x%lx rsp=0x%lx proc=%s\n",
+            err, rip, cs & 0xFFFF, rsp,
+            current_process && current_process->name
+            ? current_process->name : "?");
     serial_puts(line);
     while (1) {}
   };
@@ -468,6 +486,31 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
        serial_puts("PF64: bad current_process/pagedirloc -> halt\n");
        while (1) {}
     }
+#ifdef __x86_64__
+    /* Do not walk a CR2/RIP outside identity/KDIRECT (cert 248126:
+       0x100000001 is canonical but getphys64 GPF64'd as task_mgr). */
+    if (!pf64_walkable(location) || !pf64_walkable(rip)) {
+       char line[160];
+       sprintf(line, "PF64-BADVA cr2=0x%lx rip=0x%lx proc=%s pid=%d\n",
+               location, rip,
+               current_process && current_process->name
+               ? current_process->name : "?",
+               current_process ? (int)current_process->processid : -1);
+       serial_puts(line);
+       pf_busy[fault_cpu] = 0;
+       /* Unwalkable/torn/stack RIP is leftover smash, not a user opcode
+          (cert 248129 cc1 rip=cr2=0x10390d900).  Only a walkable user
+          ELF RIP with a wild CR2 may recover. */
+       if (pf64_walkable(rip) &&
+           exc_user_fault_rip(
+              current_process && current_process->accesslevel == ACCESS_USER,
+              rip)) {
+          exc_recover();
+       }
+       serial_puts("PF64-BADVA: kernel fault -> halt\n");
+       while (1) {}
+    }
+#endif
    {
         char line[256];
         unsigned long cr3 = 0, cr4 = 0;
@@ -580,9 +623,14 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
                  cpus[fault_cpu].current = fault_proc;
               serial_puts("PF64: user not-present -> killing process\n");
               exc_recover();
+              return 0;
            }
-           serial_puts("PF64: not-present ACCESS_SYS -> ignored\n");
-           return 0;
+           /* Ignore-and-return retried torn RIP into cpus[] (UD64). */
+           if (((unsigned long)location >> 32) != 0)
+              serial_puts("PF64: not-present ACCESS_SYS torn CR2 -> halt\n");
+           else
+              serial_puts("PF64: not-present ACCESS_SYS -> halt\n");
+           while (1) {}
        }
        {
           char line[180];
@@ -600,9 +648,13 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
              cpus[fault_cpu].current = fault_proc;
           serial_puts("PF64: user not-present -> killing process\n");
           exc_recover();
+          return 0;
        }
-       serial_puts("PF64: not-present ACCESS_SYS -> ignored\n");
-       return 0;
+       if (((unsigned long)location >> 32) != 0)
+          serial_puts("PF64: not-present ACCESS_SYS torn CR2 -> halt\n");
+       else
+          serial_puts("PF64: not-present ACCESS_SYS -> halt\n");
+       while (1) {}
     }
 #else
    (void)rip;
@@ -714,6 +766,7 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
        PF64 inside serial_puts. */
     if (!current_process || current_process->processid == 0) {
        serial_puts("PF64: kernel fault -> halt\n");
+       kbd_boot_leds_raw(0);
        while (1);
     }
     /* Non-zero so waiters can distinguish crash from clean exit(0). */

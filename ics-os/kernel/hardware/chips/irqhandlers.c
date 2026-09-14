@@ -77,6 +77,7 @@ extern void mfwrapper(void);
 extern void CPUintwrapper(void);
 extern void div_wrapper(void);
 extern void invalidtsswrapper(void);
+extern void sswrapper(void);
 
 extern void irq1wrapper(void);
 extern void irq2wrapper(void);
@@ -198,6 +199,7 @@ void nocoprocessor(){
 
 #ifdef __x86_64__
 #include "cpu/smp.h"
+#include "process/irq_kstack.h"
 /* #UD / #MF, entered from udwrapper / mfwrapper with %r13 (the PUSH_ALL frame)
    in `frame`.  Neither pushes an error code, so RIP is at +120 and CS at +128
    (see AGENTS.md).  These used to be routed into nocoprocessor(), which cleared
@@ -217,16 +219,13 @@ static void exc_noerr_report(const char *tag, unsigned long *frame)
       iretq frame lands when RFLAGS is popped as RIP -- is the faulting party
       and must be killed, not have its CPU halted.  Halting parked one CPU per
       bad child until the whole -j4 build had no CPUs left. */
-   int kernel_rip = (rip >= 0x100000UL &&
-                     rip < (unsigned long)MEM_KERNEL_LIMIT);
-   int user_fault = current_process
-                    && current_process->accesslevel == ACCESS_USER
-                    && (rip < 0x100000UL
-                        || rip >= (unsigned long)MEM_USER_ELF_BASE);
+   int kernel_rip = exc_kernel_reserved_rip(rip);
+   int user_fault = exc_user_fault_rip(
+      current_process && current_process->accesslevel == ACCESS_USER, rip);
 #ifdef __x86_64__
    /* Kernel-image #UD is a smashed iretq, not a user opcode.  Assigning
       the CR3 owner and killing it leaked crits (cert make.exe / as.exe). */
-   if (!user_fault && !kernel_rip) {
+   if (!user_fault && !kernel_rip && exc_user_opcode_rip(rip)) {
       unsigned long cr3 = 0;
       PCB386 *owner;
       __asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
@@ -524,7 +523,7 @@ void setdefaulthandlers(){
                         seg_error,SYS_CODE_SEL);
 
    setinterruptvector(12,dex_idtbase,0x8E,
-                        stack_error,SYS_CODE_SEL);
+                        sswrapper,SYS_CODE_SEL);
 
    setinterruptvector(10,dex_idtbase,0x8E,
                         invalidtsswrapper,SYS_CODE_SEL);

@@ -16,6 +16,7 @@
 .extern wrapper_call_trap
 .extern divide_error
 .extern exc_invalidtss
+.extern exc_stack_segment
 .extern irq_activate
 .extern schedule_from_timer
 .extern lapic_eoi
@@ -26,6 +27,7 @@
 .extern xhci_irq
 .extern user_fork_frame
 .extern irq_kstack_enter
+.extern irq_iretq_guard
 .extern cpus
 .extern smp_have_rdtscp
 .extern irq_safe_stack_top
@@ -137,15 +139,22 @@
     testq %rax, %rax
     jz .Lkenter\@
     cmpl $ACCESS_USER_VAL, PCB_ACCESSLEVEL(%rax)
-    jne .Lkenter\@                     /* ACCESS_SYS: keep own stack */
+    jne .Lsys\@                        /* ACCESS_SYS: stay unless user stack */
     movq PCB_KSTACK_TOP(%rax), %rdx
     testq %rdx, %rdx
     jz .Lnokstk\@
+    /* Torn kstack_top (cert 248123 (0x400000<<32)|kheap) is not a bound. */
+    movq %rdx, %r9
+    shrq $32, %r9
+    jnz .Lnokstk\@
     cmpq %rdx, %r13
     jae .Lnokstk\@
     cmpq PCB_KSTACK_BASE(%rax), %r13
     jae .Lkenter\@
 .Lnokstk\@:
+    /* FOREIGN never uses this process kstack from the user stack.
+       on_cpu < 0 (fork child) still takes kstack_top.  Do not yank
+       FOREIGN already on a valid kstack (test-fork TSS-bad). */
     cmpl $0, PCB_ON_CPU(%rax)
     jl .Lmayusr\@
     cmpl %ecx, PCB_ON_CPU(%rax)
@@ -159,13 +168,37 @@
     jae .Lbss\@
     testq %rdx, %rdx
     jz .Lcpuirq\@
+    movq %rdx, %r9
+    shrq $32, %r9
+    jnz .Lcpuirq\@                     /* do not switch to a torn top */
     movq %rdx, %rsp
     jmp .Lkenter\@
-.Lbss\@:
-    movabs $0x00400000, %r9
+.Lsys\@:
+    /* Leftover current=idle during a user syscall (cert 248119/248121).
+       ACCESS_SYS stay left C/iretq on the user stack (GPF64 TSS-bad
+       rip=fork_child_return).  Divert only that case to MEM_CPUIRQ.
+       Do not dest reserved idle here: leftover user-stack dests already
+       use CPUIRQ, and a second dest smashed fork_child_return
+       (test-fork 77-storm).  Kernel-thread kheap stacks stay. */
+    movabs $0x3FD00000, %r9
+    cmpq %r9, %r13
+    jb .Lkenter\@
+    movabs $0x40000000, %r9
     cmpq %r9, %r13
     jae .Lkenter\@
     jmp .Lcpuirq\@
+.Lbss\@:
+    movabs $0x00400000, %r9
+    cmpq %r9, %r13
+    jb .Lcpuirq\@
+    /* Reserved idle stacks (MEM_IDLE_STACK_*) sit above 4MiB. */
+    movabs $0x02040000, %r9
+    cmpq %r9, %r13
+    jb .Lkenter\@
+    movabs $0x020C2000, %r9
+    cmpq %r9, %r13
+    jb .Lcpuirq\@
+    jmp .Lkenter\@
 .Lcpuirq\@:
     testq %r8, %r8
     jz .Lkenter\@
@@ -208,6 +241,8 @@ syscallwrapper:
     call api_syscall
     movq %rax, 112(%r13)        /* return value in caller's rax */
 .Lsyscall_return:
+    movq %r13, %rdi
+    call irq_iretq_guard
     IRQ_KSTACK_LEAVE
     POP_ALL
     iretq
@@ -235,6 +270,9 @@ syscallentry:
     movq 56(%r12), %r9            /* user r8 */
     call syscallentry64
     movq %rax, 112(%r13)
+    /* Do not call irq_iretq_guard here: SYSCALL has no hardware RIP/CS
+       (cert 248130 IRETQ-BADRIP rip=0 as make).  A CR3 guard here
+       GPF'd fork_child_return in the test-fork 77-storm. */
     IRQ_KSTACK_LEAVE
     POP_ALL
     pushq %r11                    /* RFLAGS */
@@ -408,6 +446,8 @@ timerwrapper:
     movq %rax, 240(%r11)
     call time_handler
     call schedule_from_timer
+    movq %r13, %rdi
+    call irq_iretq_guard
     IRQ_KSTACK_LEAVE
     POP_ALL
     iretq
@@ -531,6 +571,19 @@ invalidtsswrapper:
     POP_ALL
     addq $8, %rsp
     iretq
+
+/* #SS (vector 12) pushes an error code. A bare C handler hid RIP/RSP. */
+.globl sswrapper
+sswrapper:
+    cli
+    movq 8(%rsp), %rdi
+    movq 16(%rsp), %rsi
+    movq 32(%rsp), %rdx
+    movq 0(%rsp), %rcx
+    call exc_stack_segment
+    jmp 1f
+1:  hlt
+    jmp 1b
 
 .globl irq1wrapper
 irq1wrapper:
