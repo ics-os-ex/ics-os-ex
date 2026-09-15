@@ -696,6 +696,13 @@ static void vnet_selftest(struct vnet_dev *d)
           (cfg.gateway >> 24) & 0xFF, (cfg.gateway >> 16) & 0xFF,
           (cfg.gateway >> 8) & 0xFF, cfg.gateway & 0xFF, dhcp_ok);
 
+   if (dhcp_ok) {
+      if (dhcp_renew(&d->nif, &cfg, 4000000) == 0)
+         printf("NET_DHCP_RENEW_OK\n");
+      else
+         printf("NET_DHCP_RENEW_FAIL\n");
+   }
+
    tcp_listen_echo(TCP_ECHO_PORT);
 
    if (icmp_ping(&d->nif, cfg.gateway, 300) == 0)

@@ -190,7 +190,7 @@ int main(void)
     unsigned char mtype;
     struct dhcp_lease lease;
 
-    printf("1..5\n");
+    printf("1..6\n");
     len = build_discover(pkt, xid, mac);
     OK(len > DHCP_MIN_PKT, "discover length");
     OK(pkt[DHCP_FIXED_LEN] == DHCP_MAGIC_0 &&
@@ -200,5 +200,31 @@ int main(void)
     OK(mtype == DHCP_OFFER && lease.ip == 0x0A00020Fu &&
        lease.server == 0x0A000202u && lease.netmask == 0xFFFFFF00u, "offer fields");
     OK(parse_reply(pkt, len, xid ^ 1u, &mtype, &lease) != 0, "reject bad xid");
+
+    /* Renew: ciaddr set, flags clear, REQUEST type, no server-id opt. */
+    memset(pkt, 0, sizeof(pkt));
+    {
+        struct dhcp_msg *m = (struct dhcp_msg *)pkt;
+        unsigned char *opt;
+        unsigned int i;
+        m->op = DHCP_BOOTREQUEST;
+        m->htype = 1;
+        m->hlen = 6;
+        m->xid = htonl_u(xid);
+        m->flags = 0;
+        m->ciaddr = htonl_u(0x0A00020Fu);
+        for (i = 0; i < 6; i++)
+            m->chaddr[i] = mac[i];
+        opt = pkt + DHCP_FIXED_LEN;
+        *opt++ = DHCP_MAGIC_0; *opt++ = DHCP_MAGIC_1;
+        *opt++ = DHCP_MAGIC_2; *opt++ = DHCP_MAGIC_3;
+        *opt++ = DHCP_OPT_MSG_TYPE; *opt++ = 1; *opt++ = DHCP_REQUEST;
+        *opt++ = DHCP_OPT_END;
+        len = (unsigned int)(opt - pkt);
+    }
+    OK(((struct dhcp_msg *)pkt)->ciaddr == htonl_u(0x0A00020Fu) &&
+       ((struct dhcp_msg *)pkt)->flags == 0 &&
+       pkt[DHCP_FIXED_LEN + 6] == DHCP_REQUEST, "renew wire shape");
+
     return tests_failed ? 1 : 0;
 }

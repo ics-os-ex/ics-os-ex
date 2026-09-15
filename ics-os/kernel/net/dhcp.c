@@ -18,6 +18,8 @@ static const unsigned char eth_broadcast[6] = {
 static volatile int dhcp_waiting;
 static unsigned char dhcp_rx[576];
 static volatile unsigned int dhcp_rx_len;
+static struct dhcp_lease dhcp_active;
+static int dhcp_have_lease;
 
 static void opt_put(unsigned char **pp, unsigned char code,
                     unsigned char len, const unsigned char *val)
@@ -50,6 +52,8 @@ static void opt_put_u32_be(unsigned char **pp, unsigned char code,
 static unsigned int dhcp_build_common(unsigned char *dst, unsigned int dst_max,
                                       unsigned int xid,
                                       const unsigned char mac[6],
+                                      unsigned short flags_host,
+                                      unsigned int ciaddr_host,
                                       unsigned char **opt_out)
 {
     struct dhcp_msg *m;
@@ -64,7 +68,8 @@ static unsigned int dhcp_build_common(unsigned char *dst, unsigned int dst_max,
     m->htype = 1;
     m->hlen = 6;
     m->xid = net_htonl(xid);
-    m->flags = net_htons(0x8000); /* broadcast */
+    m->flags = net_htons(flags_host);
+    m->ciaddr = net_htonl(ciaddr_host);
     for (i = 0; i < 6; i++)
         m->chaddr[i] = mac[i];
 
@@ -85,7 +90,7 @@ unsigned int dhcp_build_discover(unsigned char *dst, unsigned int dst_max,
     unsigned int base;
     unsigned char prl[3];
 
-    base = dhcp_build_common(dst, dst_max, xid, mac, &opt);
+    base = dhcp_build_common(dst, dst_max, xid, mac, 0x8000u, 0, &opt);
     if (!base)
         return 0;
     opt_put_u8(&opt, DHCP_OPT_MSG_TYPE, DHCP_DISCOVER);
@@ -107,7 +112,7 @@ unsigned int dhcp_build_request(unsigned char *dst, unsigned int dst_max,
     unsigned int base;
     unsigned char prl[3];
 
-    base = dhcp_build_common(dst, dst_max, xid, mac, &opt);
+    base = dhcp_build_common(dst, dst_max, xid, mac, 0x8000u, 0, &opt);
     if (!base)
         return 0;
     opt_put_u8(&opt, DHCP_OPT_MSG_TYPE, DHCP_REQUEST);
@@ -117,6 +122,40 @@ unsigned int dhcp_build_request(unsigned char *dst, unsigned int dst_max,
     prl[1] = DHCP_OPT_ROUTER;
     prl[2] = DHCP_OPT_LEASE_TIME;
     opt_put(&opt, DHCP_OPT_PARAM_REQ, 3, prl);
+    *opt++ = DHCP_OPT_END;
+    return (unsigned int)(opt - dst);
+}
+
+unsigned int dhcp_build_renew(unsigned char *dst, unsigned int dst_max,
+                              unsigned int xid,
+                              const unsigned char mac[6],
+                              unsigned int ciaddr_host)
+{
+    unsigned char *opt;
+    unsigned int base;
+
+    base = dhcp_build_common(dst, dst_max, xid, mac, 0 /* unicast */,
+                             ciaddr_host, &opt);
+    if (!base)
+        return 0;
+    opt_put_u8(&opt, DHCP_OPT_MSG_TYPE, DHCP_REQUEST);
+    *opt++ = DHCP_OPT_END;
+    return (unsigned int)(opt - dst);
+}
+
+unsigned int dhcp_build_rebind(unsigned char *dst, unsigned int dst_max,
+                               unsigned int xid,
+                               const unsigned char mac[6],
+                               unsigned int ciaddr_host)
+{
+    unsigned char *opt;
+    unsigned int base;
+
+    base = dhcp_build_common(dst, dst_max, xid, mac, 0x8000u, ciaddr_host,
+                             &opt);
+    if (!base)
+        return 0;
+    opt_put_u8(&opt, DHCP_OPT_MSG_TYPE, DHCP_REQUEST);
     *opt++ = DHCP_OPT_END;
     return (unsigned int)(opt - dst);
 }
@@ -215,7 +254,8 @@ static int dhcp_xmit(struct netif *nif, const unsigned char *payload,
     if (!udp)
         return -1;
     udp_len = udp_build(udp->data, DHCP_CLIENT_PORT, DHCP_SERVER_PORT,
-                        payload, plen, 0 /* src */, 0xFFFFFFFFu);
+                        payload, plen,
+                        nif->configured ? nif->ip : 0u, 0xFFFFFFFFu);
     udp->len = (u16)udp_len;
 
     total = IPV4_HDR_MIN + udp->len;
@@ -232,7 +272,7 @@ static int dhcp_xmit(struct netif *nif, const unsigned char *payload,
     ip->frag_off = 0;
     ip->ttl = 64;
     ip->proto = IPV4_PROTO_UDP;
-    ip->src = 0;
+    ip->src = net_htonl(nif->configured ? nif->ip : 0u);
     ip->dst = net_htonl(0xFFFFFFFFu);
     ipv4_set_checksum(ip);
     memcpy(pkt->data + IPV4_HDR_MIN, udp->data, udp->len);
@@ -241,6 +281,25 @@ static int dhcp_xmit(struct netif *nif, const unsigned char *payload,
     for (i = 0; i < 6; i++)
         dmac[i] = eth_broadcast[i];
     return ethernet_output(nif, pkt, dmac, ETH_TYPE_IPV4);
+}
+
+static int dhcp_xmit_unicast(struct netif *nif, unsigned int dst_host,
+                             const unsigned char *payload, unsigned int plen)
+{
+    struct pbuf *udp;
+    unsigned int udp_len;
+
+    if (!nif || !nif->configured || !payload || !plen || !dst_host)
+        return -1;
+    if (UDP_HDR_LEN + plen > PBUF_SIZE)
+        return -1;
+    udp = pbuf_alloc((u16)(UDP_HDR_LEN + plen));
+    if (!udp)
+        return -1;
+    udp_len = udp_build(udp->data, DHCP_CLIENT_PORT, DHCP_SERVER_PORT,
+                        payload, plen, nif->ip, dst_host);
+    udp->len = (u16)udp_len;
+    return ipv4_output(nif, udp, dst_host, IPV4_PROTO_UDP);
 }
 
 static int dhcp_wait_reply(struct netif *nif, unsigned int xid,
@@ -303,8 +362,80 @@ int dhcp_client(struct netif *nif, struct inet_config *cfg,
     cfg->ip = ack.ip;
     cfg->netmask = ack.netmask ? ack.netmask : NET_SLIRP_MASK;
     cfg->gateway = ack.gateway ? ack.gateway : offer.server;
+    dhcp_active = ack;
+    if (!dhcp_active.server)
+        dhcp_active.server = offer.server;
+    if (!dhcp_active.netmask)
+        dhcp_active.netmask = cfg->netmask;
+    if (!dhcp_active.gateway)
+        dhcp_active.gateway = cfg->gateway;
+    dhcp_have_lease = 1;
     ret = 0;
 out:
     net_unlock();
     return ret;
+}
+
+static int dhcp_renew_or_rebind(struct netif *nif, struct inet_config *cfg,
+                                unsigned int timeout_spins, int rebind)
+{
+    unsigned char pkt[512];
+    unsigned int len, xid;
+    struct dhcp_lease ack;
+    int ret = -1;
+
+    if (!nif || !cfg || !nif->configured || !dhcp_have_lease)
+        return -1;
+
+    net_lock();
+    xid = 0xA11E0000u ^ dhcp_active.ip;
+    if (!xid)
+        xid = 0x87654321u;
+
+    if (rebind)
+        len = dhcp_build_rebind(pkt, sizeof(pkt), xid, nif->mac, nif->ip);
+    else
+        len = dhcp_build_renew(pkt, sizeof(pkt), xid, nif->mac, nif->ip);
+    if (!len)
+        goto out;
+
+    if (rebind) {
+        if (dhcp_xmit(nif, pkt, len) != 0)
+            goto out;
+    } else {
+        if (dhcp_xmit_unicast(nif, dhcp_active.server, pkt, len) != 0)
+            goto out;
+    }
+    if (dhcp_wait_reply(nif, xid, DHCP_ACK, &ack, timeout_spins) != 0)
+        goto out;
+
+    cfg->ip = ack.ip ? ack.ip : nif->ip;
+    if (ack.netmask)
+        cfg->netmask = ack.netmask;
+    if (ack.gateway)
+        cfg->gateway = ack.gateway;
+    if (ack.server)
+        dhcp_active.server = ack.server;
+    dhcp_active.ip = cfg->ip;
+    dhcp_active.netmask = cfg->netmask;
+    dhcp_active.gateway = cfg->gateway;
+    if (ack.lease_secs)
+        dhcp_active.lease_secs = ack.lease_secs;
+    netif_set_addr(nif, cfg->ip, cfg->netmask, cfg->gateway);
+    ret = 0;
+out:
+    net_unlock();
+    return ret;
+}
+
+int dhcp_renew(struct netif *nif, struct inet_config *cfg,
+               unsigned int timeout_spins)
+{
+    return dhcp_renew_or_rebind(nif, cfg, timeout_spins, 0);
+}
+
+int dhcp_rebind(struct netif *nif, struct inet_config *cfg,
+                unsigned int timeout_spins)
+{
+    return dhcp_renew_or_rebind(nif, cfg, timeout_spins, 1);
 }

@@ -71,6 +71,17 @@ unsigned int dhcp_build_request(unsigned char *dst, unsigned int dst_max,
                                 const unsigned char mac[6],
                                 unsigned int req_ip_host,
                                 unsigned int server_host);
+/* RENEWING: ciaddr set, unicast; no requested-IP / server-id options. */
+unsigned int dhcp_build_renew(unsigned char *dst, unsigned int dst_max,
+                              unsigned int xid,
+                              const unsigned char mac[6],
+                              unsigned int ciaddr_host);
+/* REBINDING: ciaddr set, broadcast flag; no requested-IP / server-id. */
+unsigned int dhcp_build_rebind(unsigned char *dst, unsigned int dst_max,
+                               unsigned int xid,
+                               const unsigned char mac[6],
+                               unsigned int ciaddr_host);
+
 int dhcp_parse_reply(const unsigned char *pkt, unsigned int len,
                      unsigned int expect_xid,
                      unsigned char *msg_type_out,
@@ -82,6 +93,12 @@ int dhcp_udp_deliver(unsigned short dport, const unsigned char *payload,
 
 /* Run DORA; fills cfg on success. Returns 0 on ACK. */
 int dhcp_client(struct netif *nif, struct inet_config *cfg,
+                unsigned int timeout_spins);
+/* Unicast renew to the leasing server (RFC 2131 RENEWING). */
+int dhcp_renew(struct netif *nif, struct inet_config *cfg,
+               unsigned int timeout_spins);
+/* Broadcast rebind (RFC 2131 REBINDING). */
+int dhcp_rebind(struct netif *nif, struct inet_config *cfg,
                 unsigned int timeout_spins);
 
 #endif

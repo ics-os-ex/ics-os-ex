@@ -2,6 +2,23 @@
 
 ## 2026-09-15 (Manila, UTC+8)
 
+### 19:40 — Follow-ons: httpd + DHCP renew/rebind
+
+Current problem: close the post-DHCP networking follow-ons (userland HTTP
+demo and lease renew).
+Activity: `contrib/httpd` serves HTTP/1.0 on `:8080` (`NET_HTTPD_OK` via
+hostfwd `:18080`); `dhcp_renew`/`dhcp_rebind` (RFC 2131 RENEWING/REBINDING)
+with selftest `NET_DHCP_RENEW_OK`. `make test-net` packs netecho+httpd.
+
+### 19:25 — DHCP client (DORA) on SLIRP
+
+Current problem: addressing was static-only; real deployments need DHCP.
+Activity: RFC 2131 DISCOVER/OFFER/REQUEST/ACK client (`kernel/net/dhcp.c`),
+broadcast UDP from 0.0.0.0:68 before `configured`, virtio-net selftest
+leases via QEMU SLIRP then falls back to cmdline static on failure
+(`NET_DHCP_OK`). Host TAP `test-netdhcp-unit`; `make test-net` requires
+the DHCP marker.
+
 ### 19:10 — Net SMP/concurrency stress + softnet lock
 
 Current problem: socket stack shared state (pbuf freelist, TCP PCBs, UDP
