@@ -63,6 +63,11 @@ void fbconsole_selftest(void);
     kernel can reuse the same framebuffer. */
  void fbconsole_export_tag(unsigned char *buf);
 
+int fbconsole_geom(unsigned int *width, unsigned int *height,
+                   unsigned int *bpp);
+int fbconsole_rgb_at(unsigned int x, unsigned int y,
+                     unsigned char *r, unsigned char *g, unsigned char *b);
+
  /* ---- Direct-framebuffer crash diagnostics (early-boot localization) ----
     Paint straight to the linear framebuffer, bypassing the DDL/console. Safe
     to call from kernel fault handlers; no-op when the framebuffer is not

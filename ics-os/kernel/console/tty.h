@@ -41,6 +41,7 @@ typedef struct _tty {
    volatile int in_head, in_tail;
    unsigned char in_buf[TTY_IBUF];
    int canon_len;
+   int canon_off;
    char canon[TTY_CANON_MAX];
    volatile int line_ready;
    int canon_esc;         /* canonical-mode CSI swallow: 1 saw ESC, 2 in CSI */

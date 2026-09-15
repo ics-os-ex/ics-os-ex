@@ -25,6 +25,11 @@ int lapic_present(void)
     return lapic_x2apic || lapic_mmio != 0;
 }
 
+int lapic_x2apic_enabled(void)
+{
+    return lapic_x2apic;
+}
+
 u32 lapic_read(u32 reg) {
     if (lapic_x2apic)
         return (u32)rdmsr(lapic_x2apic_msr(reg));

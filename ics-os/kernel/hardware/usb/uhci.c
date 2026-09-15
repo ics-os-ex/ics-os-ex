@@ -11,9 +11,29 @@
 
 #include "usb.h"
 #include "usb_identity.h"
+#include "usb_cdc_acm.h"
+#include "usb_debug.h"
 #include "../dma.h"
+#include "../keyboard/kbd_boot_leds.h"
 
 extern void serial_puts(const char *s);
+extern int console_execute(const char *str);
+extern void tty_input_fg(int c);
+extern void machine_reboot(void);
+extern int kexec_load_mem(const void *img, unsigned int sz);
+extern void kexec_reboot(void);
+extern int fbconsole_geom(unsigned int *width, unsigned int *height,
+                          unsigned int *bpp);
+extern int fbconsole_rgb_at(unsigned int x, unsigned int y,
+                            unsigned char *r, unsigned char *g,
+                            unsigned char *b);
+extern unsigned int klog_count(void);
+extern void klog_dump(int level_filter);
+extern int kernel_kexeced;
+extern char kernel_cmdline[];
+extern void *malloc(unsigned int n);
+extern void free(void *p);
+extern int sprintf(char *s, const char *fmt, ...);
 
 #define USB_BULK_MAX        (32 * 1024)
 #define USB_MAX_TD          (USB_BULK_MAX / 64)
@@ -176,10 +196,57 @@ static int usb_fault_drop_stall_retry;
 static BYTE usb_recovery_before[512];
 static BYTE usb_recovery_after[512];
 
+/* Same-CPU: a spinning spin_lock never schedules the hotplug thread that
+   holds usb_io_lock during CDC OUT — openfilex then hangs forever on N150
+   when ticks/preemption are weak. Yield while waiting. */
+static void usb_io_lock_acquire(void)
+{
+    while (__sync_lock_test_and_set(&usb_io_lock.locked, 1)) {
+        while (usb_io_lock.locked) {
+            taskswitch();
+            __asm__ __volatile__("pause");
+        }
+    }
+}
+
+static void usb_io_lock_release(void)
+{
+    spin_unlock(&usb_io_lock);
+}
+#define USB_CDC_TXQ 2048
+#define USB_CDC_DEV 1
+static volatile DWORD usb_cdc_tx_head;
+static volatile DWORD usb_cdc_tx_tail;
+static unsigned char usb_cdc_txq[USB_CDC_TXQ];
+static BYTE usb_cdc_dma_buf[512] __attribute__((aligned(16)));
+static BYTE usb_cdc_rx_dma[512] __attribute__((aligned(16)));
+static volatile int usb_cdc_ready;
+static volatile int usb_cdc_pumping;
+static volatile int usb_cdc_bulk_io_quiesced;
+static BYTE usb_cdc_ep_out;
+static BYTE usb_cdc_ep_in;
+static WORD usb_cdc_mps_out;
+static WORD usb_cdc_mps_in;
+static BYTE usb_cdc_comm_if;
+static int usb_cdc_in_skip;
+static unsigned char usb_cdc_line[USB_DEBUG_LINE_MAX];
+static unsigned int usb_cdc_linelen;
+static unsigned int usb_cdc_kexec_left;
+static unsigned int usb_cdc_kexec_got;
+static unsigned int usb_cdc_kexec_size;
+static unsigned char *usb_cdc_kexec_img;
+static unsigned int usb_cdc_discard;
+static unsigned int usb_cdc_kexec_seq;
+static volatile int usb_cdc_kexec_finish_pending;
+static unsigned int usb_cdc_kexec_stall;
+static int usb_cdc_rx_seen;
+static int usb_cdc_tx_fails;
+
 static int usb_enumerate_msc(void);
 static int usb_xhci_recover(void);
 static int usb_publish_storage_devices(void);
 static void usb_xhci_hotplug_monitor(void);
+static void usb_cdc_after_msc(void);
 
 static int usb_for_each_part(int (*cb)(int deviceid))
 {
@@ -289,6 +356,17 @@ static void usb_wait_ms(int ms)
             return;
     }
     /* busy-wait fallback (~1ms * ms on typical QEMU) */
+    while (ms-- > 0) {
+        DWORD i;
+        for (i = 0; i < 20000; i++)
+            usb_io_delay();
+    }
+}
+
+/* Bounded millisecond spin that never waits on `ticks` (USB probe can
+   run before the scheduler). usb_wait_ms with ticks==0 spins 20e6. */
+static void usb_spin_ms(int ms)
+{
     while (ms-- > 0) {
         DWORD i;
         for (i = 0; i < 20000; i++)
@@ -479,11 +557,18 @@ static int uhci_bulk(BYTE endp, int in, BYTE *data, int len, BYTE *toggle)
     return 1;
 }
 
-static int usb_ctrl(usb_setup *setup, void *data, int len)
+static int usb_ctrl_dev(DWORD dev, usb_setup *setup, void *data, int len)
 {
     if (usb_host == USB_HOST_XHCI)
-        return xhci_control(usb_xhci_hcd, 0, setup, data, len);
+        return xhci_control(usb_xhci_hcd, dev, setup, data, len);
+    if (dev != 0)
+        return 0;
     return uhci_ctrl(setup, data, len);
+}
+
+static int usb_ctrl(usb_setup *setup, void *data, int len)
+{
+    return usb_ctrl_dev(0, setup, data, len);
 }
 
 static int usb_bulk(BYTE endp, int in, BYTE *data, int len, BYTE *toggle)
@@ -493,7 +578,8 @@ static int usb_bulk(BYTE endp, int in, BYTE *data, int len, BYTE *toggle)
     return uhci_bulk(endp, in, data, len, toggle);
 }
 
-static int usb_get_desc(BYTE type, BYTE index, void *buf, WORD len)
+static int usb_get_desc_dev(DWORD dev, BYTE type, BYTE index, void *buf,
+                            WORD len)
 {
     usb_setup s;
     memset(&s, 0, sizeof(s));
@@ -503,18 +589,22 @@ static int usb_get_desc(BYTE type, BYTE index, void *buf, WORD len)
     s.wIndex = 0;
     s.wLength = len;
     memset(usb_dma_buf, 0, sizeof(usb_dma_buf));
-    if (!usb_ctrl(&s, usb_dma_buf, len))
+    if (!usb_ctrl_dev(dev, &s, usb_dma_buf, len))
         return 0;
     memcpy(buf, usb_dma_buf, len);
     return 1;
+}
+
+static int usb_get_desc(BYTE type, BYTE index, void *buf, WORD len)
+{
+    return usb_get_desc_dev(0, type, index, buf, len);
 }
 
 static int usb_set_address(BYTE addr)
 {
     usb_setup s;
     if (usb_host == USB_HOST_XHCI) {
-        if (!xhci_address_device(usb_xhci_hcd, 0, 0))
-            return 0;
+        /* Address Device already ran with BSR=0 in xhci_claim_port(). */
         usb_devaddr = addr;
         return 1;
     }
@@ -529,14 +619,19 @@ static int usb_set_address(BYTE addr)
     return 1;
 }
 
-static int usb_set_config(BYTE cfg)
+static int usb_set_config_dev(DWORD dev, BYTE cfg)
 {
     usb_setup s;
     memset(&s, 0, sizeof(s));
     s.bmRequestType = 0x00;
     s.bRequest = USB_REQ_SET_CONFIGURATION;
     s.wValue = cfg;
-    return usb_ctrl(&s, 0, 0);
+    return usb_ctrl_dev(dev, &s, 0, 0);
+}
+
+static int usb_set_config(BYTE cfg)
+{
+    return usb_set_config_dev(0, cfg);
 }
 
 static int usb_msc_bot_once(BYTE *cdb, int cdb_len, int in, BYTE *data,
@@ -720,20 +815,23 @@ static int usb_scsi_rw(int write, DWORD lba, DWORD nblocks, char *buf)
 static int usb_read_block_raw(u64 block, char *blockbuff, DWORD numblocks)
 {
     int result;
-    spin_lock(&usb_io_lock);
+    usb_io_lock_acquire();
     result = usb_drive.present
         ? usb_scsi_rw(0, (DWORD)block, numblocks, blockbuff) : 0;
-    spin_unlock(&usb_io_lock);
+    usb_io_lock_release();
+    /* Re-arm CDC IN after MSC (skipped while ELF stream quiesced). */
+    usb_cdc_after_msc();
     return result;
 }
 
 static int usb_write_block_raw(u64 block, char *blockbuff, DWORD numblocks)
 {
     int result;
-    spin_lock(&usb_io_lock);
+    usb_io_lock_acquire();
     result = usb_drive.present
         ? usb_scsi_rw(1, (DWORD)block, numblocks, blockbuff) : 0;
-    spin_unlock(&usb_io_lock);
+    usb_io_lock_release();
+    usb_cdc_after_msc();
     return result;
 }
 
@@ -853,15 +951,15 @@ static int usb_flush_device(void)
     int result;
     if (!usb_context_is_current())
         return -1;
-    spin_lock(&usb_io_lock);
+    usb_io_lock_acquire();
     if (!usb_drive.present) {
-        spin_unlock(&usb_io_lock);
+        usb_io_lock_release();
         return -1;
     }
     memset(cdb, 0, sizeof(cdb));
     cdb[0] = SCSI_SYNC_CACHE10;
     result = usb_msc_bot(cdb, 10, 0, 0, 0);
-    spin_unlock(&usb_io_lock);
+    usb_io_lock_release();
     if (!result) {
         printf("usb: SYNCHRONIZE CACHE failed\n");
         return -1;
@@ -1163,6 +1261,11 @@ static int usb_enumerate_msc(void)
     usb_devaddr = 0;
     usb_toggle_in = 0;
     usb_toggle_out = 0;
+    if (usb_host == USB_HOST_XHCI)
+        printf("usb: enumerate port=%u speed=%u slot=%u\n",
+               usb_xhci_hcd->usbdevs[0].port,
+               usb_xhci_hcd->usbdevs[0].speed,
+               usb_xhci_hcd->usbdevs[0].slot);
 
     if (!usb_get_desc(USB_DESC_DEVICE, 0, devdesc, 8))
         return 0;
@@ -1173,6 +1276,13 @@ static int usb_enumerate_msc(void)
         return 0;
     if (!usb_get_desc(USB_DESC_DEVICE, 0, devdesc, 18))
         return 0;
+    printf("usb: vid=%04x pid=%04x class=%u subclass=%u proto=%u\n",
+           (unsigned)(devdesc[8] | (devdesc[9] << 8)),
+           (unsigned)(devdesc[10] | (devdesc[11] << 8)),
+           (unsigned)devdesc[4], (unsigned)devdesc[5],
+           (unsigned)devdesc[6]);
+    if (devdesc[4] == 9)
+        printf("usb: hub (no hub driver yet)\n");
     if (!usb_get_desc(USB_DESC_CONFIG, 0, cfghdr, 9))
         return 0;
     total = cfghdr[2] | (cfghdr[3] << 8);
@@ -1212,20 +1322,825 @@ static int usb_enumerate_msc(void)
     return 1;
 }
 
+static int usb_xhci_bind_msc(void)
+{
+    DWORD port;
+    DWORD ccs;
+
+    ccs = xhci_port_ccs_mask(usb_xhci_hcd);
+    if (!ccs)
+        ccs = xhci_wait_connected_ports(usb_xhci_hcd);
+    printf("xhci: bind ccs=0x%x\n", ccs);
+    usb_xhci_hcd->enumerating = 1;
+    usb_xhci_hcd->recovery_needed = 0;
+    for (port = 1; port <= usb_xhci_hcd->max_ports && port <= 32; port++) {
+        if (!(xhci_port_ccs_mask(usb_xhci_hcd) & xhci_ccs_bit(port)))
+            continue;
+        printf("xhci: trying port %u\n", port);
+        if (!xhci_claim_port(usb_xhci_hcd, port))
+            continue;
+        if (usb_enumerate_msc()) {
+            usb_xhci_hcd->enumerating = 0;
+            return 1;
+        }
+        printf("xhci: port %u not mass-storage\n", port);
+        xhci_release_dev(usb_xhci_hcd, 0);
+        usb_xhci_hcd->recovery_needed = 0;
+    }
+    usb_xhci_hcd->enumerating = 0;
+    return 0;
+}
+
+static void usb_cdc_reset_state(void)
+{
+    if (usb_xhci_hcd)
+        xhci_cdc_in_drop(usb_xhci_hcd);
+    usb_cdc_ready = 0;
+    usb_cdc_tx_head = 0;
+    usb_cdc_tx_tail = 0;
+    usb_cdc_ep_out = 0;
+    usb_cdc_ep_in = 0;
+    usb_cdc_mps_out = 64;
+    usb_cdc_mps_in = 64;
+    usb_cdc_comm_if = 0;
+    usb_cdc_in_skip = 0;
+    usb_cdc_linelen = 0;
+    usb_cdc_kexec_left = 0;
+    usb_cdc_kexec_got = 0;
+    usb_cdc_kexec_size = 0;
+    usb_cdc_discard = 0;
+    usb_cdc_kexec_seq = 0;
+    usb_cdc_kexec_finish_pending = 0;
+    usb_cdc_kexec_stall = 0;
+    usb_cdc_rx_seen = 0;
+    usb_cdc_tx_fails = 0;
+    if (usb_cdc_kexec_img) {
+        free(usb_cdc_kexec_img);
+        usb_cdc_kexec_img = 0;
+    }
+}
+
+static DWORD usb_cdc_tx_space(void)
+{
+    DWORD head = usb_cdc_tx_head;
+    DWORD tail = usb_cdc_tx_tail;
+    DWORD next = (head + 1) % USB_CDC_TXQ;
+    if (next == tail)
+        return 0;
+    if (head >= tail)
+        return USB_CDC_TXQ - 1 - (head - tail);
+    return tail - head - 1;
+}
+
+static int usb_cdc_pump_tx(void);
+
+void usb_cdc_putc(int c)
+{
+    DWORD next;
+    unsigned long flags;
+    unsigned char byte;
+    if (!usb_cdc_ready)
+        return;
+    byte = (unsigned char)c;
+    __asm__ __volatile__("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    if (byte == '\n') {
+        next = (usb_cdc_tx_head + 1) % USB_CDC_TXQ;
+        if (next != usb_cdc_tx_tail) {
+            usb_cdc_txq[usb_cdc_tx_head] = '\r';
+            usb_cdc_tx_head = next;
+        }
+    }
+    next = (usb_cdc_tx_head + 1) % USB_CDC_TXQ;
+    if (next != usb_cdc_tx_tail) {
+        usb_cdc_txq[usb_cdc_tx_head] = byte;
+        usb_cdc_tx_head = next;
+    }
+    if (flags & (1ULL << 9))
+        __asm__ __volatile__("sti" : : : "memory");
+}
+
+int usb_cdc_write_raw(const void *p, int n)
+{
+    const unsigned char *s = (const unsigned char *)p;
+    int i;
+    if (!usb_cdc_ready || !s || n <= 0)
+        return 0;
+    for (i = 0; i < n; i++) {
+        DWORD next;
+        unsigned long flags;
+        unsigned spins = 0;
+        while (usb_cdc_tx_space() == 0 && spins++ < 64)
+            usb_cdc_pump_tx();
+        __asm__ __volatile__("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+        next = (usb_cdc_tx_head + 1) % USB_CDC_TXQ;
+        if (next != usb_cdc_tx_tail) {
+            usb_cdc_txq[usb_cdc_tx_head] = s[i];
+            usb_cdc_tx_head = next;
+        }
+        if (flags & (1ULL << 9))
+            __asm__ __volatile__("sti" : : : "memory");
+    }
+    usb_cdc_pump_tx();
+    return n;
+}
+
+int usb_cdc_present(void)
+{
+    return usb_cdc_ready;
+}
+
+static void usb_cdc_reply_ok(unsigned int seq, const void *payload, int n)
+{
+    char hdr[48];
+    char end[32];
+    int hn, en;
+    if (n < 0)
+        n = 0;
+    hn = usb_debug_format_ok(hdr, (int)sizeof(hdr), seq, (unsigned int)n);
+    if (hn)
+        usb_cdc_write_raw(hdr, hn);
+    if (n && payload)
+        usb_cdc_write_raw(payload, n);
+    en = usb_debug_format_end(end, (int)sizeof(end), seq);
+    if (en)
+        usb_cdc_write_raw(end, en);
+}
+
+static void usb_cdc_reply_err(unsigned int seq, int code, const char *msg)
+{
+    char line[80];
+    int n = sprintf(line, "%cICS %u ERR %d %s\n",
+                    (char)USB_DEBUG_RS, seq, code, msg ? msg : "err");
+    if (n > 0)
+        usb_cdc_write_raw(line, n);
+}
+
+static void usb_cdc_send_status(unsigned int seq)
+{
+    char body[512];
+    char ver[192];
+    unsigned int fw = 0, fh = 0, fb = 0;
+    int vn, n;
+    vn = usb_debug_format_status_ver(ver, (int)sizeof(ver),
+                                     ICSOS_RELEASE, ICSOS_GIT_HASH,
+                                     ICSOS_GIT_DIRTY[0] == '1',
+                                     ICSOS_BUILD_TS,
+                                     __DATE__ " " __TIME__);
+    n = sprintf(body,
+                "cdc=1\nusb_root=%d\nfb=%ux%u bpp=%u\nklog=%u\nkexeced=%d\n"
+                "%scmdline=%s\n",
+                usb_storage_available() ? 1 : 0,
+                fbconsole_geom(&fw, &fh, &fb) ? fw : 0,
+                fh, fb, klog_count(), kernel_kexeced ? 1 : 0,
+                vn > 0 ? ver : "",
+                kernel_cmdline[0] ? kernel_cmdline : "");
+    if (n < 0)
+        n = 0;
+    usb_cdc_reply_ok(seq, body, n);
+}
+
+static void usb_cdc_send_screen(unsigned int seq)
+{
+    unsigned char cells[80 * 25 * 2];
+    char text[80 * 25 + 25 + 1];
+    int n;
+    if (!ActiveDDL) {
+        usb_cdc_reply_err(seq, USB_DEBUG_ERR_IO, "no-ddl");
+        return;
+    }
+    Dex32GetText(ActiveDDL, 0, 0, 79, 24, (char *)cells);
+    n = usb_debug_screen_text(cells, 80, 25, text, (int)sizeof(text));
+    usb_cdc_reply_ok(seq, text, n);
+}
+
+static void usb_cdc_send_fb(unsigned int seq, unsigned int scale)
+{
+    unsigned int sw = 0, sh = 0, bpp = 0, dw, dh, x, y;
+    char hdr[32];
+    int hn;
+    if (!fbconsole_geom(&sw, &sh, &bpp) || !sw || !sh) {
+        usb_cdc_reply_err(seq, USB_DEBUG_ERR_IO, "no-fb");
+        return;
+    }
+    usb_debug_fb_size(sw, sh, scale, &dw, &dh);
+    hn = usb_debug_ppm_header(hdr, (int)sizeof(hdr), dw, dh);
+    {
+        char ok[48];
+        int n = usb_debug_format_ok(ok, (int)sizeof(ok), seq,
+                                    (unsigned int)hn + dw * dh * 3u);
+        if (n)
+            usb_cdc_write_raw(ok, n);
+    }
+    if (hn)
+        usb_cdc_write_raw(hdr, hn);
+    for (y = 0; y < dh; y++) {
+        unsigned char row[16 * 3];
+        unsigned int xi = 0;
+        for (x = 0; x < dw; x++) {
+            unsigned char r = 0, g = 0, b = 0;
+            unsigned int sx = x * usb_debug_fb_scale(scale);
+            unsigned int sy = y * usb_debug_fb_scale(scale);
+            fbconsole_rgb_at(sx, sy, &r, &g, &b);
+            row[xi++] = r;
+            row[xi++] = g;
+            row[xi++] = b;
+            if (xi >= sizeof(row)) {
+                usb_cdc_write_raw(row, (int)xi);
+                xi = 0;
+            }
+        }
+        if (xi)
+            usb_cdc_write_raw(row, (int)xi);
+    }
+    {
+        char end[32];
+        int n = usb_debug_format_end(end, (int)sizeof(end), seq);
+        if (n)
+            usb_cdc_write_raw(end, n);
+    }
+}
+
+static void usb_cdc_handle_req(const usb_debug_req *req)
+{
+    unsigned int i;
+    if (!req)
+        return;
+    if (req->verb == USB_DEBUG_VERB_PING)
+        return;
+    if (req->verb == USB_DEBUG_VERB_KEYS) {
+        for (i = 0; i < req->nkeys; i++)
+            tty_input_fg(req->keys[i]);
+        usb_cdc_reply_ok(req->seq, 0, 0);
+        return;
+    }
+    if (req->verb == USB_DEBUG_VERB_CMD) {
+        /* Do not console_execute on the hotplug/CDC pump thread: that
+           nested VFS/MSC under pump and hung Intel after the first ls.
+           Inject as keystrokes so the console thread runs the command. */
+        if (req->cmd[0]) {
+            const char *p = req->cmd;
+            while (*p)
+                tty_input_fg((unsigned char)*p++);
+            tty_input_fg('\r');
+        }
+        usb_cdc_reply_ok(req->seq, 0, 0);
+        return;
+    }
+    if (req->verb == USB_DEBUG_VERB_STATUS) {
+        usb_cdc_send_status(req->seq);
+        return;
+    }
+    if (req->verb == USB_DEBUG_VERB_SCREEN) {
+        usb_cdc_send_screen(req->seq);
+        return;
+    }
+    if (req->verb == USB_DEBUG_VERB_FB) {
+        usb_cdc_send_fb(req->seq, req->fb_scale);
+        return;
+    }
+    if (req->verb == USB_DEBUG_VERB_DMESG) {
+        klog_dump(-1);
+        usb_cdc_reply_ok(req->seq, 0, 0);
+        return;
+    }
+    if (req->verb == USB_DEBUG_VERB_REBOOT) {
+        usb_cdc_reply_ok(req->seq, 0, 0);
+        machine_reboot();
+        return;
+    }
+    if (req->verb == USB_DEBUG_VERB_KEXEC) {
+        int i;
+        if (usb_cdc_kexec_img) {
+            free(usb_cdc_kexec_img);
+            usb_cdc_kexec_img = 0;
+        }
+        usb_cdc_kexec_size = req->kexec_bytes;
+        usb_cdc_kexec_got = 0;
+        usb_cdc_kexec_seq = req->seq;
+        usb_cdc_kexec_finish_pending = 0;
+        usb_cdc_kexec_stall = 0;
+        usb_cdc_kexec_left = 0;
+        if (!usb_cdc_kexec_size || usb_cdc_kexec_size > 8u * 1024u * 1024u) {
+            usb_cdc_reply_err(req->seq, USB_DEBUG_ERR_ARG, "size");
+            return;
+        }
+        usb_cdc_kexec_img = malloc(usb_cdc_kexec_size);
+        if (!usb_cdc_kexec_img) {
+            usb_cdc_discard = usb_cdc_kexec_size;
+            usb_cdc_reply_err(req->seq, USB_DEBUG_ERR_IO, "nomem");
+            return;
+        }
+        /* ACK before body so the Pico does not flood CDC IN during malloc. */
+        usb_cdc_reply_ok(req->seq, "ready", 5);
+        for (i = 0; i < 32; i++)
+            if (!usb_cdc_pump_tx())
+                break;
+        /* Drop any further console TX until the image is in — TX on the
+           shared event ring wedged CDC IN around ~700 KiB on N150. */
+        usb_cdc_tx_head = usb_cdc_tx_tail;
+        usb_cdc_kexec_left = usb_cdc_kexec_size;
+        serial_puts("usb-cdc: kexec ready\n");
+        return;
+    }
+}
+
+static void usb_cdc_kexec_abort(const char *why)
+{
+    if (usb_cdc_kexec_img) {
+        free(usb_cdc_kexec_img);
+        usb_cdc_kexec_img = 0;
+    }
+    usb_cdc_kexec_left = 0;
+    usb_cdc_kexec_got = 0;
+    usb_cdc_kexec_size = 0;
+    usb_cdc_kexec_finish_pending = 0;
+    usb_cdc_kexec_stall = 0;
+    usb_cdc_reply_err(usb_cdc_kexec_seq, USB_DEBUG_ERR_IO, why ? why : "abort");
+}
+
+static void usb_cdc_kexec_finish(void)
+{
+    int r;
+    if (!usb_cdc_kexec_img) {
+        usb_cdc_kexec_left = 0;
+        usb_cdc_kexec_finish_pending = 0;
+        return;
+    }
+    printf("usb-cdc: kexec image %u bytes, loading\n", usb_cdc_kexec_got);
+    r = kexec_load_mem(usb_cdc_kexec_img, usb_cdc_kexec_got);
+    if (r != 0) {
+        usb_cdc_kexec_abort("elf");
+        return;
+    }
+    /* ACK already drains via usb_cdc_write_raw→pump_tx. Do not spin more
+       USB OUT here — that hung N150 after a successful load (never reached
+       kexec_reboot; keyboard/CDC dead). */
+    usb_cdc_reply_ok(usb_cdc_kexec_seq, "done", 4);
+    free(usb_cdc_kexec_img);
+    usb_cdc_kexec_img = 0;
+    usb_cdc_kexec_left = 0;
+    usb_cdc_kexec_finish_pending = 0;
+    usb_cdc_kexec_stall = 0;
+    serial_puts("usb-cdc: kexec reboot\n");
+    kexec_reboot();
+}
+
+static void usb_cdc_feed(const unsigned char *p, int n)
+{
+    int i;
+    if (!p || n <= 0)
+        return;
+    if (!usb_cdc_rx_seen) {
+        usb_cdc_rx_seen = 1;
+        serial_puts("USB_CDC_RX\n");
+    }
+    for (i = 0; i < n; i++) {
+        unsigned char c = p[i];
+        if (usb_cdc_discard) {
+            usb_cdc_discard--;
+            continue;
+        }
+        if (usb_cdc_kexec_left && usb_cdc_kexec_img) {
+            usb_cdc_kexec_img[usb_cdc_kexec_got++] = c;
+            usb_cdc_kexec_left--;
+            usb_cdc_kexec_stall = 0;
+            /* No printf here — console TX during receive kills CDC IN. */
+            if ((usb_cdc_kexec_got & 0x1ffffu) == 0) {
+                char m[48];
+                int n = sprintf(m, "usb-cdc: kexec %u/%u\n",
+                                usb_cdc_kexec_got, usb_cdc_kexec_size);
+                if (n > 0)
+                    serial_puts(m);
+            }
+            if (!usb_cdc_kexec_left)
+                usb_cdc_kexec_finish_pending = 1;
+            continue;
+        }
+        if (c == '\n' || usb_cdc_linelen >= USB_DEBUG_LINE_MAX - 1) {
+            usb_debug_req req;
+            int parsed;
+            unsigned int j;
+            usb_cdc_line[usb_cdc_linelen] = 0;
+            parsed = usb_cdc_linelen ?
+                usb_debug_parse_line((char *)usb_cdc_line, &req) : USB_DEBUG_ERR_PARSE;
+            if (parsed == USB_DEBUG_OK)
+                usb_cdc_handle_req(&req);
+            else if (usb_cdc_linelen && usb_cdc_line[0] != USB_DEBUG_RS) {
+                for (j = 0; j < usb_cdc_linelen; j++)
+                    tty_input_fg(usb_cdc_line[j]);
+                if (c == '\n')
+                    tty_input_fg('\n');
+            }
+            usb_cdc_linelen = 0;
+            if (c != '\n' && c != '\r') {
+                usb_cdc_line[usb_cdc_linelen++] = c;
+            }
+            continue;
+        }
+        if (c == '\r')
+            continue;
+        usb_cdc_line[usb_cdc_linelen++] = c;
+    }
+}
+
+static int usb_cdc_pump_tx(void);
+static void usb_cdc_feed_in(unsigned char *p, int n);
+
+/* After MSC: take a stashed CDC IN if complete and re-post if idle.
+   Arm-only (timeout 0) — never the full 40k-spin empty poll. Skipped while
+   ELF stream quiesced so hello.exe loads stay fast. Called after each
+   block unlock and from usb_cdc_bulk_io_end. */
+static void usb_cdc_after_msc(void)
+{
+    int got = 0;
+    unsigned int cap;
+    unsigned char rx[512];
+
+    if (!usb_cdc_ready || !usb_xhci_hcd || !usb_cdc_ep_in)
+        return;
+    /* Boot FAT mount hammers MSC before hotplug pumps CDC; arming there
+       raced with BOT and left IN dead (STATUS 504 at idle prompt). */
+    if (!usb_hotplug_monitor_started)
+        return;
+    if (usb_cdc_pumping || usb_io_lock.locked || usb_cdc_bulk_io_quiesced)
+        return;
+    usb_cdc_pumping = 1;
+    usb_io_lock_acquire();
+    /* Always post the full DMA buffer so len never mismatches a live TRB. */
+    cap = sizeof(usb_cdc_rx_dma);
+    if (xhci_bulk_in_try(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_in,
+                         usb_cdc_rx_dma, (int)cap, &got, 0) && got > 0) {
+        if (got > (int)sizeof(rx))
+            got = (int)sizeof(rx);
+        memcpy(rx, usb_cdc_rx_dma, (unsigned)got);
+    } else {
+        got = 0;
+    }
+    usb_io_lock_release();
+    usb_cdc_pumping = 0;
+    if (got)
+        usb_cdc_feed_in(rx, got);
+}
+
+void usb_cdc_bulk_io_begin(void)
+{
+    int waits;
+
+    /* Signal first so in-flight CDC next_event aborts and releases the lock. */
+    usb_cdc_bulk_io_quiesced = 1;
+    usb_cdc_tx_head = usb_cdc_tx_tail;
+    for (waits = 0; waits < 100000; waits++) {
+        if (!usb_io_lock.locked && !usb_cdc_pumping)
+            break;
+        taskswitch();
+    }
+    if (usb_io_lock.locked || usb_cdc_pumping) {
+        usb_cdc_pumping = 0;
+        usb_io_lock.locked = 0;
+    }
+    if (!usb_cdc_ready || !usb_xhci_hcd)
+        return;
+    usb_io_lock_acquire();
+    /* Take completed IN only. Do not abandon a live TRB (ring desync
+       killed Pico RPC after MSC). Pump stays off via quiesced. */
+    if (xhci_cdc_in_pending && xhci_cdc_in_done)
+        (void)xhci_cdc_in_take(0, 0);
+    usb_io_lock_release();
+}
+
+void usb_cdc_bulk_io_end(void)
+{
+    if (!usb_cdc_ready) {
+        usb_cdc_bulk_io_quiesced = 0;
+        return;
+    }
+    usb_cdc_bulk_io_quiesced = 0;
+    usb_cdc_after_msc();
+    (void)usb_cdc_pump_tx();
+}
+
+static int usb_cdc_pump_tx(void)
+{
+    DWORD head, tail, n, i, cap;
+    unsigned long flags;
+    if (!usb_cdc_ready || usb_cdc_pumping || usb_host != USB_HOST_XHCI)
+        return 0;
+    if (usb_cdc_bulk_io_quiesced || usb_io_lock.locked)
+        return 0;
+    usb_cdc_pumping = 1;
+    usb_io_lock_acquire();
+    __asm__ __volatile__("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    tail = usb_cdc_tx_tail;
+    head = usb_cdc_tx_head;
+    cap = usb_cdc_mps_out;
+    if (!cap || cap > sizeof(usb_cdc_dma_buf))
+        cap = sizeof(usb_cdc_dma_buf);
+    n = 0;
+    while (tail != head && n < cap) {
+        usb_cdc_dma_buf[n++] = usb_cdc_txq[tail];
+        tail = (tail + 1) % USB_CDC_TXQ;
+    }
+    usb_cdc_tx_tail = tail;
+    if (flags & (1ULL << 9))
+        __asm__ __volatile__("sti" : : : "memory");
+    i = 0;
+    if (n) {
+        if (!xhci_bulk(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_out, 0,
+                       usb_cdc_dma_buf, (int)n)) {
+            serial_puts("USB_CDC_TX_FAIL\n");
+            usb_cdc_tx_fails++;
+            if (usb_cdc_tx_fails > 8)
+                usb_cdc_ready = 0;
+            n = 0;
+        } else {
+            usb_cdc_tx_fails = 0;
+            i = n;
+        }
+    }
+    usb_io_lock_release();
+    usb_cdc_pumping = 0;
+    return (int)i;
+}
+
+static void usb_cdc_feed_in(unsigned char *p, int n)
+{
+    if (usb_cdc_in_skip) {
+        if (n <= usb_cdc_in_skip)
+            return;
+        p += usb_cdc_in_skip;
+        n -= usb_cdc_in_skip;
+    }
+    usb_cdc_feed(p, n);
+}
+
+int usb_cdc_pump(void)
+{
+    int sent = 0;
+    int got = 0;
+    unsigned int cap;
+    unsigned char rx[512];
+    int packets;
+
+    if (!usb_cdc_ready || usb_cdc_pumping || usb_host != USB_HOST_XHCI)
+        return 0;
+    /* ELF stream load: no CDC IN or OUT — OUT during MSC hung hello.exe. */
+    if (usb_cdc_bulk_io_quiesced)
+        return 0;
+    if (usb_io_lock.locked || !usb_cdc_ep_in)
+        return usb_cdc_pump_tx();
+
+    /* Poll a posted IN first so a Pico write can complete before TX
+       cancels that TRB for the shared event ring. */
+    usb_cdc_pumping = 1;
+    usb_io_lock_acquire();
+    cap = sizeof(usb_cdc_rx_dma);
+    if (xhci_bulk_in_try(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_in,
+                         usb_cdc_rx_dma, (int)cap, &got,
+                         XHCI_CDC_IN_SPINS) && got > 0) {
+        if (got > (int)sizeof(rx))
+            got = (int)sizeof(rx);
+        memcpy(rx, usb_cdc_rx_dma, (unsigned)got);
+    } else {
+        got = 0;
+    }
+    usb_io_lock_release();
+    usb_cdc_pumping = 0;
+    if (got) {
+        /* Re-arm bulk IN before handling the RPC. STATUS/SCREEN replies
+           TX for a long time; without a posted IN the Pico's next write
+           is dropped and gadget RPC stays 504 after the first MSC+STATUS. */
+        usb_cdc_pumping = 1;
+        usb_io_lock_acquire();
+        cap = sizeof(usb_cdc_rx_dma);
+        (void)xhci_bulk_in_try(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_in,
+                               usb_cdc_rx_dma, (int)cap, 0, 0);
+        usb_io_lock_release();
+        usb_cdc_pumping = 0;
+        usb_cdc_feed_in(rx, got);
+    }
+
+    /* While absorbing a kexec image, do not TX — shared event ring. */
+    if (!usb_cdc_kexec_left && !usb_cdc_kexec_finish_pending) {
+        for (packets = 0; packets < 32; packets++) {
+            int n = usb_cdc_pump_tx();
+            sent += n;
+            if (!n)
+                break;
+        }
+    }
+
+    got = 0;
+    if (usb_cdc_ready && !usb_cdc_pumping && !usb_io_lock.locked &&
+        usb_cdc_ep_in) {
+        usb_cdc_pumping = 1;
+        usb_io_lock_acquire();
+        cap = sizeof(usb_cdc_rx_dma);
+        if (xhci_bulk_in_try(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_in,
+                             usb_cdc_rx_dma, (int)cap, &got,
+                             XHCI_CDC_IN_SPINS) && got > 0) {
+            if (got > (int)sizeof(rx))
+                got = (int)sizeof(rx);
+            memcpy(rx, usb_cdc_rx_dma, (unsigned)got);
+        } else {
+            got = 0;
+        }
+        usb_io_lock_release();
+        usb_cdc_pumping = 0;
+        if (got)
+            usb_cdc_feed_in(rx, got);
+    }
+    /* Receive kexec with short bursts + yields. The old 400k×IN_SPINS
+       drain froze the BSP (keyboard dead) when the Pico finished TX
+       before every byte landed. */
+    if (usb_cdc_kexec_left && usb_cdc_ready && !usb_io_lock.locked) {
+        int bursts;
+        for (bursts = 0; bursts < 8 && usb_cdc_kexec_left; bursts++) {
+            got = 0;
+            usb_cdc_pumping = 1;
+            usb_io_lock_acquire();
+            cap = sizeof(usb_cdc_rx_dma);
+            if (xhci_bulk_in_try(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_in,
+                                 usb_cdc_rx_dma, (int)cap, &got,
+                                 XHCI_CDC_IN_SPINS) && got > 0) {
+                if (got > (int)sizeof(rx))
+                    got = (int)sizeof(rx);
+                memcpy(rx, usb_cdc_rx_dma, (unsigned)got);
+            } else {
+                got = 0;
+            }
+            usb_io_lock_release();
+            usb_cdc_pumping = 0;
+            if (got)
+                usb_cdc_feed_in(rx, got);
+            else
+                break;
+            taskswitch();
+        }
+        if (usb_cdc_kexec_left && ++usb_cdc_kexec_stall > 3000) {
+            printf("usb-cdc: kexec stall got=%u left=%u\n",
+                   usb_cdc_kexec_got, usb_cdc_kexec_left);
+            usb_cdc_kexec_abort("stall");
+        }
+    }
+    if (usb_cdc_kexec_finish_pending && !usb_cdc_kexec_left)
+        usb_cdc_kexec_finish();
+    return sent;
+}
+
+static void usb_cdc_pump_flush(void)
+{
+    int i;
+    for (i = 0; i < 64; i++)
+        if (!usb_cdc_pump_tx())
+            break;
+}
+
+static int usb_cdc_set_line(void)
+{
+    usb_setup s;
+    BYTE coding[7];
+    DWORD baud = 115200;
+    memset(&s, 0, sizeof(s));
+    memset(coding, 0, sizeof(coding));
+    coding[0] = (BYTE)baud;
+    coding[1] = (BYTE)(baud >> 8);
+    coding[2] = (BYTE)(baud >> 16);
+    coding[3] = (BYTE)(baud >> 24);
+    coding[4] = 0;
+    coding[5] = 0;
+    coding[6] = 8;
+    memcpy(usb_cdc_dma_buf, coding, 7);
+    s.bmRequestType = 0x21;
+    s.bRequest = USB_CDC_REQ_SET_LINE_CODING;
+    s.wIndex = usb_cdc_comm_if;
+    s.wLength = 7;
+    if (!usb_ctrl_dev(USB_CDC_DEV, &s, usb_cdc_dma_buf, 7))
+        return 0;
+    memset(&s, 0, sizeof(s));
+    s.bmRequestType = 0x21;
+    s.bRequest = USB_CDC_REQ_SET_CONTROL_LINE_STATE;
+    s.wValue = USB_CDC_LINE_DTR | USB_CDC_LINE_RTS;
+    s.wIndex = usb_cdc_comm_if;
+    return usb_ctrl_dev(USB_CDC_DEV, &s, 0, 0);
+}
+
+static int usb_enumerate_cdc(void)
+{
+    BYTE devdesc[18];
+    BYTE cfghdr[9];
+    BYTE cfg[256];
+    WORD total;
+    usb_cdc_acm_info info;
+
+    if (!usb_get_desc_dev(USB_CDC_DEV, USB_DESC_DEVICE, 0, devdesc, 8))
+        return 0;
+    if (!xhci_set_ep0_packet_size(usb_xhci_hcd, USB_CDC_DEV, devdesc[7]))
+        return 0;
+    if (!usb_get_desc_dev(USB_CDC_DEV, USB_DESC_DEVICE, 0, devdesc, 18))
+        return 0;
+    printf("usb: cdc vid=%04x pid=%04x class=%u\n",
+           (unsigned)(devdesc[8] | (devdesc[9] << 8)),
+           (unsigned)(devdesc[10] | (devdesc[11] << 8)),
+           (unsigned)devdesc[4]);
+    if (devdesc[4] == 9)
+        return 0;
+    if (!usb_get_desc_dev(USB_CDC_DEV, USB_DESC_CONFIG, 0, cfghdr, 9))
+        return 0;
+    total = cfghdr[2] | (cfghdr[3] << 8);
+    if (total < 9 || total > sizeof(cfg))
+        total = 9;
+    if (!usb_get_desc_dev(USB_CDC_DEV, USB_DESC_CONFIG, 0, cfg, total))
+        return 0;
+    {
+        int acm = usb_parse_cdc_acm(cfg, total, &info);
+        if (!acm && !usb_parse_vendor_bulk_serial(cfg, total, &info)) {
+            printf("usb: no CDC-ACM or vendor serial interface\n");
+            return 0;
+        }
+        if (!acm)
+            printf("usb: vendor bulk serial (FTDI-style)\n");
+        if (!usb_set_config_dev(USB_CDC_DEV, info.cfgval))
+            return 0;
+        if (!xhci_configure_endpoints(usb_xhci_hcd, USB_CDC_DEV,
+                                      info.ep_in, info.mps_in, info.burst_in,
+                                      info.ep_out, info.mps_out,
+                                      info.burst_out))
+            return 0;
+        usb_cdc_ep_in = info.ep_in;
+        usb_cdc_ep_out = info.ep_out;
+        usb_cdc_mps_out = info.mps_out;
+        usb_cdc_mps_in = info.mps_in;
+        usb_cdc_comm_if = info.comm_if;
+        usb_cdc_in_skip = acm ? 0 : 2;
+        if (acm)
+            (void)usb_cdc_set_line();
+        printf("usb: serial console endpoints in=%d out=%d acm=%d\n",
+               usb_cdc_ep_in, usb_cdc_ep_out, acm);
+    }
+    return 1;
+}
+
+static int usb_xhci_bind_cdc(void)
+{
+    DWORD port;
+    DWORD msc_port;
+
+    usb_cdc_reset_state();
+    if (!usb_xhci_hcd)
+        return 0;
+    msc_port = usb_xhci_hcd->usbdevs[0].port;
+    usb_xhci_hcd->enumerating = 1;
+    usb_xhci_hcd->recovery_needed = 0;
+    for (port = 1; port <= usb_xhci_hcd->max_ports && port <= 32; port++) {
+        if (port == msc_port)
+            continue;
+        if (!(xhci_port_ccs_mask(usb_xhci_hcd) & xhci_ccs_bit(port)))
+            continue;
+        printf("xhci: trying CDC port %u\n", port);
+        if (!xhci_claim_port_dev(usb_xhci_hcd, port, USB_CDC_DEV))
+            continue;
+        if (usb_enumerate_cdc()) {
+            char ver[192];
+            int vn;
+            usb_xhci_hcd->enumerating = 0;
+            usb_cdc_ready = 1;
+            serial_puts("USB_CDC_CONSOLE_OK\n");
+            vn = usb_debug_format_icsos_ver(ver, (int)sizeof(ver),
+                                            ICSOS_RELEASE, ICSOS_GIT_HASH,
+                                            ICSOS_GIT_DIRTY[0] == '1',
+                                            ICSOS_BUILD_TS,
+                                            __DATE__ " " __TIME__);
+            if (vn > 0)
+                serial_puts(ver);
+            printf("usb: CDC-ACM console ready\n");
+            usb_cdc_pump_flush();
+            return 1;
+        }
+        printf("xhci: port %u not CDC-ACM\n", port);
+        xhci_release_dev(usb_xhci_hcd, USB_CDC_DEV);
+        usb_xhci_hcd->recovery_needed = 0;
+    }
+    usb_xhci_hcd->enumerating = 0;
+    return 0;
+}
+
 static int usb_xhci_recover(void)
 {
     usb_xhci_recovering = 1;
+    usb_cdc_reset_state();
     xhci_stop_hcd(usb_xhci_hcd);
     usb_xhci_hcd->recovery_needed = 0;
-    if (!xhci_init_hcd(usb_xhci_hcd) || !usb_enumerate_msc()) {
+    if (!xhci_init_hcd(usb_xhci_hcd) || !usb_xhci_bind_msc()) {
         printf("xhci: controller recovery failed\n");
         xhci_stop_hcd(usb_xhci_hcd);
         usb_xhci_hcd->recovery_needed = 1;
         usb_drive.present = 0;
         usb_invalidate_storage_cache();
         usb_xhci_recovering = 0;
+        usb_cdc_reset_state();
         return 0;
     }
+    usb_xhci_bind_cdc();
     usb_xhci_recovery_count++;
     usb_xhci_hcd->recovery_needed = 0;
     usb_drive.present = 1;
@@ -1245,10 +2160,12 @@ static int usb_xhci_reconnect(void)
        without publishing it, yet must still verify the replacement. */
     int initial_attach = (old_blocks == 0);
     usb_xhci_recovering = 1;
+    usb_cdc_reset_state();
     xhci_stop_hcd(usb_xhci_hcd);
     usb_xhci_hcd->recovery_needed = 0;
-    if (!xhci_init_hcd(usb_xhci_hcd) || !usb_enumerate_msc())
+    if (!xhci_init_hcd(usb_xhci_hcd) || !usb_xhci_bind_msc())
         goto fail;
+    usb_xhci_bind_cdc();
     if (!initial_attach) {
         if (usb_drive.total_blocks != old_blocks ||
             usb_drive.block_size != old_block_size)
@@ -1281,18 +2198,19 @@ static void usb_xhci_hotplug_monitor(void)
     int reconnect_blocked = 0;
     int offline_reported = !usb_media_established;
     for (;;) {
-        delay(100);
+        usb_cdc_pump();
+        delay(xhci_cdc_hotplug_delay(usb_cdc_ready));
         if (usb_host != USB_HOST_XHCI)
             continue;
         if (usb_drive.present) {
             attach_samples = 0;
             reconnect_blocked = 0;
             offline_reported = 0;
-            if (!xhci_device_connected(usb_xhci_hcd) &&
+            if (!xhci_usbdev_connected(usb_xhci_hcd, 0) &&
                 !usb_io_lock.locked &&
                 __sync_bool_compare_and_swap(&usb_hotplug_transition,0,1)) {
                 if (!usb_io_lock.locked && usb_drive.present &&
-                    !xhci_device_connected(usb_xhci_hcd)) {
+                    !xhci_usbdev_connected(usb_xhci_hcd, 0)) {
                     usb_xhci_disconnect_offline();
                 }
                 __sync_lock_release(&usb_hotplug_transition);
@@ -1544,7 +2462,7 @@ static int usb_xhci_probe_msc(void)
     for (index = 0; index < count; index++) {
         usb_xhci_hcd = xhci_hcds[index];
         printf("usb: probing xHCI hcd=%u\n", index);
-        if (xhci_init_hcd(usb_xhci_hcd) && usb_enumerate_msc()) {
+        if (xhci_init_hcd(usb_xhci_hcd) && usb_xhci_bind_msc()) {
             printf("usb: selected xHCI hcd=%u\n", index);
             return 1;
         }
@@ -1561,6 +2479,7 @@ int usb_init(void)
     int port;
     int found_dev = 0;
 
+    kbd_boot_leds_raw(KBD_LED_NUM);
     memset(&usb_drive, 0, sizeof(usb_drive));
     memset(&usb_expected_identity, 0, sizeof(usb_expected_identity));
     usb_media_established = 0;
@@ -1683,6 +2602,8 @@ int usb_init(void)
     }
 
 register_device:
+    if (usb_host == USB_HOST_XHCI)
+        usb_xhci_bind_cdc();
     usb_drive.present = 1;
     return usb_publish_storage_devices() ? 0 : -1;
 }

@@ -83,6 +83,9 @@ DEX32_DDL_INFO *Dex32CreateDDL(){
    Dex32SetTextBackground(dev,BLACK);
     
    dev->curx=0;dev->cury=0;
+   dev->hist=(console_hist_t*)malloc(sizeof(console_hist_t));
+   if (dev->hist)
+      console_hist_init(dev->hist);
    if (ActiveDDL==0) {
       Dex32SetActiveDDL(dev);
    };
@@ -167,6 +170,8 @@ void Dex32Clear(DEX32_DDL_INFO *dev){
 //perform a scroll up
 void Dex32ScrollUp(DEX32_DDL_INFO *dev){
     DWORD vidmemloc=dev->buf_ptr;
+    if (dev->hist)
+       console_hist_push(dev->hist, (unsigned char *)vidmemloc);
     memmove((void*)vidmemloc,(void*)vidmemloc+0x000A0,3840);
     if (dev==ActiveDDL && dev->active && !dev->bufmode)
        fbconsole_screen_refresh();
@@ -359,6 +364,8 @@ int Dex32GetAttb(DEX32_DDL_INFO *dev){
 //destroy the device
 int Dex32FreeDDL(DEX32_DDL_INFO *dev){
    if (ActiveDDL!=dev){
+      if (dev && dev->hist)
+         free(dev->hist);
       free(dev);
       return 0;
    };

@@ -43,27 +43,34 @@ int fg_toggle(){
 static int fg_last = 0;
 static int fg_prefix = 0;
 
-static void fg_vga_status(const char *msg, unsigned char attr)
+static void fg_put_status_cells(char *base, const char *msg, unsigned char attr,
+                                int render)
 {
     int i;
-    if (fbconsole_active() && ActiveDDL && ActiveDDL->active &&
-        !ActiveDDL->bufmode) {
-       /* Framebuffer mode: the status line is row 24 of the active DDL;
-          write through the DDL so each cell renders to the framebuffer. */
-       for (i = 0; i < 80; i++)
-          Dex32PutChar(ActiveDDL, i, 24,
-                       (msg && msg[i]) ? msg[i] : ' ',
-                       (char)attr);
+    int ended = 0;
+    for (i = 0; i < 80; i++) {
+       char ch = ' ';
+       if (!ended && msg && msg[i])
+          ch = msg[i];
+       else
+          ended = 1;
+       if (base) {
+          base[(24 * 80 + i) * 2] = ch;
+          base[(24 * 80 + i) * 2 + 1] = (char)attr;
+       }
+       if (render)
+          fbconsole_cell_render(i, 24, (unsigned char)ch, attr);
+    }
+}
+
+static void fg_vga_status(const char *msg, unsigned char attr)
+{
+    if (fbconsole_active() && ActiveDDL) {
+       char *base = ActiveDDL->bufmode ? ActiveDDL->hdw_ptr : ActiveDDL->buf_ptr;
+       fg_put_status_cells(base, msg, attr, 1);
        return;
     }
-    {
-       volatile unsigned char *vga = (unsigned char *)0xB8000 + 24 * 80 * 2;
-       for (i = 0; i < 80; i++) {
-          char ch = (msg && msg[i]) ? msg[i] : ' ';
-          vga[i * 2] = (unsigned char)ch;
-          vga[i * 2 + 1] = attr;
-       }
-    }
+    fg_put_status_cells((char *)0xB8000, msg, attr, 0);
 }
 
 void fg_status(const char *msg)
@@ -73,31 +80,150 @@ void fg_status(const char *msg)
 
 static void fg_status_windows(const char *hint)
 {
-   char line[81];
-   int i, n = 0;
-   n = sprintf(line, "[%d]", fg_current);
-   for (i = 0; i < FG_MAXCONSOLE && n < 70; i++) {
+   char line[FG_STATUS_COLS + 1];
+   const char *names[FG_MAXCONSOLE];
+   int ids[FG_MAXCONSOLE];
+   int i, nwin = 0;
+   for (i = 0; i < FG_MAXCONSOLE; i++) {
       if (fg_vconsoles[i] && !fg_vconsoles[i]->ignore) {
          PCB386 *p = ps_findprocess(fg_vconsoles[i]->pid);
-         char mark = (i == fg_current) ? '*' : ' ';
+         ids[nwin] = i;
          if (p && p != (PCB386 *)-1)
-            n += sprintf(line + n, " %c%d:%s", mark, i, p->name);
+            names[nwin] = p->name;
          else
-            n += sprintf(line + n, " %c%d", mark, i);
+            names[nwin] = 0;
+         nwin++;
       }
    }
-   if (hint && n < 78) {
-      line[n++] = ' ';
-      strncpy(line + n, hint, 80 - n - 1);
-      line[80] = 0;
-   }
+   fg_format_status(line, sizeof line, fg_current, nwin, ids, names, hint);
    fg_status(line);
+}
+
+static int fg_copy;
+static int fg_copy_took_buf;
+static unsigned int fg_view_off;
+
+static void fg_blit_cells(DEX32_DDL_INFO *dev, int y, const unsigned char *cells)
+{
+   int x;
+   char *hdw;
+   if (!dev || y < 0 || y >= 24 || !cells)
+      return;
+   hdw = dev->hdw_ptr;
+   for (x = 0; x < 80; x++) {
+      unsigned char ch = cells[x * 2];
+      unsigned char at = cells[x * 2 + 1];
+      if (hdw) {
+         hdw[(y * 80 + x) * 2] = (char)ch;
+         hdw[(y * 80 + x) * 2 + 1] = (char)at;
+      }
+      fbconsole_cell_render(x, y, ch, at);
+   }
+}
+
+static void fg_copy_paint(void)
+{
+   DEX32_DDL_INFO *dev = ActiveDDL;
+   console_hist_t *h;
+   unsigned int y, live_row;
+   char bar[FG_STATUS_COLS + 1];
+   unsigned int n = 0;
+   unsigned int i;
+   if (!dev || !fg_copy)
+      return;
+   for (i = 0; i < sizeof bar; i++)
+      bar[i] = 0;
+   h = dev->hist;
+   fg_view_off = console_hist_clamp_off(fg_view_off, h ? h->count : 0);
+   for (y = 0; y < CONSOLE_VIEW_ROWS; y++) {
+      int slot = -1;
+      live_row = y;
+      if (h)
+         slot = console_hist_view_slot(h, fg_view_off, y, CONSOLE_VIEW_ROWS,
+                                       &live_row);
+      if (slot >= 0)
+         fg_blit_cells(dev, (int)y, h->lines[slot]);
+      else if (dev->mem_ptr)
+         fg_blit_cells(dev, (int)y,
+                       (unsigned char *)dev->mem_ptr + live_row * 160);
+   }
+   n = fg_status_append(bar, 0, sizeof bar, "[");
+   n = fg_status_uint(bar, n, sizeof bar, (unsigned int)fg_current);
+   n = fg_status_append(bar, n, sizeof bar, "] COPY ");
+   n = fg_status_uint(bar, n, sizeof bar, fg_view_off);
+   n = fg_status_append(bar, n, sizeof bar, "/");
+   n = fg_status_uint(bar, n, sizeof bar, h ? h->count : 0);
+   n = fg_status_append(bar, n, sizeof bar,
+                        "  q/Esc quit  Up/Dn  PgUp/PgDn");
+   (void)n;
+   fg_status(bar);
+}
+
+static void fg_copy_leave(void)
+{
+   DEX32_DDL_INFO *dev = ActiveDDL;
+   if (!fg_copy)
+      return;
+   fg_copy = 0;
+   fg_view_off = 0;
+   if (fg_copy_took_buf && dev)
+      dd_swaptohardware(dev);
+   else if (dev && fbconsole_active())
+      fbconsole_screen_refresh();
+   fg_copy_took_buf = 0;
+   fg_status_windows(0);
+}
+
+static void fg_copy_enter(int delta)
+{
+   DEX32_DDL_INFO *dev = ActiveDDL;
+   unsigned int count;
+   if (!dev)
+      return;
+   if (!fg_copy) {
+      if (!dev->bufmode) {
+         dd_swaptomemory(dev);
+         fg_copy_took_buf = 1;
+      } else
+         fg_copy_took_buf = 0;
+      fg_copy = 1;
+      fg_view_off = 0;
+   }
+   count = (dev->hist) ? dev->hist->count : 0;
+   fg_view_off = console_hist_add_off(fg_view_off, delta, count);
+   fg_copy_paint();
+}
+
+static int fg_copy_key(int c)
+{
+   if (c == 'q' || c == 27 || c == '\n' || c == 'i') {
+      fg_copy_leave();
+      return 1;
+   }
+   if (c == KEY_UP)
+      fg_copy_enter(1);
+   else if (c == KEY_DN)
+      fg_copy_enter(-1);
+   else if (c == KEY_PGUP)
+      fg_copy_enter((int)CONSOLE_VIEW_ROWS);
+   else if (c == KEY_PGDN)
+      fg_copy_enter(-(int)CONSOLE_VIEW_ROWS);
+   else if (c == KEY_HOME)
+      fg_copy_enter(100000);
+   else if (c == KEY_END) {
+      fg_view_off = 0;
+      fg_copy_paint();
+   }
+   return 1;
 }
 
 //Sets the foreground console
 int fg_setforeground(int num){
    DWORD cpuflags;
    int ret = -1;
+
+   if (fg_copy)
+      fg_copy_leave();
     
    dex32_stopints(&cpuflags);
     
@@ -166,11 +292,16 @@ static void fg_kill_current(void)
    for (i = 0; i < FG_MAXCONSOLE; i++)
       if (fg_usable(i) && i != fg_current)
          others++;
+   pid = fg_vconsoles[fg_current]->pid;
    if (!others) {
-      fg_status("C-b x: last window — not killed");
+      /* Last window: kill and respawn so a wedged `ls`/VFS mount can be
+         recovered without power-cycling (F4 does the same). */
+      if (pid)
+         dex32_killkthread(pid);
+      console_new();
+      fg_status("restarted");
       return;
    }
-   pid = fg_vconsoles[fg_current]->pid;
    fg_next();
    if (pid)
       dex32_killkthread(pid);
@@ -181,10 +312,19 @@ static void fg_kill_current(void)
 
 int fg_mux_key(int c)
 {
+   tty_t *t;
+   if (fg_copy)
+      return fg_copy_key(c);
+   t = tty_fg();
+   /* Shell (no alternate screen): PageUp opens scrollback. vim/less keep PgUp. */
+   if (c == KEY_PGUP && (!t || !t->vt.alt)) {
+      fg_copy_enter((int)CONSOLE_VIEW_ROWS);
+      return 1;
+   }
    if (!fg_prefix) {
       if (c == FG_PREFIX) {
          fg_prefix = 1;
-         fg_status_windows("C-b  c:new n:next p:prev l:last w:list x:kill ?:help");
+         fg_status_windows("C-b [ scroll  c n p l w x ?");
          return 1;
       }
       return 0;
@@ -195,33 +335,38 @@ int fg_mux_key(int c)
       tty_input_fg(2);
       return 1;
    }
-   if (c == 'c' || c == ('c' - 'a')) {
+   if (c == '[' || c == KEY_PGUP) {
+      fg_copy_enter((int)CONSOLE_VIEW_ROWS);
+      return 1;
+   }
+   c = fg_mux_letter(c);
+   if (c == 'c') {
       console_new();
       fg_status_windows("new");
       return 1;
    }
-   if (c == 'n' || c == ('n' - 'a')) {
+   if (c == 'n') {
       fg_next();
       return 1;
    }
-   if (c == 'p' || c == ('p' - 'a')) {
+   if (c == 'p') {
       fg_prev();
       return 1;
    }
-   if (c == 'l' || c == ('l' - 'a')) {
+   if (c == 'l') {
       fg_lastwin();
       return 1;
    }
-   if (c == 'w' || c == ('w' - 'a') || c == 's') {
+   if (c == 'w' || c == 's') {
       fg_set_state(1);
       return 1;
    }
-   if (c == 'x' || c == ('x' - 'a')) {
+   if (c == 'x') {
       fg_kill_current();
       return 1;
    }
    if (c == '?' || c == '/') {
-      fg_status("C-b c new | n next | p prev | l last | 0-9 select | w list | x kill | C-b C-b send");
+      fg_status("C-b [ scroll | c new | n/p | l last | 0-9 | w list | x kill | C-b C-b send");
       return 1;
    }
    if (c >= '0' && c <= '9') {

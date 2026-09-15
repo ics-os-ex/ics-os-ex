@@ -1,5 +1,7 @@
 /* Kernel tty: canonical line discipline + VGA/serial backends. */
 
+#include "tty_canon.h"
+
 static tty_t tty_pool[TTY_MAX];
 static int tty_used;
 static tty_t *tty_foreground;
@@ -37,7 +39,11 @@ static int tty_in_get(tty_t *t)
 static void tty_echo(tty_t *t, char c)
 {
    /* DDL-backed ttys route through the VT100/xterm interpreter so
-      full-screen apps work; serial ttys pass bytes through raw. */
+      full-screen apps work; serial ttys pass bytes through raw.
+      vt_index implements LF without CR; ONLCR so sh.exe "\\n" returns
+      the cursor to column 0 (kernel printf already does this in Dex32PutC). */
+   if (c == '\n' && t->ddl)
+      vt_feed(t, '\r');
    vt_feed(t, c);
 }
 
@@ -170,8 +176,9 @@ int tty_flush_input(tty_t *t)
       n = (t->in_head - t->in_tail + TTY_IBUF) % TTY_IBUF;
       t->in_head = t->in_tail;
    }
-   n += t->canon_len;
+   n += t->canon_len - t->canon_off;
    t->canon_len = 0;
+   t->canon_off = 0;
    t->line_ready = 0;
    t->canon_esc = 0;
    return n;
@@ -226,6 +233,7 @@ void tty_input(tty_t *t, int c)
           if (t->canon_len < TTY_CANON_MAX - 1)
              t->canon[t->canon_len++] = '\n';
           t->canon[t->canon_len] = 0;
+          t->canon_off = 0;
           t->line_ready = 1;
           t->canon_esc = 0;
           if (t->flags & TTY_ECHO)
@@ -273,13 +281,17 @@ int tty_read(tty_t *t, char *buf, int n)
          }
          taskswitch();
       }
-      while (i < n && i < t->canon_len) {
-         buf[i] = t->canon[i];
-         i++;
+      {
+         int done = 0;
+         i = tty_canon_read_copy(t->canon, t->canon_len, &t->canon_off,
+                                 buf, n, &done);
+         if (done) {
+            t->canon_len = 0;
+            t->canon_off = 0;
+            t->line_ready = 0;
+         }
+         return i;
       }
-      t->canon_len = 0;
-      t->line_ready = 0;
-      return i;
    }
    while (i < n) {
       c = tty_in_get(t);

@@ -1735,6 +1735,19 @@ int fat_mount(vfs_node *mountpoint,fatdirentry *buf2,BPB *bpb,int id)
    {
       vfs_node *node;
       char filename[255];
+      /* Large dirs (e.g. /apps on USB root) used to pin the BSP for the
+         whole walk under vfs_busy: timer could not preempt, so C-b c's new
+         console never ran and F4/sigterm waited until mount finished. */
+      if ((i & 31) == 0) {
+         PCB386 *p = current_process;
+         if (p)
+            p->crit_wait = 1;
+         taskswitch();
+         if (p)
+            p->crit_wait = 0;
+         if (sigterm && p && sigterm == p->processid)
+            break;
+      }
       
       file12tostr(&buf2[i],filename);
       

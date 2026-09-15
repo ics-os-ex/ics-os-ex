@@ -1745,6 +1745,7 @@ void *mmio_map(u64 phys, u64 len)
 {
 #ifdef __x86_64__
    extern u64 boot_pdpt_high[];
+   extern int serial_com1_present(void);
    u64 aligned, end, page_count;
    unsigned offset, pages, first, map_index, i, phys_bits = 36;
    spin_irq_flags_t flags;
@@ -1760,12 +1761,18 @@ void *mmio_map(u64 phys, u64 len)
    offset = (unsigned)(phys - aligned);
    end = phys + len;
    page_count = (end - aligned + 0xFFFULL) >> 12;
-   eax = 0x80000000u;
-   __asm__ volatile ("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
-   if (eax >= 0x80000008u) {
-      eax = 0x80000008u;
+   if (serial_com1_present()) {
+      eax = 0x80000000u;
       __asm__ volatile ("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
-      phys_bits = eax & 0xFF;
+      if (eax >= 0x80000008u) {
+         eax = 0x80000008u;
+         __asm__ volatile ("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+         phys_bits = eax & 0xFF;
+      }
+   } else {
+      /* N150 hung in CPUID 0x80000000. 46 bits covers the high MMIO
+         window without probing the leaf. */
+      phys_bits = 46;
    }
    if (!page_count || page_count > KMMIO_SIZE / 0x1000 ||
        !phys_bits || phys_bits > 63 || ((end - 1) >> phys_bits))

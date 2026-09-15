@@ -359,6 +359,11 @@ int elf_loadmodule(char *module_name,char *elf_image,
        elfheader->e_ident[3]==ELFMAG3)
     {
 #ifdef __x86_64__
+      if (elfheader->e_ident[4] == ELFCLASS32) {
+         printf("elf: 32-bit ELF is not supported (%s); rebuild as ELF64\n",
+                module_name);
+         return 0;
+      }
       /* Prefer ELF64 on long-mode kernel */
       if (elfheader->e_ident[4] == ELFCLASS64) {
          Elf64_Ehdr *eh64 = (Elf64_Ehdr *)elf_image;
@@ -776,24 +781,34 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
   unsigned long pgdone = 0;
   int ret = 0;
 
+  /* Quiesce CDC before any VFS/MSC (openfilex). */
+  usb_cdc_bulk_io_begin();
+  printf("elf64-stream: opening %s\n", module_name);
   f = openfilex(module_name, FILE_READ);
+  printf("elf64-stream: openfilex done f=%p\n", (void *)f);
   if (!f) {
      printf("elf64-stream: open fail %s\n", module_name);
+     usb_cdc_bulk_io_end();
      return 0;
   }
+  printf("elf64-stream: open %s\n", module_name);
   fstat(f, &st);
   fsize = (unsigned long long)st.st_size;
+  printf("elf64-stream: size=%llu\n", fsize);
   if (fsize < 64) {
      printf("elf64-stream: tiny %s size=%llu\n", module_name, fsize);
      fclose(f);
+     usb_cdc_bulk_io_end();
      return 0;
   }
   need = fsize < sizeof(hdr) ? fsize : sizeof(hdr);
   if (fread(hdr, (int)need, 1, f) != (int)need) {
      printf("elf64-stream: hdr read fail %s need=%llu\n", module_name, need);
      fclose(f);
+     usb_cdc_bulk_io_end();
      return 0;
   }
+  printf("elf64-stream: hdr ok %s\n", module_name);
   eh64 = (Elf64_Ehdr *)hdr;
   if (eh64->e_ident[0] != ELFMAG0 || eh64->e_ident[1] != ELFMAG1 ||
       eh64->e_ident[2] != ELFMAG2 || eh64->e_ident[3] != ELFMAG3 ||
@@ -801,6 +816,7 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
      printf("elf64-stream: not elf64 %s id4=%d mach=%d\n",
             module_name, eh64->e_ident[4], (int)eh64->e_machine);
      fclose(f);
+     usb_cdc_bulk_io_end();
      return 0;
   }
   phend = eh64->e_phoff +
@@ -809,6 +825,7 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
      printf("elf64-stream: phdr overflow %s phend=%llu need=%llu phnum=%d\n",
             module_name, phend, need, (int)eh64->e_phnum);
      fclose(f);
+     usb_cdc_bulk_io_end();
      return 0;
   }
   ph64 = (Elf64_Phdr *)(hdr + eh64->e_phoff);
@@ -820,6 +837,7 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
         if (v + ph64[phi].p_memsz > (unsigned long long)MEM_USER_ELF_END) {
            printf("elf64-stream: PT_LOAD overflow %s\n", module_name);
            fclose(f);
+           usb_cdc_bulk_io_end();
            return 0;
         }
      }
@@ -829,6 +847,7 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
      printf("elf64-stream: mode/type %s mode=%d type=%d\n",
             module_name, mode, (int)eh64->e_type);
      fclose(f);
+     usb_cdc_bulk_io_end();
      return 0;
   }
 
@@ -836,6 +855,7 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
   if (!upml4) {
      printf("elf64-stream: no userpd %s\n", module_name);
      fclose(f);
+     usb_cdc_bulk_io_end();
      return 0;
   }
   pagedir = (DWORD *)(uintptr)upml4;
@@ -870,6 +890,7 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
       printf("elf64-stream: map fail %s\n", module_name);
       userpd_free(upml4);
       fclose(f);
+      usb_cdc_bulk_io_end();
       return 0;
    }
 
@@ -919,8 +940,16 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
             }
             memcpy((char *)KDIRECT((u64)(uintptr)fr) + dstoff, pagebuf,
                    (unsigned long)len);
-            if ((++pgdone & 0x7FUL) == 0)
+            if ((++pgdone & 0x7FUL) == 0) {
+               /* SIGINT == 2; abort a wedged USB-root stream load. */
+               if (current_process && current_process->pending_sig == 2) {
+                  printf("elf64-stream: interrupted loading %s\n",
+                         module_name);
+                  mapok = 0;
+                  break;
+               }
                taskswitch();
+            }
          }
       }
    }
@@ -928,6 +957,7 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
       printf("elf64-stream: copy fail %s\n", module_name);
       userpd_free(upml4);
       fclose(f);
+      usb_cdc_bulk_io_end();
       return 0;
    }
 
@@ -940,5 +970,6 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
    if (!ret)
       printf("elf64-stream: createprocess fail %s\n", module_name);
    fclose(f);
+   usb_cdc_bulk_io_end();
    return ret;
 }

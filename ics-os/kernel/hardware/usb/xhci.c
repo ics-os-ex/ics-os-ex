@@ -1,6 +1,8 @@
 /* Minimal xHCI backend for the legacy USB MSC/BOT layer. */
 
 #include "../irq_lifecycle.h"
+#include "xhci_policy.h"
+#include "cpu/lapic.h"
 
 #define XHCI_TRBS             256
 #define XHCI_EVENT_TRBS       256
@@ -8,6 +10,9 @@
 #define XHCI_MAX_HCDS         8
 #define XHCI_MAX_USBDEVS      2
 #define XHCI_TIMEOUT          4000000
+
+static int xhci_no_recover;
+static DWORD xhci_last_remain;
 
 #define XHCI_CMD_RUN          (1u << 0)
 #define XHCI_CMD_RESET        (1u << 1)
@@ -33,9 +38,12 @@
 #define XHCI_TRB_STATUS       XHCI_TRB_TYPE(4)
 #define XHCI_TRB_LINK         XHCI_TRB_TYPE(6)
 #define XHCI_TRB_ENABLE_SLOT  XHCI_TRB_TYPE(9)
+#define XHCI_TRB_DISABLE_SLOT XHCI_TRB_TYPE(10)
 #define XHCI_TRB_ADDRESS      XHCI_TRB_TYPE(11)
 #define XHCI_TRB_CONFIG_EP    XHCI_TRB_TYPE(12)
+#define XHCI_TRB_EVALUATE     XHCI_TRB_TYPE(13)
 #define XHCI_TRB_RESET_EP     XHCI_TRB_TYPE(14)
+#define XHCI_TRB_STOP_EP      XHCI_TRB_TYPE(15)
 #define XHCI_TRB_SET_DEQUEUE  XHCI_TRB_TYPE(16)
 #define XHCI_TRB_TRANSFER_EV  32
 #define XHCI_TRB_COMMAND_EV   33
@@ -93,6 +101,7 @@ typedef struct {
     xhci_ring ep_in_ring;
     xhci_ring ep_out_ring;
     xhci_ring cdc_ep0_ring;
+    xhci_ring cdc_ep_in_ring;
     xhci_ring cdc_ep_out_ring;
     dma_region dcbaa_dma;
     dma_region event_dma;
@@ -110,6 +119,7 @@ typedef struct {
     dma_device stream_dma;
     DWORD scratchpad_count;
     volatile int recovery_needed;
+    int enumerating;
     volatile int fault_drop_next;
     volatile int fault_fail_init;
     volatile int fault_disconnect_inflight;
@@ -148,7 +158,31 @@ static xhci_hcd *xhci_irq_routes[XHCI_MAX_HCDS];
 static char xhci_test_reservation_owner;
 static int xhci_test_vector_reserved;
 
+/* Leave a CDC bulk IN TRB posted across empty polls. Stop+SetDequeue on
+   every timeout wedged Intel xHCI after the first USB_CDC_RX. MSC waits
+   stash CDC IN completions (see xhci_next_event); do not Stop at BOT. */
+static int xhci_cdc_in_pending;
+static xhci_hcd *xhci_cdc_in_hcd;
+static DWORD xhci_cdc_in_dev;
+static DWORD xhci_cdc_in_epid;
+static DWORD xhci_cdc_in_slot;
+static xhci_ring *xhci_cdc_in_ring;
+static dma_sg_mapping xhci_cdc_in_map;
+static DWORD xhci_cdc_in_first;
+static int xhci_cdc_in_len;
+static BYTE *xhci_cdc_in_cpu;
+static int xhci_cdc_in_done;
+static DWORD xhci_cdc_in_cc;
+static DWORD xhci_cdc_in_remain;
+
+static int xhci_stop_endpoint(xhci_hcd *hcd, DWORD dev, DWORD endpoint,
+                              xhci_ring *ring);
+static void xhci_cdc_in_drop(xhci_hcd *hcd);
+static int xhci_cdc_in_take(int *got, int len);
+static void xhci_cdc_quiesce_for_msc(xhci_hcd *hcd);
+
 extern void *mmio_map(u64 phys, u64 len);
+extern int serial_com1_present(void);
 extern void *malloc(unsigned int size);
 extern void free(void *ptr);
 extern void xhci_msixwrapper0(void);
@@ -232,15 +266,34 @@ static int xhci_wait32(volatile BYTE *base, DWORD off, DWORD mask,
     return 0;
 }
 
+static DWORD xhci_port_ccs_mask(xhci_hcd *hcd)
+{
+    DWORD mask = 0;
+    DWORD port;
+    if (!hcd || !hcd->op || !hcd->max_ports)
+        return 0;
+    for (port = 1; port <= hcd->max_ports && port <= 32; port++)
+        if (xhci_r32(hcd->op, 0x400 + (port - 1) * 0x10) & XHCI_PORT_CCS)
+            mask |= xhci_ccs_bit(port);
+    return mask;
+}
+
+static DWORD xhci_wait_connected_ports(xhci_hcd *hcd)
+{
+    DWORD spins;
+    DWORD mask = 0;
+    for (spins = 0; spins < XHCI_PORT_SETTLE_SPINS; spins++) {
+        mask = xhci_port_ccs_mask(hcd);
+        if (mask)
+            return mask;
+        usb_io_delay();
+    }
+    return xhci_port_ccs_mask(hcd);
+}
+
 static int xhci_device_attached(xhci_hcd *hcd)
 {
-   DWORD port;
-   if (!hcd->op)
-       return 0;
-   for (port = 1; port <= hcd->max_ports; port++)
-       if (xhci_r32(hcd->op, 0x400 + (port - 1) * 0x10) & XHCI_PORT_CCS)
-           return 1;
-   return 0;
+   return xhci_port_ccs_mask(hcd) != 0;
 }
 
 /* Per-device accessors. Device 0 (the MSC root) always exists once the HCD
@@ -264,7 +317,7 @@ static xhci_ring *xhci_ep_out_ring_for(xhci_hcd *hcd, DWORD dev)
 
 static xhci_ring *xhci_ep_in_ring_for(xhci_hcd *hcd, DWORD dev)
 {
-   return dev ? 0 : &hcd->ep_in_ring;
+   return dev ? &hcd->cdc_ep_in_ring : &hcd->ep_in_ring;
 }
 
 static BYTE *xhci_input_ctx_base(xhci_hcd *hcd, DWORD dev)
@@ -298,7 +351,7 @@ static int xhci_usbdev_connected(xhci_hcd *hcd, DWORD dev)
            XHCI_PORT_CCS) != 0;
 }
 
-/* Any active device still connected (used to gate event waits). */
+/* Any active device still connected (used to gate command waits). */
 static int xhci_device_connected(xhci_hcd *hcd)
 {
    DWORD dev;
@@ -308,6 +361,22 @@ static int xhci_device_connected(xhci_hcd *hcd)
        if (xhci_usbdev_connected(hcd, dev))
            return 1;
    return 0;
+}
+
+static int xhci_ring_is_cdc(xhci_hcd *hcd, xhci_ring *ring)
+{
+    if (!hcd || !ring)
+        return 0;
+    return ring == &hcd->cdc_ep0_ring || ring == &hcd->cdc_ep_in_ring ||
+           ring == &hcd->cdc_ep_out_ring;
+}
+
+static int xhci_ring_owner_connected(xhci_hcd *hcd, xhci_ring *ring)
+{
+    DWORD dev = xhci_ring_is_cdc(hcd, ring) ? 1 : 0;
+    if (!hcd->usbdevs[dev].port)
+        return xhci_device_connected(hcd);
+    return xhci_usbdev_connected(hcd, dev);
 }
 
 static DWORD xhci_discover_hcds(void)
@@ -519,14 +588,14 @@ static int xhci_ring_init(xhci_ring *ring, DWORD link_chain)
     return 1;
 }
 
-static xhci_trb *xhci_ring_put(xhci_ring *ring, u64 parameter, DWORD status,
-                               DWORD control)
+static xhci_trb *xhci_ring_put_cycle(xhci_ring *ring, u64 parameter,
+                                     DWORD status, DWORD control, DWORD cycle)
 {
     xhci_trb *trb = &ring->trbs[ring->enqueue];
     trb->parameter = parameter;
     trb->status = status;
     xhci_mb();
-    trb->control = control | ring->cycle;
+    trb->control = (control & ~XHCI_TRB_CYCLE) | (cycle & XHCI_TRB_CYCLE);
     xhci_mb();
     ring->enqueue++;
     if (ring->enqueue == XHCI_TRBS - 1) {
@@ -536,6 +605,12 @@ static xhci_trb *xhci_ring_put(xhci_ring *ring, u64 parameter, DWORD status,
         ring->cycle ^= 1;
     }
     return trb;
+}
+
+static xhci_trb *xhci_ring_put(xhci_ring *ring, u64 parameter, DWORD status,
+                               DWORD control)
+{
+    return xhci_ring_put_cycle(ring, parameter, status, control, ring->cycle);
 }
 
 static xhci_trb *xhci_ring_buffer(xhci_ring *ring, u64 phys, DWORD len,
@@ -558,20 +633,73 @@ static xhci_trb *xhci_ring_buffer(xhci_ring *ring, u64 phys, DWORD len,
     return last;
 }
 
+static int xhci_trb_in_td(xhci_ring *ring, DWORD first, u64 pointer)
+{
+    u64 base;
+    u64 delta;
+    DWORD index;
+    DWORD end;
+    if (!ring)
+        return 0;
+    base = ring->dma.dma_addr;
+    delta = pointer - base;
+    index = (DWORD)(delta / sizeof(xhci_trb));
+    end = ring->enqueue;
+    return pointer >= base && !(delta & 0xF) && index < XHCI_TRBS - 1 &&
+           ((first < end && index >= first && index < end) ||
+            (first > end && (index >= first || index < end)));
+}
+
+static int xhci_stash_cdc_in_event(DWORD type, DWORD event_endpoint,
+                                   DWORD event_slot, u64 pointer, DWORD cc,
+                                   DWORD remain)
+{
+    if (!xhci_cdc_in_pending || xhci_cdc_in_done || !xhci_cdc_in_ring)
+        return 0;
+    if (type != XHCI_TRB_TRANSFER_EV || event_endpoint != xhci_cdc_in_epid)
+        return 0;
+    if (xhci_cdc_in_slot && event_slot != xhci_cdc_in_slot)
+        return 0;
+    /* Stash on slot+epid even when in_td misses. Orphaning a completed
+       CDC IN (pending&&!done, no TRB armed) kills Pico RPC after MSC. */
+    (void)pointer;
+    xhci_cdc_in_done = 1;
+    xhci_cdc_in_cc = cc;
+    xhci_cdc_in_remain = remain;
+    return 1;
+}
+
 /* Transfer events are matched against wanted_ring by TRB pointer (in_td) and
-   by endpoint; each USB device owns distinct rings, so this already
-   disambiguates the MSC (device 0) and CDC (device 1) completions on the
-   shared event ring. */
+   by endpoint. A posted CDC IN completion is stashed instead of dropped so
+   MSC/command waits do not steal it and do not need Stop Endpoint. */
 static int xhci_next_event(xhci_hcd *hcd, DWORD wanted_type, u64 wanted_ptr,
                            xhci_ring *wanted_ring, DWORD first,
                            DWORD wanted_endpoint,
-                           DWORD *completion, DWORD *slot)
+                           DWORD *completion, DWORD *slot, DWORD max_spins)
 {
     DWORD spins;
     DWORD flags;
     volatile BYTE *intr = hcd->runtime + 0x20;
-    for (spins = 0; spins < XHCI_TIMEOUT; spins++) {
-        if (hcd->usbdev_count && !xhci_device_connected(hcd)) {
+    if (!max_spins)
+        max_spins = XHCI_TIMEOUT;
+    for (spins = 0; spins < max_spins; spins++) {
+        /* ELF/MSC load set usb_cdc_bulk_io_quiesced so a stuck CDC OUT
+           must drop usb_io_lock; otherwise openfilex waits forever. */
+        if (wanted_ring && xhci_ring_is_cdc(hcd, wanted_ring) &&
+            usb_cdc_bulk_io_quiesced)
+            return 0;
+        /* Yield so a same-CPU waiter on usb_io_lock can run. */
+        if (wanted_ring && xhci_ring_is_cdc(hcd, wanted_ring) &&
+            (spins & 0x3F) == 0x3F)
+            taskswitch();
+        if (wanted_ring) {
+            if (hcd->usbdev_count &&
+                !xhci_ring_owner_connected(hcd, wanted_ring)) {
+                if (!xhci_ring_is_cdc(hcd, wanted_ring))
+                    hcd->connection_lost = 1;
+                return 0;
+            }
+        } else if (hcd->usbdev_count && !xhci_device_connected(hcd)) {
             hcd->connection_lost = 1;
             return 0;
         }
@@ -583,6 +711,8 @@ static int xhci_next_event(xhci_hcd *hcd, DWORD wanted_type, u64 wanted_ptr,
             u64 pointer = event->parameter & ~(u64)0xF;
             DWORD cc = event->status >> 24;
             DWORD event_slot = control >> 24;
+            DWORD remain = event->status & 0xFFFFFFu;
+            int cdc_in;
             hcd->event_dequeue++;
             if (hcd->event_dequeue == XHCI_EVENT_TRBS) {
                 hcd->event_dequeue = 0;
@@ -591,15 +721,10 @@ static int xhci_next_event(xhci_hcd *hcd, DWORD wanted_type, u64 wanted_ptr,
             xhci_w64(intr, 0x18,
                      hcd->event_dma.dma_addr +
                      hcd->event_dequeue * sizeof(xhci_trb) | 8);
+            cdc_in = xhci_stash_cdc_in_event(type, event_endpoint, event_slot,
+                                             pointer, cc, remain);
             if (type == wanted_type && wanted_ring) {
-                u64 base = wanted_ring->dma.dma_addr;
-                u64 delta = pointer - base;
-                DWORD index = (DWORD)(delta / sizeof(xhci_trb));
-                DWORD end = wanted_ring->enqueue;
-                int in_td = pointer >= base && !(delta & 0xF) &&
-                            index < XHCI_TRBS - 1 &&
-                            ((first < end && index >= first && index < end) ||
-                             (first > end && (index >= first || index < end)));
+                int in_td = xhci_trb_in_td(wanted_ring, first, pointer);
                 if (!in_td || event_endpoint != wanted_endpoint)
                     continue;
             } else if (type != wanted_type ||
@@ -607,10 +732,13 @@ static int xhci_next_event(xhci_hcd *hcd, DWORD wanted_type, u64 wanted_ptr,
                 continue;
             }
             if (type == wanted_type) {
+                xhci_last_remain = remain;
                 if (completion)
                     *completion = cc;
                 if (slot)
                     *slot = event_slot;
+                if (cdc_in && wanted_ring == xhci_cdc_in_ring)
+                    xhci_cdc_in_done = 0;
                 return 1;
             }
         } else {
@@ -640,26 +768,29 @@ static int xhci_command(xhci_hcd *hcd, u64 parameter, DWORD status,
 {
     DWORD cc = 0;
     unsigned long long trb_dma;
-    xhci_trb *trb = xhci_ring_put(&hcd->cmd_ring, parameter, status, control);
+    xhci_trb *trb;
+    trb = xhci_ring_put(&hcd->cmd_ring, parameter, status, control);
     if (!dma_region_map(&hcd->cmd_ring.dma, trb, sizeof(*trb), &trb_dma))
         return 0;
     xhci_mb();
     hcd->doorbell[0] = 0;
     xhci_mb();
     if (!xhci_next_event(hcd, XHCI_TRB_COMMAND_EV, trb_dma, 0, 0, 0,
-                         &cc, slot)) {
+                         &cc, slot, XHCI_TIMEOUT)) {
         /* command events match by TRB pointer; no ring/slot filter needed */
 
         if (hcd->connection_lost)
             return 0;
         printf("xhci: command timeout type=%u\n", (control >> 10) & 0x3F);
-        hcd->recovery_needed = 1;
+        if (!xhci_no_recover)
+            hcd->recovery_needed = 1;
         return 0;
     }
     if (cc != XHCI_CC_SUCCESS) {
         printf("xhci: command failed type=%u cc=%u\n",
                (control >> 10) & 0x3F, cc);
-        hcd->recovery_needed = 1;
+        if (!xhci_no_recover)
+            hcd->recovery_needed = 1;
         return 0;
     }
     return 1;
@@ -678,6 +809,7 @@ static void xhci_free_dma_storage(xhci_hcd *hcd)
     dma_free_coherent(&hcd->ep_in_ring.dma, free);
     dma_free_coherent(&hcd->ep_out_ring.dma, free);
     dma_free_coherent(&hcd->cdc_ep0_ring.dma, free);
+    dma_free_coherent(&hcd->cdc_ep_in_ring.dma, free);
     dma_free_coherent(&hcd->cdc_ep_out_ring.dma, free);
     dma_free_coherent(&hcd->cdc_input_ctx_dma, free);
     dma_free_coherent(&hcd->cdc_device_ctx_dma, free);
@@ -726,6 +858,9 @@ static int xhci_alloc_dma_storage(xhci_hcd *hcd)
         !dma_alloc_coherent(&hcd->cdc_ep0_ring.dma,
                             sizeof(xhci_trb) * XHCI_TRBS, 64,
                             0xFFFFFFFFULL, malloc, free) ||
+        !dma_alloc_coherent(&hcd->cdc_ep_in_ring.dma,
+                            sizeof(xhci_trb) * XHCI_TRBS, 64,
+                            0xFFFFFFFFULL, malloc, free) ||
         !dma_alloc_coherent(&hcd->cdc_ep_out_ring.dma,
                             sizeof(xhci_trb) * XHCI_TRBS, 64,
                             0xFFFFFFFFULL, malloc, free)) {
@@ -752,7 +887,9 @@ static void xhci_fill_ep_context(xhci_hcd *hcd, DWORD *ep, DWORD type,
                                  DWORD max_packet, DWORD max_burst,
                                  xhci_ring *ring, DWORD average)
 {
-    u64 dequeue = ring->dma.dma_addr | 1;
+    u64 dequeue = ring->dma.dma_addr +
+                  (u64)ring->enqueue * sizeof(xhci_trb);
+    dequeue |= ring->cycle & 1u;
     memset(ep, 0, hcd->context_size);
         ep[1] = (3u << 1) | (type << 3) | (max_burst << 8) |
             (max_packet << 16);
@@ -832,17 +969,43 @@ static int xhci_address_device(xhci_hcd *hcd, DWORD dev,
                         (ud->slot << 24), 0);
 }
 
+static int xhci_evaluate_ep0(xhci_hcd *hcd, DWORD dev)
+{
+    DWORD *control;
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    xhci_ring *ep0_ring;
+    if (!ud)
+        return 0;
+    ep0_ring = xhci_ep0_ring_for(hcd, dev);
+    memset(xhci_input_ctx_base(hcd, dev), 0,
+           dev ? hcd->cdc_input_ctx_dma.length
+               : hcd->input_ctx_dma.length);
+    control = xhci_input_context_dev(hcd, dev, 0);
+    control[1] = 3;
+    xhci_fill_slot_context(hcd, dev, xhci_input_context_dev(hcd, dev, 1), 1);
+    xhci_fill_ep_context(hcd, xhci_input_context_dev(hcd, dev, 2),
+                         4, ud->ep0_mps, 0, ep0_ring, 8);
+    return xhci_command(hcd,
+                        dev ? hcd->cdc_input_ctx_dma.dma_addr
+                            : hcd->input_ctx_dma.dma_addr, 0,
+                        XHCI_TRB_EVALUATE | (ud->slot << 24), 0);
+}
+
 static int xhci_set_ep0_packet_size(xhci_hcd *hcd, DWORD dev, BYTE encoded)
 {
     xhci_usbdev *ud = xhci_ud(hcd, dev);
     DWORD size = (ud && ud->speed >= 4) ? (1u << encoded) : encoded;
+    DWORD old;
     if (!ud ||
-        size != 8 && size != 16 && size != 32 && size != 64 && size != 512) {
+        (size != 8 && size != 16 && size != 32 && size != 64 && size != 512)) {
         printf("xhci: invalid EP0 packet size=%u encoded=%u\n", size, encoded);
         return 0;
     }
+    old = ud->ep0_mps;
     ud->ep0_mps = size;
-    return 1;
+    if (size == old)
+        return 1;
+    return xhci_evaluate_ep0(hcd, dev);
 }
 
 static DWORD xhci_buffer_trb_count(u64 dma_addr, DWORD len)
@@ -877,7 +1040,8 @@ static int xhci_transfer_sg(xhci_hcd *hcd, DWORD dev, xhci_ring *ring,
     if (!ud)
         return 0;
     if (ud->slot && !xhci_usbdev_connected(hcd, dev)) {
-        hcd->connection_lost = 1;
+        if (dev == 0)
+            hcd->connection_lost = 1;
         return 0;
     }
     if (!dma_map_sg_device(&mapping, segments, segment_count, direction,
@@ -916,11 +1080,14 @@ static int xhci_transfer_sg(xhci_hcd *hcd, DWORD dev, xhci_ring *ring,
             usb_io_delay();
     }
     if (!xhci_next_event(hcd, XHCI_TRB_TRANSFER_EV, 0,
-                         ring, first, endpoint, &cc, 0)) {
+                         ring, first, endpoint, &cc, 0,
+                         xhci_ring_is_cdc(hcd, ring) ? XHCI_CDC_IN_SPINS
+                                                     : XHCI_TIMEOUT)) {
         if (hcd->connection_lost)
             goto out;
         printf("xhci: transfer timeout ep=%u len=%u\n", endpoint, len);
-        hcd->recovery_needed = 1;
+        if (dev == 0)
+            hcd->recovery_needed = 1;
         goto out;
     }
     xhci_mb();
@@ -928,7 +1095,7 @@ static int xhci_transfer_sg(xhci_hcd *hcd, DWORD dev, xhci_ring *ring,
         printf("xhci: transfer failed ep=%u cc=%u\n", endpoint, cc);
         if (cc == XHCI_CC_STALL && endpoint < 32)
             hcd->stalled_endpoints |= 1u << endpoint;
-        else
+        else if (dev == 0)
             hcd->recovery_needed = 1;
         goto out;
     }
@@ -966,55 +1133,60 @@ static int xhci_control(xhci_hcd *hcd, DWORD dev, usb_setup *setup,
 {
     xhci_usbdev *ud = xhci_ud(hcd, dev);
     xhci_ring *ep0;
+    xhci_trb *first_trb;
     DWORD first;
     DWORD direction;
+    DWORD setup_flags;
+    DWORD start_cycle;
     u64 setup_value = 0;
     int result = 0;
+    int dir_in;
     dma_mapping mapping = {0};
-    DWORD trt;
     DWORD cc = 0;
     if (!ud)
         return 0;
     ep0 = xhci_ep0_ring_for(hcd, dev);
     first = ep0->enqueue;
-    direction = (setup->bmRequestType & 0x80)
-                ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
-    trt = len ? ((setup->bmRequestType & 0x80) ? 3 : 2) : 0;
+    dir_in = (setup->bmRequestType & 0x80) != 0;
+    direction = dir_in ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
     if (len && !dma_map_single_device(&mapping, data, (DWORD)len, direction,
                                       &hcd->stream_dma))
         return 0;
     memcpy(&setup_value, setup, 8);
-    xhci_ring_put(ep0, setup_value, 8,
-                  XHCI_TRB_SETUP | XHCI_TRB_IDT | XHCI_TRB_CHAIN |
-                  (trt << 16));
+    setup_flags = xhci_ctrl_setup_flags(len != 0, dir_in);
+    start_cycle = ep0->cycle;
+    /* Invert the Setup cycle until Data/Status are posted so the xHC
+       cannot fetch an incomplete control TD. */
+    first_trb = xhci_ring_put_cycle(ep0, setup_value, 8, setup_flags,
+                                    start_cycle ^ 1);
     if (len) {
         if (!xhci_ring_buffer(ep0, mapping.dma_addr, (DWORD)len,
-                      XHCI_TRB_DATA |
-                      ((setup->bmRequestType & 0x80)
-                       ? XHCI_TRB_DIR_IN : 0),
-                      XHCI_TRB_CHAIN))
+                      xhci_ctrl_data_flags(dir_in), 0))
             goto out;
     }
-    xhci_ring_put(ep0, 0, 0,
-                  XHCI_TRB_STATUS | XHCI_TRB_IOC |
-                  ((!len || !(setup->bmRequestType & 0x80))
-                   ? XHCI_TRB_DIR_IN : 0));
+    xhci_ring_put(ep0, 0, 0, xhci_ctrl_status_flags(len != 0, dir_in));
+    xhci_mb();
+    first_trb->control = setup_flags | start_cycle;
     xhci_mb();
     hcd->doorbell[ud->slot] = 1;
     xhci_mb();
     if (!xhci_next_event(hcd, XHCI_TRB_TRANSFER_EV, 0,
-                         ep0, first, 1, &cc, 0)) {
+                         ep0, first, 1, &cc, 0, XHCI_TIMEOUT)) {
         if (hcd->connection_lost)
             goto out;
-        printf("xhci: control timeout request=%u\n", setup->bRequest);
-        hcd->recovery_needed = 1;
+        printf("xhci: control timeout request=%u len=%d\n",
+               setup->bRequest, len);
+        if (!hcd->enumerating)
+            hcd->recovery_needed = 1;
         goto out;
     }
     xhci_mb();
     if (cc != XHCI_CC_SUCCESS && cc != XHCI_CC_SHORT_PACKET) {
-        printf("xhci: control failed request=%u cc=%u\n",
-               setup->bRequest, cc);
-        hcd->recovery_needed = 1;
+        printf("xhci: control failed request=%u cc=%u%s\n",
+               setup->bRequest, cc,
+               cc == XHCI_CC_STALL ? " (stall)" : "");
+        if (!hcd->enumerating)
+            hcd->recovery_needed = 1;
         goto out;
     }
     result = 1;
@@ -1037,6 +1209,10 @@ static int xhci_bulk(xhci_hcd *hcd, DWORD dev, BYTE endpoint, int in,
                          : xhci_ep_out_ring_for(hcd, dev);
     if (!ring)
         return 0;
+    /* MSC is usbdevs[0]; CDC is usbdevs[1]. Take a completed CDC IN so
+       BOT does not race a late take; never Stop (policy). */
+    if (dev == 0)
+        xhci_cdc_quiesce_for_msc(hcd);
     if (len > 1 && strstr(kernel_cmdline, "xhci-sg-test")) {
         dma_segment segments[2];
         int result;
@@ -1056,6 +1232,210 @@ static int xhci_bulk(xhci_hcd *hcd, DWORD dev, BYTE endpoint, int in,
     return xhci_transfer(hcd, dev, ring, endpoint_id, data, (DWORD)len,
                          XHCI_TRB_NORMAL,
                          in ? DMA_FROM_DEVICE : DMA_TO_DEVICE);
+}
+
+static int xhci_stop_endpoint(xhci_hcd *hcd, DWORD dev, DWORD endpoint,
+                              xhci_ring *ring)
+{
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    u64 dequeue;
+    unsigned long long trb_dma;
+    int saved = xhci_no_recover;
+    if (!ud || !ring)
+        return 0;
+    xhci_no_recover = 1;
+    if (!xhci_command(hcd, 0, 0, XHCI_TRB_STOP_EP |
+                      (endpoint << 16) | (ud->slot << 24), 0)) {
+        xhci_no_recover = saved;
+        return 0;
+    }
+    if (!dma_region_map(&ring->dma, &ring->trbs[ring->enqueue],
+                        sizeof(xhci_trb), &trb_dma)) {
+        xhci_no_recover = saved;
+        return 0;
+    }
+    dequeue = trb_dma | ring->cycle;
+    if (!xhci_command(hcd, dequeue, 0, XHCI_TRB_SET_DEQUEUE |
+                      (endpoint << 16) | (ud->slot << 24), 0)) {
+        xhci_no_recover = saved;
+        return 0;
+    }
+    xhci_no_recover = saved;
+    return 1;
+}
+
+static void xhci_cdc_in_drop(xhci_hcd *hcd)
+{
+    if (!xhci_cdc_in_pending)
+        return;
+    if (hcd && hcd == xhci_cdc_in_hcd && xhci_cdc_in_ring)
+        (void)xhci_stop_endpoint(hcd, xhci_cdc_in_dev, xhci_cdc_in_epid,
+                                 xhci_cdc_in_ring);
+    dma_unmap_sg(&xhci_cdc_in_map);
+    xhci_cdc_in_pending = 0;
+    xhci_cdc_in_done = 0;
+    xhci_cdc_in_hcd = 0;
+    xhci_cdc_in_ring = 0;
+    xhci_cdc_in_cpu = 0;
+    xhci_cdc_in_len = 0;
+    xhci_cdc_in_slot = 0;
+}
+
+/* Forget a posted CDC IN without Stop-EP. Used for ELF stream loads —
+   Stop wedged Intel xHCI so the following MSC read never completed. */
+static void xhci_cdc_in_abandon(void)
+{
+    if (!xhci_cdc_in_pending)
+        return;
+    dma_unmap_sg(&xhci_cdc_in_map);
+    xhci_cdc_in_pending = 0;
+    xhci_cdc_in_done = 0;
+    xhci_cdc_in_hcd = 0;
+    xhci_cdc_in_ring = 0;
+    xhci_cdc_in_cpu = 0;
+    xhci_cdc_in_len = 0;
+    xhci_cdc_in_slot = 0;
+}
+
+static int xhci_cdc_in_take(int *got, int len)
+{
+    DWORD cc;
+    if (!xhci_cdc_in_pending || !xhci_cdc_in_done)
+        return -1;
+    cc = xhci_cdc_in_cc;
+    xhci_last_remain = xhci_cdc_in_remain;
+    dma_unmap_sg(&xhci_cdc_in_map);
+    xhci_cdc_in_pending = 0;
+    xhci_cdc_in_done = 0;
+    xhci_cdc_in_hcd = 0;
+    xhci_cdc_in_ring = 0;
+    xhci_cdc_in_cpu = 0;
+    xhci_cdc_in_len = 0;
+    xhci_cdc_in_slot = 0;
+    if (cc != XHCI_CC_SUCCESS && cc != XHCI_CC_SHORT_PACKET)
+        return 0;
+    if (got) {
+        int n = len - (int)xhci_last_remain;
+        if (n < 0)
+            n = 0;
+        if (n > len)
+            n = len;
+        *got = n;
+    }
+    return 1;
+}
+
+/* Before MSC/BOT: drain a completed CDC IN. Live TRBs stay posted;
+   xhci_next_event stashes their Transfer Events. Stop-EP only if
+   policy allows (currently never — wedges Intel CDC IN). */
+static void xhci_cdc_quiesce_for_msc(xhci_hcd *hcd)
+{
+    if (!xhci_cdc_in_pending)
+        return;
+    if (xhci_cdc_in_done) {
+        (void)xhci_cdc_in_take(0, 0);
+        return;
+    }
+    if (xhci_cdc_in_cancel_for_msc())
+        xhci_cdc_in_drop(hcd ? hcd : xhci_cdc_in_hcd);
+}
+
+/* Short-timeout bulk IN. 1 = completed (got may be 0 on ZLP), 0 = no data
+   yet. Empty polls leave the TRB posted unless policy says to stop.
+   max_spins == 0: take if done / post if idle, do not wait (MSC kick). */
+static int xhci_bulk_in_try(xhci_hcd *hcd, DWORD dev, BYTE endpoint,
+                            BYTE *data, int len, int *got, DWORD max_spins)
+{
+    DWORD endpoint_id = xhci_endpoint_id(endpoint, 1);
+    xhci_ring *ring = xhci_ep_in_ring_for(hcd, dev);
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    dma_segment segment;
+    DWORD cc = 0;
+    int result = 0;
+    int saved;
+
+    if (got)
+        *got = 0;
+    if (!ud || !ring || !data || len <= 0)
+        return 0;
+    if (ud->slot && !xhci_usbdev_connected(hcd, dev))
+        return 0;
+
+    /* Never Stop-EP a live CDC IN on buffer/len mismatch — that wedges
+       Intel ADL-N. Soft-abandon and re-post with the new mapping. */
+    if (xhci_cdc_in_pending &&
+        (xhci_cdc_in_hcd != hcd || xhci_cdc_in_dev != dev ||
+         xhci_cdc_in_cpu != data || xhci_cdc_in_len != len))
+        xhci_cdc_in_abandon();
+
+
+    {
+        int taken = xhci_cdc_in_take(got, len);
+        if (taken >= 0)
+            return taken;
+    }
+
+    if (!xhci_cdc_in_pending) {
+        segment.cpu_addr = data;
+        segment.length = (DWORD)len;
+        xhci_cdc_in_first = ring->enqueue;
+        if (!dma_map_sg_device(&xhci_cdc_in_map, &segment, 1, DMA_FROM_DEVICE,
+                               &hcd->stream_dma))
+            return 0;
+        if (!xhci_ring_buffer(ring, xhci_cdc_in_map.mappings[0].dma_addr,
+                              xhci_cdc_in_map.mappings[0].length,
+                              XHCI_TRB_NORMAL, xhci_cdc_in_trb_flags())) {
+            dma_unmap_sg(&xhci_cdc_in_map);
+            return 0;
+        }
+        xhci_mb();
+        hcd->doorbell[ud->slot] = endpoint_id;
+        xhci_mb();
+        xhci_cdc_in_pending = 1;
+        xhci_cdc_in_hcd = hcd;
+        xhci_cdc_in_dev = dev;
+        xhci_cdc_in_epid = endpoint_id;
+        xhci_cdc_in_slot = ud->slot;
+        xhci_cdc_in_ring = ring;
+        xhci_cdc_in_len = len;
+        xhci_cdc_in_cpu = data;
+        xhci_cdc_in_done = 0;
+    }
+
+    if (max_spins == 0)
+        return 0;
+
+    saved = xhci_no_recover;
+    xhci_no_recover = 1;
+    if (!xhci_next_event(hcd, XHCI_TRB_TRANSFER_EV, 0, ring,
+                         xhci_cdc_in_first, endpoint_id, &cc, 0,
+                         max_spins)) {
+        xhci_no_recover = saved;
+        if (xhci_cdc_in_stop_on_timeout())
+            xhci_cdc_in_drop(hcd);
+        return 0;
+    }
+    xhci_no_recover = saved;
+    dma_unmap_sg(&xhci_cdc_in_map);
+    xhci_cdc_in_pending = 0;
+    xhci_cdc_in_done = 0;
+    xhci_cdc_in_hcd = 0;
+    xhci_cdc_in_ring = 0;
+    xhci_cdc_in_cpu = 0;
+    xhci_cdc_in_len = 0;
+    xhci_cdc_in_slot = 0;
+    if (cc != XHCI_CC_SUCCESS && cc != XHCI_CC_SHORT_PACKET)
+        return 0;
+    result = 1;
+    if (got) {
+        int n = len - (int)xhci_last_remain;
+        if (n < 0)
+            n = 0;
+        if (n > len)
+            n = len;
+        *got = n;
+    }
+    return result;
 }
 
 static int xhci_recover_endpoint(xhci_hcd *hcd, DWORD dev, DWORD endpoint,
@@ -1169,11 +1549,19 @@ static int xhci_reset_port_dev(xhci_hcd *hcd, DWORD dev)
         return 0;
     off = 0x400 + (ud->port - 1) * 0x10;
     p = xhci_r32(hcd->op, off);
-    if (!(p & XHCI_PORT_CCS))
+    if (!(p & XHCI_PORT_CCS)) {
+        printf("xhci: port %u reset failed sc=0x%x (no ccs)\n",
+               ud->port, p);
         return 0;
+    }
+    /* Same PORTSC write that enabled ports 4/5 on the N150. Clearing PRC
+       or calling usb_wait_ms here dropped PED on that controller. */
     xhci_w32(hcd->op, off, (p & ~XHCI_PORT_CHANGE) | XHCI_PORT_RESET);
-    if (!xhci_wait32(hcd->op, off, XHCI_PORT_RESET, 0))
+    if (!xhci_wait32(hcd->op, off, XHCI_PORT_RESET, 0)) {
+        printf("xhci: port %u reset failed sc=0x%x (pr stuck)\n",
+               ud->port, xhci_r32(hcd->op, off));
         return 0;
+    }
     p = xhci_r32(hcd->op, off);
     ud->speed = XHCI_PORT_SPEED(p);
     if (ud->speed >= 4)
@@ -1182,16 +1570,100 @@ static int xhci_reset_port_dev(xhci_hcd *hcd, DWORD dev)
         ud->ep0_mps = 64;
     else
         ud->ep0_mps = 8;
-    return (p & (XHCI_PORT_CCS | XHCI_PORT_PED)) ==
-           (XHCI_PORT_CCS | XHCI_PORT_PED);
+    if ((p & (XHCI_PORT_CCS | XHCI_PORT_PED)) !=
+        (XHCI_PORT_CCS | XHCI_PORT_PED)) {
+        printf("xhci: port %u reset failed sc=0x%x (no ped speed=%u)\n",
+               ud->port, p, ud->speed);
+        return 0;
+    }
+    usb_spin_ms(10);
+    return 1;
+}
+
+static void xhci_recount_usbdevs(xhci_hcd *hcd)
+{
+    DWORD i, n = 0;
+    for (i = 0; i < XHCI_MAX_USBDEVS; i++)
+        if (hcd->usbdevs[i].port)
+            n = i + 1;
+    hcd->usbdev_count = n;
+}
+
+static int xhci_release_dev(xhci_hcd *hcd, DWORD dev)
+{
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    if (!hcd || !ud)
+        return 1;
+    if (ud->slot) {
+        (void)xhci_command(hcd, 0, 0,
+                           XHCI_TRB_DISABLE_SLOT | (ud->slot << 24), 0);
+        if (ud->slot < 256)
+            hcd->dcbaa[ud->slot] = 0;
+    }
+    ud->slot = 0;
+    ud->port = 0;
+    ud->speed = 0;
+    xhci_recount_usbdevs(hcd);
+    return 1;
+}
+
+static int xhci_claim_port_dev(xhci_hcd *hcd, DWORD port, DWORD dev)
+{
+    xhci_usbdev *ud;
+    xhci_ring *ep0;
+    if (!hcd || !port || port > hcd->max_ports || dev >= XHCI_MAX_USBDEVS)
+        return 0;
+    xhci_release_dev(hcd, dev);
+    ep0 = xhci_ep0_ring_for(hcd, dev);
+    if (!xhci_ring_init(ep0, XHCI_TRB_CHAIN))
+        return 0;
+    memset(&hcd->usbdevs[dev], 0, sizeof(hcd->usbdevs[dev]));
+    hcd->usbdevs[dev].port = port;
+    if (hcd->usbdev_count <= dev)
+        hcd->usbdev_count = dev + 1;
+    if (!xhci_reset_port_dev(hcd, dev)) {
+        hcd->usbdevs[dev].port = 0;
+        xhci_recount_usbdevs(hcd);
+        return 0;
+    }
+    ud = &hcd->usbdevs[dev];
+    ud->slot = 0;
+    if (dev == 0) {
+        hcd->connection_lost = 0;
+        hcd->stalled_endpoints = 0;
+    }
+    if (!xhci_command(hcd, 0, 0, XHCI_TRB_ENABLE_SLOT, &ud->slot) ||
+        !ud->slot) {
+        printf("xhci: port %u enable slot failed\n", port);
+        hcd->usbdevs[dev].port = 0;
+        xhci_recount_usbdevs(hcd);
+        return 0;
+    }
+    hcd->dcbaa[ud->slot] = dev ? hcd->cdc_device_ctx_dma.dma_addr
+                               : hcd->device_ctx_dma.dma_addr;
+    /* BSR=0: the xHC issues SET_ADDRESS. GET_DESCRIPTOR follows on EP0. */
+    if (!xhci_address_device(hcd, dev, 0)) {
+        printf("xhci: port %u address failed\n", port);
+        xhci_release_dev(hcd, dev);
+        return 0;
+    }
+    usb_spin_ms(2);
+    printf("xhci: controller at PCI %u:%u.%u devs=%u port=%u speed=%u slot=%u ctx=%u\n",
+           hcd->pci_bus, hcd->pci_slot, hcd->pci_func,
+           hcd->usbdev_count, ud->port, ud->speed, ud->slot, hcd->context_size);
+    return 1;
+}
+
+static int xhci_claim_port(xhci_hcd *hcd, DWORD port)
+{
+    return xhci_claim_port_dev(hcd, port, 0);
 }
 
 static int xhci_init_hcd(xhci_hcd *hcd)
 {
     BYTE bus, slot, func;
     u64 bar = 0, bar_size = 0, required;
-    DWORD caplen, hcs1, hcs2, hcc, dboff, rtsoff, found = 0;
-    DWORD port, dev;
+    DWORD caplen, hcs1, hcs2, hcc, dboff, rtsoff;
     volatile BYTE *intr;
     if (!hcd)
         return 0;
@@ -1215,6 +1687,13 @@ static int xhci_init_hcd(xhci_hcd *hcd)
         bar + bar_size < bar) {
         printf("xhci: unsupported BAR 0x%llx\n", (unsigned long long)bar);
         return 0;
+    }
+    {
+        DWORD id = pci_read32(bus, slot, func, 0);
+        printf("xhci: PCI %u:%u.%u id=%04x:%04x BAR=0x%llx size=%llu\n",
+               bus, slot, func, (unsigned)(id & 0xFFFFu),
+               (unsigned)((id >> 16) & 0xFFFFu),
+               (unsigned long long)bar, (unsigned long long)bar_size);
     }
     pci_write16(bus, slot, func, 0x04,
                 pci_read16(bus, slot, func, 0x04) | 0x06);
@@ -1264,9 +1743,14 @@ static int xhci_init_hcd(xhci_hcd *hcd)
         printf("xhci: test reserved platform vector=%u\n",
                IRQ_VECTOR_FIRST_DEVICE);
     }
-    if (strstr(kernel_cmdline, "xhci-poll-test")) {
+    if (strstr(kernel_cmdline, "xhci-poll-test") ||
+        !xhci_allow_msix(serial_com1_present(), lapic_x2apic_enabled())) {
         hcd->has_msix = 0;
-        printf("xhci: test forcing polling fallback\n");
+        if (strstr(kernel_cmdline, "xhci-poll-test"))
+            printf("xhci: test forcing polling fallback\n");
+        printf("xhci: polling (com1=%d x2apic=%d)\n",
+               serial_com1_present() ? 1 : 0,
+               lapic_x2apic_enabled() ? 1 : 0);
     } else if (!xhci_setup_msix(hcd, bus, slot, func)) {
         printf("xhci: MSI-X unavailable; polling\n");
     }
@@ -1320,53 +1804,34 @@ static int xhci_init_hcd(xhci_hcd *hcd)
         printf("xhci: controller failed to run\n");
         return 0;
     }
-
-    /* Walk every connected port and remember up to two reset-ready devices.
-       Device 0 is the first usable port (normally the MSC root); device 1
-       is a later port (CDC-ACM). usb_enumerate_msc still talks to device 0. */
     {
-        DWORD dev = 0;
-        memset(hcd->usbdevs, 0, sizeof(hcd->usbdevs));
-        hcd->usbdev_count = 0;
-        for (port = 1; port <= hcd->max_ports && dev < XHCI_MAX_USBDEVS; port++) {
-            DWORD p = xhci_r32(hcd->op, 0x400 + (port - 1) * 0x10);
-            if (!(p & XHCI_PORT_CCS))
+        DWORD ccs = xhci_wait_connected_ports(hcd);
+        DWORD psc, p;
+        printf("xhci: ports=%u ccs=0x%x ctx=%u irq=%s\n",
+               hcd->max_ports, ccs, hcd->context_size,
+               hcd->has_msix ? "msix" : "poll");
+        for (p = 1; p <= hcd->max_ports && p <= 32; p++) {
+            if (!(ccs & xhci_ccs_bit(p)))
                 continue;
-            hcd->usbdevs[dev].port = port;
-            if (xhci_reset_port_dev(hcd, dev)) {
-                dev++;
-                hcd->usbdev_count = dev;
-                found = 1;
-            }
+            psc = xhci_r32(hcd->op, 0x400 + (p - 1) * 0x10);
+            printf("xhci: port %u sc=0x%x speed=%u\n",
+                   p, psc, XHCI_PORT_SPEED(psc));
+        }
+        if (!ccs) {
+            printf("xhci: no enabled device port\n");
+            return 0;
         }
     }
-    if (!found) {
-        printf("xhci: no enabled device port\n");
-        return 0;
-    }
-    for (dev = 0; dev < hcd->usbdev_count; dev++) {
-        xhci_usbdev *ud = &hcd->usbdevs[dev];
-        ud->slot = 0;
-        hcd->connection_lost = 0;
-        hcd->stalled_endpoints = 0;
-        if (!xhci_command(hcd, 0, 0, XHCI_TRB_ENABLE_SLOT, &ud->slot) ||
-            !ud->slot)
-            return 0;
-        hcd->dcbaa[ud->slot] = dev ? hcd->cdc_device_ctx_dma.dma_addr
-                                   : hcd->device_ctx_dma.dma_addr;
-        if (!xhci_address_device(hcd, dev, 1))
-            return 0;
-    }
-    printf("xhci: controller at PCI %u:%u.%u devs=%u port=%u speed=%u slot=%u ctx=%u\n",
-           bus, slot, func, hcd->usbdev_count,
-           hcd->usbdevs[0].port, hcd->usbdevs[0].speed,
-           hcd->usbdevs[0].slot, hcd->context_size);
+    hcd->usbdev_count = 0;
+    hcd->enumerating = 0;
+    memset(hcd->usbdevs, 0, sizeof(hcd->usbdevs));
     return 1;
 }
 
 static void xhci_stop_hcd(xhci_hcd *hcd)
 {
     WORD control;
+    xhci_cdc_in_drop(hcd);
     if (hcd->runtime && hcd->has_msix)
         xhci_w32(hcd->runtime + 0x20, 0x00, 1);
     if (hcd->op)

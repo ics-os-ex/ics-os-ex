@@ -26,6 +26,7 @@
 
 #define SCRIPT_MAXINSTANCE 20
 
+#include "script_comment.h"
 
 //removes '\n', '\r' and other characters which could mess
 //with the interpreter and replaces them with a space
@@ -64,6 +65,16 @@ int script_load(const char *filename){
       //skip blank lines
       if (strcmp(linebuffer,"")==0) 
          continue;
+
+      /* Line comments before '@'/echo handling so '# rem' and "' comment"
+         never become console_execute noise. */
+      {
+         int i = 0;
+         while (linebuffer[i] == ' ')
+            i++;
+         if (linebuffer[i] == '#' || linebuffer[i] == '\'')
+            continue;
+      }
       
       /*determine if the line will be printed to the screen
        or not. Dtermined by the @ at the start or an echo off command*/
@@ -71,25 +82,30 @@ int script_load(const char *filename){
          printf("%s\n",linebuffer);  
       else
          if (linebuffer[0]=='@')
-            linebuffer[0]=' ';     
-         else
-            if (linebuffer[0]==';') //a comment line? we skip this line
-               continue;
+            linebuffer[0]=' ';
       
-      //filter out comments
+      //filter out trailing ;comments
       str = strtok(linebuffer,";");
+      if (!str)
+         continue;
       
       strcpy(temp,str);
 
       script_command = strtok(temp," ");
+      if (!script_command)
+         continue;
+
+      /* DOS rem / @rem (leading @ already stripped to space). */
+      if (script_is_comment_token(script_command))
+         continue;
       
       if (strcmp(script_command,"echo")==0){
          script_command = strtok(0," ");
-         if (strcmp(script_command,"off")==0){
+         if (script_command && strcmp(script_command,"off")==0){
             echo_command = 0;
             continue;
-         }else if (strcmp(script_command,"on")==0){
-            echo_command = 1;;
+         }else if (script_command && strcmp(script_command,"on")==0){
+            echo_command = 1;
             continue;
          };
       };

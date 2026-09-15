@@ -839,6 +839,8 @@ void dex_init(){
 
    printf("Initializing USB mass-storage drivers...\n");
    usb_init();
+   usb_cdc_pump();
+   kbd_boot_leds_raw(KBD_LED_CAPS | KBD_LED_NUM);
    if (usb_storage_available())
       printf("[OK]\n");
    else
@@ -993,10 +995,10 @@ void dex_init(){
          }
       }
 
-      if (usb_start_hotplug_monitor() == -1)
-         printf("xhci: failed to start hotplug monitor\n");
-
-      /* Writable scratch FS for in-OS compiles (selfhost / tccboot). */
+      /* Writable scratch FS for in-OS compiles (selfhost / tccboot).
+         Start the console before xHCI hotplug/CDC pump: Intel ADL-N can
+         block forever in usb_cdc_pump after Root mount, which used to
+         leave GOP stuck there with no prompt. */
       if (mounted)
          ramdisk_mount();
       work_mount_vblk();
@@ -1040,6 +1042,26 @@ void dex_init(){
    //Create a new console instance
     consolepid = console_new();
     ps_set_affinity(consolepid, 0);
+    printf("console thread started pid=%d\n", consolepid);
+    serial_puts("CONSOLE_THREAD_OK\n");
+    kbd_boot_leds_raw(0);
+
+    /* Wait until the first console has painted CONSOLE_READY (or time out)
+       before the hotplug thread starts usb_cdc_pump. Intel ADL-N can wedge
+       MSC while CDC is pumped on the init path; racing autoexec copies is
+       the same failure mode. */
+    {
+       int spins;
+       for (spins = 0; console_first == 0 && spins < 200; spins++)
+          delay(1);
+       if (console_first == 0)
+          printf("console: timed out waiting for CONSOLE_READY\n");
+    }
+
+    /* Hotplug/CDC after the console exists so a wedged xHCI pump cannot
+       hide the GOP prompt. The monitor thread does its own usb_cdc_pump. */
+    if (usb_start_hotplug_monitor() == -1)
+       printf("xhci: failed to start hotplug monitor\n");
 
     /* COM2 (0x2F8) interactive terminal/shell: live commands + introspection
        without a reboot. Attach via a second QEMU -serial chardev (telnet or

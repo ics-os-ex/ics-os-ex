@@ -105,7 +105,13 @@ int dex32_loader(char *name,char *image,char *loadaddress,int mode,char *p,char 
        call_loader=dex32_loaders[i];
        if (ret=call_loader(name,image,(DWORD)loadaddress,mode,p,workdir,parent)) return ret;
        };
-     printf("dex32_loader: unidentified executable format.\n");  
+     printf("dex32_loader: unidentified executable format (%s).\n",
+            name ? name : "?");
+     if (image) {
+        unsigned char *b = (unsigned char *)image;
+        printf("dex32_loader: magic %02x %02x %02x %02x\n",
+               b[0], b[1], b[2], b[3]);
+     }  
    return 0;
   };
 

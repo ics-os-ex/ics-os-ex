@@ -13,6 +13,7 @@
 
 extern void uart_com1_putc(unsigned int c);
 extern void uart_com2_putc(unsigned int c);
+extern void usb_cdc_putc(int c);
 
 #define SERIAL_COM1 0x3F8
 #define SERIAL_COM2 0x2F8
@@ -145,6 +146,7 @@ void serial_putc(char c)
 {
     serial_guard guard;
 
+    usb_cdc_putc(c);
     if (!uart1.ready)
         return;
 
@@ -158,9 +160,13 @@ void serial_putc(char c)
 void serial_puts(const char *s)
 {
     serial_guard guard;
+    const char *p;
 
     if (s == 0)
         return;
+    p = s;
+    while (*p)
+        usb_cdc_putc(*p++);
     if (!uart1.ready)
         return;
     guard = uart_guard_acquire(&uart1);
@@ -179,6 +185,8 @@ void serial_write(const char *s, int n)
 
     if (s == 0 || n <= 0)
         return;
+    for (i = 0; i < n; i++)
+        usb_cdc_putc(s[i]);
     if (!uart1.ready)
         return;
     guard = uart_guard_acquire(&uart1);

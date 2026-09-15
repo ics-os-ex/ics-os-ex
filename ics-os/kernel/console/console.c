@@ -199,20 +199,20 @@ int user_fork(){
 
 /**
  * Function that reads an executable and creates a new process for it.
+ * ELF64 uses the same VFS stream path as posix_spawn (no whole-file heap
+ * map).  mmap+dex32_loader remains for PE/COFF/B32 leftovers.
  */
-int user_execp(char *fname, DWORD mode, char *params){
-    DWORD id,size;
+static DWORD execp_load(char *fname, DWORD mode, char *params)
+{
+    DWORD id, size;
     char *buf;
     char temp[255];
 
-    /* Serialize the eager ELF map + load path with sys_spawn().  The previous
-       per-image cache was not safe under SMP: two concurrent callers could map
-       different images into the same static buffer, and the first waiter could
-       free an image still in use by the second loader.  The loader copies every
-       PT_LOAD into the child's private frames before returning, so the image
-       buffer can be freed immediately after dex32_loader() and does not need to
-       stay alive while the child runs.  Holding the crit only across map+load
-       also bounds kernel-heap pressure from large concurrent cc1.exe images. */
+    id = (DWORD)elf64_stream_load(fname, mode, params, showpath(temp),
+                                  current_process);
+    if (id && (int)id != -1)
+       return id;
+
     sync_entercrit(&elf_map_crit);
     buf = (char*)vfs_mapfile(fname, &size);
     if (!buf){
@@ -221,32 +221,75 @@ int user_execp(char *fname, DWORD mode, char *params){
     }
 
     printf("execp: loading %s (%u bytes) [mmap]\n", fname, (unsigned)size);
-    /* Load synchronously from the caller. The historic process_dispatcher
-       kthread path can starve under software scheduling while the console
-       spins on pd_ok(). */
     id = dex32_loader(fname, buf, userspace, mode, params,
                       showpath(temp), current_process);
-
-    if (!id || (int)id == -1){
-       printf("execp: failed to start %s\n", fname);
-       free(buf);
-       sync_leavecrit(&elf_map_crit);
-       return 0;
-    }
     free(buf);
     sync_leavecrit(&elf_map_crit);
+    if (!id || (int)id == -1)
+       return 0;
+    return id;
+}
+
+int user_execp(char *fname, DWORD mode, char *params){
+    DWORD id;
+    char alt[260];
+    int n = 0, has_dot = 0;
+
+    if (!fname || !fname[0])
+       return 0;
+
+    /* Pause CDC before printf/open — CDC OUT holding usb_io_lock blocked MSC. */
+    usb_cdc_bulk_io_begin();
+    printf("execp: loading %s (Ctrl-C abort, F4 kill fg)\n", fname);
+    id = execp_load(fname, mode, params);
+    if (!id) {
+       while (fname[n] && n < 250) {
+          if (fname[n] == '.')
+             has_dot = 1;
+          n++;
+       }
+       if (!has_dot && n > 0 && n < 250) {
+          memcpy(alt, fname, (unsigned)n);
+          memcpy(alt + n, ".exe", 5);
+          printf("execp: loading %s (Ctrl-C abort, F4 kill fg)\n", alt);
+          id = execp_load(alt, mode, params);
+       }
+    }
+    usb_cdc_bulk_io_end();
+    if (!id){
+       printf("execp: failed to start %s\n", fname);
+       return 0;
+    }
 
     printf("execp: started pid=%d, waiting\n", (int)id);
     fg_setmykeyboard(id);
     {
        int child_status = 0;
+       long wr;
        dex32_child_faulted = 0;
        printf("execp: waitpid enter pid=%d\n", (int)id);
-       /* Consume the direct child's retained status. A process-global fault
-          flag can be set by a faulting grandchild and must not classify its
-          healthy parent as failed. */
-       if (sys_waitpid((int)id,&child_status,0)!=(long)id)
-          child_status = 1;
+       /* Poll with WNOHANG so Ctrl-C can abort. Do NOT call delay():
+          delay() spins until ticks advance, and a stalled tick source
+          (seen on some no-COM1 laptop boots) freezes every exec forever
+          — hello.exe included. WNOHANG already taskswitches once. */
+       for (;;) {
+          wr = sys_waitpid((int)id, &child_status, 1 /* WNOHANG */);
+          if (wr == (long)id)
+             break;
+          if (wr < 0) {
+             child_status = 1;
+             break;
+          }
+          if (current_process && current_process->pending_sig == SIGINT) {
+             current_process->pending_sig = 0;
+             printf("\nexecp: Ctrl-C — killing pid=%d\n", (int)id);
+             kill_process(id);
+             wr = sys_waitpid((int)id, &child_status, 0);
+             if (wr != (long)id)
+                child_status = 1;
+             break;
+          }
+       }
        printf("execp: waitpid exit pid=%d status=%d\n", (int)id,
               child_status);
        dex32_child_faulted = child_status != 0;
@@ -789,9 +832,16 @@ int console_execute(const char *str){
    char *u;
    int command_length = 0;
    signed char mouse_x, mouse_y, last_mouse_x=0, last_mouse_y=0;
+   int n;
   
    //make a copy so that strtok wouldn't ruin str
    strcpy(temp,str);
+   n = (int)strlen(temp);
+   while (n > 0 && (temp[n-1] == '\n' || temp[n-1] == '\r' ||
+                    temp[n-1] == ' ' || temp[n-1] == '\t' ||
+                    temp[n-1] == 3))
+      temp[--n] = 0;
+  
    u=strtok(temp," ");
   
    if (u == 0) 
@@ -1721,25 +1771,31 @@ void console_main(){
    }
 
    clrscr();
-   printf("console: tmux keys  C-b c/n/p/l/0-9/w/x/?  (F2 new, F12 next)\n");
+   printf("console: tmux C-b [/c/n/p/l/0-9/w/x/?  F2 new  F4 kill fg\n");
    strcpy(last,"");
-    
-   if (console_first == 0) {
-      if (kernel_kexeced && strcmp(kernel_cmdline, "kexeced") == 0) {
-         printf("KEXEC_BOOT_OK\n");
-         serial_puts("KEXEC_BOOT_OK\n");
-         if (script_load("/icsos/postkexec.bat") == -1)
-            machine_reboot();
-      } else
-         script_load("/icsos/autoexec.bat");
-   }
-    
-   console_first++;
-   /* Prefer userland sh.exe when present (PATH on CD / ramdisk). */
-   if (user_execp("/icsos/apps/sh.exe", 0, "/icsos/apps/sh.exe")) {
-      fg_exit();
-      exit(0);
-      return;
+
+   /* First window: run autoexec while MSC is still quiet (hotplug/CDC pump
+      starts only after CONSOLE_READY). Do not auto-exec sh.exe — loading it
+      from USB-root races the same pump and leaves a blank hung tty. Extra
+      C-b c windows always drop straight to the kernel prompt. */
+   {
+      int is_first = (console_first == 0);
+
+      if (is_first) {
+         if (kernel_kexeced && strcmp(kernel_cmdline, "kexeced") == 0) {
+            printf("KEXEC_BOOT_OK\n");
+            serial_puts("KEXEC_BOOT_OK\n");
+            if (script_load("/icsos/postkexec.bat") == -1)
+               machine_reboot();
+         } else
+            script_load("/icsos/autoexec.bat");
+      }
+
+      console_first++;
+      printf("CONSOLE_READY window=%d\n", console_first - 1);
+      serial_puts("CONSOLE_READY\n");
+      if (is_first)
+         printf("kernel prompt (type sh for POSIX shell, help for commands)\n");
    }
    do{
       textcolor(WHITE);

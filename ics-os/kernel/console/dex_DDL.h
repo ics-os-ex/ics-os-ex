@@ -15,6 +15,7 @@
 #define DEX_DLL_H
 
 #include "../dextypes.h"
+#include "console_mux.h"
 
 typedef struct _dex32_direct_device_hdl {
    DWORD size;             //defines the size of this structure
@@ -34,6 +35,7 @@ typedef struct _dex32_direct_device_hdl {
    DWORD cury;             //cursor y
    DWORD lines;            //the number of lines
    int scroll;
+   console_hist_t *hist;   /* scrolled-off rows; malloc'd in Dex32CreateDDL */
    
    //added 2/2/2004, support for ANSI escape codes
    char ansi_command_ptr;

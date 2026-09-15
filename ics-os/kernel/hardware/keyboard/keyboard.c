@@ -145,14 +145,17 @@ void sendtokeyb(const char *s,queue_t *q)
 
 int signal_foreground()
 {
-if (fg_getkeyboardowner()!=0)
-  {
-      sched_sysmes[0]=fg_getkeyboardowner();
-      sched_sysmes[1]=SIG_TERM;
-      sched_sysmes[2]=0;
-      return 1;
-  };
-  return 0;
+  int owner = fg_getkeyboardowner();
+  if (!owner && fg_current >= 0 && fg_current < FG_MAXCONSOLE
+      && fg_vconsoles[fg_current]
+      && !fg_vconsoles[fg_current]->ignore)
+     owner = fg_vconsoles[fg_current]->pid;
+  if (!owner)
+     return 0;
+  sched_sysmes[0]=owner;
+  sched_sysmes[1]=SIG_TERM;
+  sched_sysmes[2]=0;
+  return 1;
 ;};
 
 /*
@@ -177,7 +180,7 @@ static const char *kbd_special_sequence(unsigned int c)
     case KEY_F1:   return "\x1bOP";
     case KEY_F2:   return "\x1bOQ";
     case KEY_F3:   return "\x1bOR";
-    case KEY_F4:   return "\x1bOS";
+    /* KEY_F4 is force-kill in kbd_irq; do not emit xterm F4 ("\x1bOS"). */
     case KEY_F5:   return "\x1b[15~";
     case KEY_F6:   return "\x1b[17~";
     case KEY_F7:   return "\x1b[18~";
@@ -193,15 +196,36 @@ static const char *kbd_special_sequence(unsigned int c)
 
 int kill_foreground()
 {
-  if (fg_getkeyboardowner() != 0)
-   {
-     printf("\nForeground Application force terminated using Ctrl-X\n");
-     if ( fg_vconsoles[fg_current]->pid != fg_getkeyboardowner())
-     sigterm = fg_getkeyboardowner();
-     return 1;
-   };
-   return 0;
+  int owner = fg_getkeyboardowner();
+  int cons = 0;
+  int i, others = 0;
+  /* keyboard.c is compiled before foreground.c; do not call fg_usable(). */
+  if (fg_current >= 0 && fg_current < FG_MAXCONSOLE
+      && fg_vconsoles[fg_current]
+      && !fg_vconsoles[fg_current]->ignore)
+     cons = fg_vconsoles[fg_current]->pid;
+  /* Prefer the keyboard-focus task; if the kernel console itself is stuck
+     in ls/VFS (owner == console pid, or owner unset), kill that console. */
+  if (!owner)
+     owner = cons;
+  if (!owner)
+     return 0;
+  printf("\nForeground force terminated (F4)\n");
+  sigterm = owner;
+  /* If we killed the only console window's thread, open a replacement so
+     C-b c / recovery is not required after a wedged `ls`. */
+  if (owner == cons) {
+     for (i = 0; i < FG_MAXCONSOLE; i++)
+        if (i >= 0 && i < FG_MAXCONSOLE && fg_vconsoles[i]
+            && !fg_vconsoles[i]->ignore
+            && fg_vconsoles[i]->pid != owner)
+           others++;
+     if (!others)
+        console_new();
+  }
+  return 1;
 };
+
 
 void  kbd_irq(void)
 {
@@ -224,11 +248,15 @@ void  kbd_irq(void)
            {     
                    if (c == SOFT_RESET) ps_shutdown();
                         else 
-                   if (c==KEY_F2+400) console_new();
+                   if (c==KEY_F2 || c==KEY_F2+400) console_new();
                         else 
                    if (c==KEY_F1+400) dex32_set_tm_state(!dex32_get_tm_state());
                         else 
-                   if (c==KEY_F4+400) kill_foreground();  //force terminate
+                   if (c==KEY_F4 || c==KEY_F4+400) {
+                         /* Plain F4 used to inject "\x1bOS" (printed as "OS")
+                            while only Ctrl-Alt-F4 called kill_foreground. */
+                         kill_foreground();
+                   }
                         else
                    if (c=='c'-'a')
                          {

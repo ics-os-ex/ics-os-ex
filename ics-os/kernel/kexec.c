@@ -19,11 +19,8 @@ static unsigned long kexec_entry;
 static unsigned long kexec_span;
 static int kexec_ready;
 
-int kexec_load(const char *path)
+static int kexec_parse_elf(const unsigned char *eh, unsigned int sz)
 {
-   DWORD sz = 0;
-   char *img;
-   unsigned char *eh;
    unsigned long phoff, phentsize, phnum, i;
    unsigned long min_va = ~0UL, max_va = 0;
 
@@ -31,31 +28,27 @@ int kexec_load(const char *path)
    kexec_span = 0;
    kexec_entry = 0;
 
-   img = vfs_mapfile(path, &sz);
-   if (!img || sz < 64) {
-      printf("kexec: cannot map %s\n", path);
+   if (!eh || sz < 64) {
+      printf("kexec: image too small\n");
       return -1;
    }
-   eh = (unsigned char *)img;
    if (eh[0] != 0x7f || eh[1] != 'E' || eh[2] != 'L' || eh[3] != 'F' || eh[4] != 2) {
       printf("kexec: not ELF64\n");
-      free(img);
       return -1;
    }
-   kexec_entry = *(unsigned long *)(img + 24); /* e_entry */
-   phoff = *(unsigned long *)(img + 32);
-   phentsize = *(unsigned short *)(img + 54);
-   phnum = *(unsigned short *)(img + 56);
-   if (!phoff || !phnum || phentsize < 56) {
+   kexec_entry = *(unsigned long *)(eh + 24); /* e_entry */
+   phoff = *(unsigned long *)(eh + 32);
+   phentsize = *(unsigned short *)(eh + 54);
+   phnum = *(unsigned short *)(eh + 56);
+   if (!phoff || !phnum || phentsize < 56 || phoff + phnum * phentsize > sz) {
       printf("kexec: bad program headers\n");
-      free(img);
       return -1;
    }
 
    memset((void *)(uintptr)KEXEC_STAGE, 0, KEXEC_MAX);
 
    for (i = 0; i < phnum; i++) {
-      char *ph = img + phoff + i * phentsize;
+      const unsigned char *ph = eh + phoff + i * phentsize;
       unsigned int type = *(unsigned int *)ph;
       unsigned long vaddr, filesz, memsz, offset;
       unsigned long dst;
@@ -68,17 +61,20 @@ int kexec_load(const char *path)
       memsz  = *(unsigned long *)(ph + 40);
       if (vaddr < MEM_KERNEL_LOAD) {
          printf("kexec: PT_LOAD vaddr 0x%lx below kernel load\n", vaddr);
-         free(img);
          return -1;
       }
       dst = KEXEC_STAGE + (vaddr - MEM_KERNEL_LOAD);
       if ((vaddr - MEM_KERNEL_LOAD) + memsz > KEXEC_MAX) {
          printf("kexec: image too large (%lu)\n", (unsigned long)memsz);
-         free(img);
          return -1;
       }
-      if (filesz)
-         memcpy((void *)(uintptr)dst, img + offset, (unsigned)filesz);
+      if (filesz) {
+         if (offset + filesz > sz) {
+            printf("kexec: truncated PT_LOAD\n");
+            return -1;
+         }
+         memcpy((void *)(uintptr)dst, eh + offset, (unsigned)filesz);
+      }
       if (memsz > filesz)
          memset((void *)(uintptr)(dst + filesz), 0, (unsigned)(memsz - filesz));
       if (vaddr < min_va)
@@ -86,7 +82,6 @@ int kexec_load(const char *path)
       if (vaddr + memsz > max_va)
          max_va = vaddr + memsz;
    }
-   free(img);
 
    if (max_va <= min_va) {
       printf("kexec: no PT_LOAD segments\n");
@@ -99,6 +94,27 @@ int kexec_load(const char *path)
    printf("kexec: staged %lu bytes entry=0x%lx\n",
           kexec_span, kexec_entry);
    return 0;
+}
+
+int kexec_load_mem(const void *img, unsigned int sz)
+{
+   return kexec_parse_elf((const unsigned char *)img, sz);
+}
+
+int kexec_load(const char *path)
+{
+   DWORD sz = 0;
+   char *img;
+   int r;
+
+   img = vfs_mapfile(path, &sz);
+   if (!img || sz < 64) {
+      printf("kexec: cannot map %s\n", path);
+      return -1;
+   }
+   r = kexec_parse_elf((unsigned char *)img, sz);
+   free(img);
+   return r;
 }
 
  void kexec_reboot(void)

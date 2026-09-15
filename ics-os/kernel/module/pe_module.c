@@ -726,7 +726,14 @@ int pe_loadusermodule(
    printf("PE module loader called..\n");
    #endif
    
-   if (opthdr->Magic == 0x10b) printf("PE32 file detected.\n");
+   if (opthdr->Magic == 0x10b) {
+#ifdef __x86_64__
+      printf("pe: 32-bit PE is not supported (%s); use ELF64\n", module_name);
+      return 0;
+#else
+      printf("PE32 file detected.\n");
+#endif
+   }
       else
    if (opthdr->Magic == 0x20b) 
       {

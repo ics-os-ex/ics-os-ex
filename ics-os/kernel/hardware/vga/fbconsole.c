@@ -405,6 +405,42 @@ int fbconsole_have_tag(void)
     return fb_have_tag ? 1 : 0;
 }
 
+int fbconsole_geom(unsigned int *width, unsigned int *height,
+                   unsigned int *bpp)
+{
+    if (!fbconsole_active() || !fb_base)
+        return 0;
+    if (width)
+        *width = fb_width;
+    if (height)
+        *height = fb_height;
+    if (bpp)
+        *bpp = fb_bpp;
+    return 1;
+}
+
+int fbconsole_rgb_at(unsigned int x, unsigned int y,
+                     unsigned char *r, unsigned char *g, unsigned char *b)
+{
+    unsigned int v, rv, gv, bv, rmax, gmax, bmax;
+    if (!fbconsole_active() || !fb_base || x >= fb_width || y >= fb_height)
+        return 0;
+    v = fb_get_pixel(x, y);
+    rmax = fb_rsize ? ((1u << fb_rsize) - 1u) : 0;
+    gmax = fb_gsize ? ((1u << fb_gsize) - 1u) : 0;
+    bmax = fb_bsize ? ((1u << fb_bsize) - 1u) : 0;
+    rv = fb_rsize ? ((v >> fb_rshift) & rmax) : 0;
+    gv = fb_gsize ? ((v >> fb_gshift) & gmax) : 0;
+    bv = fb_bsize ? ((v >> fb_bshift) & bmax) : 0;
+    if (r)
+        *r = (unsigned char)(rmax ? (rv * 255u) / rmax : 0);
+    if (g)
+        *g = (unsigned char)(gmax ? (gv * 255u) / gmax : 0);
+    if (b)
+        *b = (unsigned char)(bmax ? (bv * 255u) / bmax : 0);
+    return 1;
+}
+
 void fbconsole_cell_render(int x, int y, unsigned char c, unsigned char attr)
 {
     if (!fbconsole_active() || !fb_live_render)

@@ -10,6 +10,7 @@
  */
 #include "virtio.h"
 #include "virtio_blk.h"
+#include "../pci_scan.h"
 #include "../../devmgr/dex32_devmgr.h"
 #include "../../cpu/lapic.h"
 #include "../../cpu/spinlock.h"
@@ -25,6 +26,7 @@ extern char *strcpy(char *d, const char *s);
 extern int printf(const char *fmt, ...);
 extern void *memcpy(void *d, const void *s, unsigned int n);
 extern void *mmio_map(u64 phys, u64 len);
+extern int serial_com1_present(void);
 extern void storeflags(DWORD *flags);
 extern void restoreflags(DWORD flags);
 extern void stopints(void);
@@ -235,11 +237,30 @@ static void *zalloc_align(unsigned sz, unsigned align)
 static int virtio_find_blk(u8 *bus, u8 *dev, u8 *fn)
 {
    int b, d, f;
-   for (b = 0; b < 8; b++) {
+   int max_bus;
+   /* N150 has no virtio. Even a bus-0-only walk of every slot can
+      master-abort-timeout on some PCH devices (~half of boots freeze at
+      "virtio-blk: pci bus 0"). QEMU always has COM1 and may place virtio
+      behind a root port — only scan when COM1 is present. */
+   if (!pci_scan_virtio_allowed(serial_com1_present())) {
+      printf("virtio-blk: skip pci scan (no COM1)\n");
+      return 0;
+   }
+   max_bus = 8;
+   for (b = 0; b < max_bus; b++) {
       for (d = 0; d < 32; d++) {
-         for (f = 0; f < 8; f++) {
-            u16 vend = pci_read16((u8)b, (u8)d, (u8)f, 0);
+         u16 vend = pci_read16((u8)b, (u8)d, (u8)0, 0);
+         unsigned int maxf;
+         if (vend == 0xFFFF)
+            continue;
+         maxf = pci_slot_fn_count(vend, pci_read32((u8)b, (u8)d, 0, 0x0C));
+         for (f = 0; f < (int)maxf; f++) {
             u16 did;
+            if (f) {
+               vend = pci_read16((u8)b, (u8)d, (u8)f, 0);
+               if (vend == 0xFFFF)
+                  continue;
+            }
             if (vend != VIRTIO_VENDOR_ID)
                continue;
             did = pci_read16((u8)b, (u8)d, (u8)f, 2);
@@ -312,6 +333,9 @@ static int virtio_setup_msix(struct vblk_dev *d)
    u16 cmd;
 
    if (!(status & PCI_STATUS_CAPS))
+      return 0;
+   /* Same rule as xHCI: xAPIC MSI address 0xFEE00000 hung the N150 PCH. */
+   if (!serial_com1_present() || lapic_x2apic_enabled())
       return 0;
    ptr = pci_read8(d->bus, d->dev, d->fn, PCI_CAP_PTR);
    while (ptr >= 0x40) {
