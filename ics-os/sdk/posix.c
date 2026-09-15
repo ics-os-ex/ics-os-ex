@@ -78,6 +78,8 @@ extern void exit(int status);
 #define FXN_CONNECT 0xCA
 #define FXN_SEND    0xCB
 #define FXN_RECV    0xCC
+#define FXN_SENDTO  0xCD
+#define FXN_RECVFROM 0xCE
 #define FXN_DELAY 0x9B
 #define FXN_PRECISTIME 0x96
 
@@ -1961,4 +1963,20 @@ ssize_t send(int fd, const void *buf, size_t len, int flags)
 ssize_t recv(int fd, void *buf, size_t len, int flags)
 {
    return (ssize_t)ics_sys(FXN_RECV, fd, (long)buf, (long)len, flags, 0);
+}
+
+ssize_t sendto(int fd, const void *buf, size_t len, int flags,
+               const struct sockaddr *addr, socklen_t addrlen)
+{
+   (void)flags;
+   return (ssize_t)ics_sys(FXN_SENDTO, fd, (long)buf, (long)len,
+                           (long)addr, (long)addrlen);
+}
+
+ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
+                 struct sockaddr *addr, socklen_t *addrlen)
+{
+   (void)flags;
+   return (ssize_t)ics_sys(FXN_RECVFROM, fd, (long)buf, (long)len,
+                           (long)addr, (long)addrlen);
 }

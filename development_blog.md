@@ -2,6 +2,15 @@
 
 ## 2026-09-15 (Manila, UTC+8)
 
+### 18:55 — Socket completion: UDP sendto/recvfrom + listen/accept
+
+Current problem: last milestone left UDP sockets half-done and never
+exercised bind/listen/accept from userland.
+Activity: `sendto`/`recvfrom` (`0xCD`/`0xCE`), UDP RX demux into bound
+sockets, peer vs local port bookkeeping, and `netecho` phases for TCP
+client, UDP echo, and TCP listen on `:7779` with QEMU hostfwd + host
+probe (`NET_SOCK_UDP_OK` / `NET_SOCK_LISTEN_OK`).
+
 ### 18:45 — Berkeley sockets + netecho
 
 Current problem: expose TCP/UDP to userland over POSIX fds.

@@ -781,7 +781,8 @@ test-virtio: vmdex
 
 # Boot with virtio-net on QEMU user (SLIRP) networking; static 10.0.2.15
 # pings 10.0.2.2, UDP-echoes :7777, TCP-echoes :7778 on the host, then
-# userland netecho.exe exercises Berkeley sockets (NET_SOCK_OK).
+# userland netecho.exe exercises TCP client, UDP sendto/recvfrom, and TCP
+# listen/accept via hostfwd :17779→:7779.
 apps/netecho.exe: contrib/netecho/netecho.c contrib/netecho/Makefile sdk/posix.c sdk/include/sys/socket.h
 	$(MAKE) -C contrib/netecho install
 
@@ -794,19 +795,21 @@ test-net: vmdex apps/netecho.exe
 	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
 		> /tmp/icsos-net-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-net.iso /tmp/icsos-net-iso >/dev/null 2>&1
-	@echo "Starting host UDP/TCP echo on :7777/:7778..."
-	@chmod +x scripts/udp_echo_server.py scripts/tcp_echo_server.py
+	@echo "Starting host UDP/TCP echo + listen probe..."
+	@chmod +x scripts/udp_echo_server.py scripts/tcp_echo_server.py scripts/tcp_connect_probe.py
 	@python3 scripts/udp_echo_server.py 7777 >/tmp/icsos-udp-echo.log 2>&1 & echo $$! > /tmp/icsos-udp-echo.pid
 	@python3 scripts/tcp_echo_server.py 7778 >/tmp/icsos-tcp-echo.log 2>&1 & echo $$! > /tmp/icsos-tcp-echo.pid
+	@python3 scripts/tcp_connect_probe.py 17779 >/tmp/icsos-tcp-probe.log 2>&1 & echo $$! > /tmp/icsos-tcp-probe.pid
 	@echo "Running virtio-net ping+UDP+TCP+socket test (TCG, 2 vCPUs)..."
-	@-timeout 70 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
+	@-timeout 80 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
 		-cdrom /tmp/icsos-net.iso -boot d \
-		-netdev user,id=n0 \
+		-netdev user,id=n0,hostfwd=tcp::17779-:7779 \
 		-device virtio-net-pci,netdev=n0,disable-legacy=on \
 		< /dev/null > /tmp/icsos-net.log 2>&1; \
 	 status=$$?; \
 	 if [ -f /tmp/icsos-udp-echo.pid ]; then kill $$(cat /tmp/icsos-udp-echo.pid) 2>/dev/null || true; rm -f /tmp/icsos-udp-echo.pid; fi; \
 	 if [ -f /tmp/icsos-tcp-echo.pid ]; then kill $$(cat /tmp/icsos-tcp-echo.pid) 2>/dev/null || true; rm -f /tmp/icsos-tcp-echo.pid; fi; \
+	 if [ -f /tmp/icsos-tcp-probe.pid ]; then wait $$(cat /tmp/icsos-tcp-probe.pid) 2>/dev/null || true; rm -f /tmp/icsos-tcp-probe.pid; fi; \
 	 exit 0
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-net.log
 	@grep -aq "VIRTIO_NET_OK" /tmp/icsos-net.log
@@ -816,6 +819,8 @@ test-net: vmdex apps/netecho.exe
 	@grep -aq "NET_UDP_OK" /tmp/icsos-net.log
 	@grep -aq "NET_TCP_OK" /tmp/icsos-net.log
 	@grep -aq "NET_SOCK_OK" /tmp/icsos-net.log
+	@grep -aq "NET_SOCK_UDP_OK" /tmp/icsos-net.log
+	@grep -aq "NET_SOCK_LISTEN_OK" /tmp/icsos-net.log
 	@! grep -aq "VIRTIO_NET_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_PING_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_UDP_FAIL" /tmp/icsos-net.log

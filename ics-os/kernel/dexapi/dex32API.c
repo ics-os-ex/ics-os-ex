@@ -218,6 +218,8 @@ void api_init(){
      api_addsystemcall(0xCA,sys_connect,0,API_REQUIRE_INTS);
      api_addsystemcall(0xCB,sys_send,0,API_REQUIRE_INTS);
      api_addsystemcall(0xCC,sys_recv,0,API_REQUIRE_INTS);
+     api_addsystemcall(0xCD,sys_sendto,0,API_REQUIRE_INTS);
+     api_addsystemcall(0xCE,sys_recvfrom,0,API_REQUIRE_INTS);
   };
 
 

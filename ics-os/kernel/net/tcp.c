@@ -77,6 +77,16 @@ int tcp_pcb_state(struct tcp_pcb *pcb)
     return pcb ? pcb->state : TCP_CLOSED;
 }
 
+unsigned int tcp_pcb_remote_ip(struct tcp_pcb *pcb)
+{
+    return pcb ? pcb->remote_ip : 0;
+}
+
+unsigned short tcp_pcb_remote_port(struct tcp_pcb *pcb)
+{
+    return pcb ? pcb->remote_port : 0;
+}
+
 static int tcp_output(struct tcp_pcb *pcb, unsigned char flags,
                       const unsigned char *payload, unsigned int payload_len)
 {

@@ -121,5 +121,7 @@ int  tcp_pcb_recv(struct tcp_pcb *pcb, void *buf, unsigned int len,
                   unsigned int timeout_spins);
 int  tcp_pcb_close(struct tcp_pcb *pcb);
 int  tcp_pcb_state(struct tcp_pcb *pcb);
+unsigned int tcp_pcb_remote_ip(struct tcp_pcb *pcb);
+unsigned short tcp_pcb_remote_port(struct tcp_pcb *pcb);
 
 #endif

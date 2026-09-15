@@ -83,4 +83,9 @@ int  udp_send(struct netif *nif, unsigned int dst_host,
 int  udp_echo_client(struct netif *nif, unsigned int dst_host,
                      unsigned short dst_port, unsigned int timeout_spins);
 
+/* Deliver inbound UDP to a bound user socket (returns 1 if consumed). */
+int  sock_udp_deliver(unsigned short dport, unsigned short sport,
+                      unsigned int sip, const unsigned char *payload,
+                      unsigned int plen);
+
 #endif

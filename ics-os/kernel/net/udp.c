@@ -67,6 +67,12 @@ void udp_input(struct netif *nif, struct pbuf *p, unsigned int ip_hdr_len)
         return;
     }
 
+    /* Bound userland UDP sockets. */
+    if (sock_udp_deliver(dport, sport, net_ntohl(ip->src), payload, payload_len)) {
+        pbuf_free(p);
+        return;
+    }
+
     /* Outstanding echo-client reply. */
     if (udp_wait && dport == udp_wait_sport && sport == udp_wait_dport &&
         payload_len == udp_wait_plen &&
