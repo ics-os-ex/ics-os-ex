@@ -93,9 +93,7 @@ test-posixio`, and `make test-virtio`; the guest tests use two virtual CPUs and
 remain focused regression/functional tests rather than exhaustive stress.
 Networking milestones A–C plus Berkeley sockets, SMP netstress, and DHCP:
 `make test-net-unit`, `make test-net` (`NET_DHCP_OK` + sockets), and
-`make test-net-stress`.
-`make test-net`, and `make test-net-stress` (virtio-net SLIRP ICMP + UDP +
-TCP + sockets, plus concurrent `user-smp` socket hammer → `NETSTRESS_PASS`).
+`make test-net-stress` (concurrent `user-smp` socket hammer → `NETSTRESS_PASS`).
 
 POSIX fd lookup must hold the process `fd_lock` until it has acquired a typed
 reference on the VFS, block, or io_uring open description. `sys_close()` first
