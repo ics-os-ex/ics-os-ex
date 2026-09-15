@@ -70,8 +70,12 @@ Useful individual targets (from `ics-os/`):
 | `test-usb-storage-xhci-reconnect-mismatch` | Re-enumerated replacement with different geometry remains offline |
 | `test-usb-storage-xhci-reconnect-identity-mismatch` | Same-size replacement with a different FAT volume serial remains offline |
 | `test-usb-storage-xhci-no-device` | q35 xHCI no-device path reaches console without registering USB storage |
+| `test-usb-cdc-console` | q35 xHCI MSC root plus CDC-ACM console (`usb-serial`); both attach orders keep `Root mount [OK]` and write `USB_CDC_CONSOLE_OK` plus `ICSOS_VER` to the gadget chardev |
+| `test-usb-cdc-pico` | Physical Pico 2 W (`2e8a:0005`) via QEMU `usb-host` on q35 xHCI; curls Pico Wi-Fi for `USB_CDC_CONSOLE_OK`, `ICSOS_VER`, `pico=`, `USB_CDC_RX`, and `STATUS cdc=1`/`release=`. SKIP if the gadget is not plugged into the host |
 | `test-posixio` | POSIX fds + preadv/pwritev/fsync + io_uring; ramdisk `POSIXIO_PASS`/`URING_PASS`; virtio `/dev/vblk` `URING_VBLK_PASS` |
 | `test-virtio` | QEMU virtio-blk DMA; MSI-X completions; `VIRTIO_BLK_OK` + `VIRTIO_IRQ_OK` |
+| `test-net` | QEMU virtio-net + SLIRP; static `10.0.2.15` ICMP ping of `10.0.2.2`; `VIRTIO_NET_OK` + `NET_PING_OK` |
+| `test-net-unit` | Host TAP for checksum / ARP / ICMP echo transform (`tests/net_*_unit.c`) |
 | `test-ext4` | ext4 virtio-blk read/create/write; guest marker plus host `e2fsck`/`debugfs` validation of the post-test image |
 | `test-spawn` | `posix_spawn` + `waitpid` of `hello.exe` (`SPAWN_PASS`); FAT `/work` on virtio (`WORK_DISK_PASS`) |
 | `test-stress` | SMP=4 spawn/exit/reap + short fork+ELF overlap (`STRESSPROC_PASS`); no GPF/PF |
@@ -89,6 +93,16 @@ Useful individual targets (from `ics-os/`):
 | `test-fbconsole-unit` | Host-native TAP for GOP/VBE pitch, late map, PAT-WC, 80x25 origin, and per-axis zoom (`tests/fbconsole_geom_unit.c`) |
 | `test-kbdleds-unit` | Host-native TAP for i8042 boot-stage Caps/Num/Scroll encoding (`tests/kbd_boot_leds_unit.c`) |
 | `test-lapicx2-unit` | Host-native TAP for x2APIC MSR numbers (`tests/lapic_x2_unit.c`) |
+| `test-xhcipolicy-unit` | Host-native TAP for xHCI MSI-X vs poll (no COM1 / x2APIC), CCS bits, and control TD flags (`tests/xhci_policy_unit.c`) |
+| `test-consolemux-unit` | Host-native TAP for tmux status-line NUL/truncation, scrollback view mapping, and Caps/Ctrl mux letter folding (`tests/console_mux_unit.c`) |
+| `test-scriptcomment-unit` | Host-native TAP for DOS `rem`/`#`/`'` script comment tokens (`tests/script_comment_unit.c`) |
+| `test-cdcacm-unit` | Host-native TAP for CDC-ACM and QEMU FTDI vendor-serial config parsing (`tests/usb_cdc_acm_unit.c`) |
+| `test-netchecksum-unit` | Host-native TAP for Internet checksum (`tests/net_checksum_unit.c`) |
+| `test-netarp-unit` | Host-native TAP for ARP build/parse/cache (`tests/net_arp_unit.c`) |
+| `test-neticmp-unit` | Host-native TAP for ICMP echo request→reply transform (`tests/net_icmp_unit.c`) |
+| `test-usbdbg-unit` | Host-native TAP for the CDC debug RPC line parser, KEYS hex, SCREEN dump, PPM size, and ICSOS_VER bind/STATUS stamps (`tests/usb_debug_unit.c`) |
+| `test-ttycanon-unit` | Host-native TAP for canonical tty read remainder (`tests/tty_canon_unit.c`) |
+| `test-pciscan-unit` | Host-native TAP for PCI slot function-count (empty slots skip fn 1-7; `tests/pci_scan_unit.c`) |
 | `test-bridge-console-unit` | Host-native TAP for the ESP32 debug-bridge LCD line buffer (`tests/bridge_console_unit.c`) |
 | `test-vfsgrow-unit` | Host-native TAP for VFS `vfs_units_covering` (exact cluster-size grow; `tests/vfs_grow_unit.c`) |
 | `test-smpclaim-unit` | Host-native TAP for the one-PCB-one-CPU claim/publish protocol, crit nest tokens, and `irq_kstack_dest` (process kstack top only from the user stack; `tests/smp_claim_unit.c`) |
@@ -193,7 +207,7 @@ Make sure it contains the current problem and the activity currently being perfo
 
 ## Suggested next work
 
-1. Qualify physical N150 xHCI USB root and writable `/icsos`. GOP console is live; parse MADT before re-enabling APs. Pico/ESP32 bridges need a 16550 COM1 header (USB gadget is not COM1).
+1. Qualify physical N150 xHCI USB root and writable `/icsos`. GOP console is live; parse MADT before re-enabling APs. Pico USB CDC-ACM gadget console is in (`test-usb-cdc-console`); UART bridges still need a 16550 COM1 header.
 2. Complete strict GCC self-host certification (see `ics-os/docs/gcc-selfhost.md`): `test-kbuild` passes with a host-seeded compiler, but GCC must still rebuild itself in-OS and that rebuilt compiler must build the kernel before the loop is closed.
 3. Richer io_uring (registered buffers, linked SQEs) if needed. Async virtio CQEs and `/dev/vblk` are in. `posix_spawn` / `waitpid` / `/work` are in (`make test-spawn`).
 4. Allow user processes on any CPU and validate remote COW TLB shootdown during migration; harden `waitpid`/exit migration first.

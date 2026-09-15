@@ -132,6 +132,7 @@ extern void textcolor(unsigned char c);
 #include "hardware/usb/usb.h"
 #include "iomgr/iosched.h"
 #include "hardware/virtio/virtio_blk.h"
+#include "hardware/virtio/virtio_net.h"
 #include "kexec.h"
 
 //structure to hold the boot info
@@ -836,6 +837,9 @@ void dex_init(){
 
    printf("Initializing virtio-blk...\n");
    virtio_blk_init();
+
+   printf("Initializing virtio-net...\n");
+   virtio_net_init();
 
    printf("Initializing USB mass-storage drivers...\n");
    usb_init();

@@ -210,10 +210,11 @@ static inline int irq_iretq_frame_cr3_ok(unsigned long frame,
 
 /* Crit owner token is (pid & 0x7fffff)+1.  Leftover current must not
    mint a token for a different MM PCB (cert 248122 vfs_busy 0x1f vs 0x2a). */
-/* Timer iretq after schedule_from_timer.  Kernel .text ends ~0x180e3e;
-   0x300000..4GiB used to accept BSS and kheap (cert 248124 IRETQ-BADRIP
-   then halt as leftover idle with no RIP printed). */
-#define IRQ_IRETQ_KTEXT_END  0x182000UL
+/* Timer iretq after schedule_from_timer.  Kernel .text ends ~0x19562b
+   after virtio-net + IPv4 stack; keep a margin under the 4MiB user ELF
+   window.  0x300000..4GiB used to accept BSS and kheap (cert 248124
+   IRETQ-BADRIP then halt as leftover idle with no RIP printed). */
+#define IRQ_IRETQ_KTEXT_END  0x1C0000UL
 
 /* x86-64 canonical: bits 48..63 are sign-extension of bit 47. */
 static inline int addr_canonical(unsigned long a)

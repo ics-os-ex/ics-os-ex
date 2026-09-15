@@ -93,7 +93,8 @@ warncheck:
 endif
 
 obj: warncheck scheduler.o fat.o ext4.o iso9660.o ramdisk.o devfs.o iomgr.o blkcache.o posixfd.o devmgr_error.o kernel32.o \
-		startup.o asmlib.o irqwrap.o context.o ap_trampoline.o lapic.o smp.o kexec.o irq_lifecycle.o vtd.o virtio_blk.o
+		startup.o asmlib.o irqwrap.o context.o ap_trampoline.o lapic.o smp.o kexec.o irq_lifecycle.o vtd.o virtio_blk.o virtio_net.o \
+		net_pbuf.o net_netif.o net_ethernet.o net_arp.o net_ipv4.o net_icmp.o net_inet_config.o
 		
 kernel32.o: kernel32.c build.h hardware/usb/uhci.c hardware/usb/xhci.c hardware/usb/xhci_policy.h hardware/usb/usb.h hardware/usb/usb_cdc_acm.h hardware/usb/usb_debug.h hardware/dma.h hardware/irq_lifecycle.h \
 		hardware/chips/serial.c hardware/ATA/ide.c hardware/ATA/ata_capacity.h \
@@ -171,6 +172,30 @@ kexec.o: kexec.S
 virtio_blk.o: hardware/virtio/virtio_blk.c hardware/virtio/virtio_blk.h hardware/virtio/virtio.h hardware/pci_scan.h hardware/irq_lifecycle.h process/process.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o virtio_blk.o hardware/virtio/virtio_blk.c
 
+virtio_net.o: hardware/virtio/virtio_net.c hardware/virtio/virtio_net.h hardware/virtio/virtio.h hardware/pci_scan.h hardware/irq_lifecycle.h net/netif.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o virtio_net.o hardware/virtio/virtio_net.c
+
+net_pbuf.o: net/pbuf.c net/pbuf.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_pbuf.o net/pbuf.c
+
+net_netif.o: net/netif.c net/netif.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_netif.o net/netif.c
+
+net_ethernet.o: net/ethernet.c net/ethernet.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_ethernet.o net/ethernet.c
+
+net_arp.o: net/arp.c net/arp.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_arp.o net/arp.c
+
+net_ipv4.o: net/ipv4.c net/ipv4.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_ipv4.o net/ipv4.c
+
+net_icmp.o: net/icmp.c net/icmp.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_icmp.o net/icmp.c
+
+net_inet_config.o: net/inet_config.c net/inet_config.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_inet_config.o net/inet_config.c
+
 irq_lifecycle.o: hardware/irq_lifecycle.c hardware/irq_lifecycle.h cpu/spinlock.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o irq_lifecycle.o hardware/irq_lifecycle.c
 
@@ -185,7 +210,8 @@ smp.o: cpu/smp.c cpu/smp.h process/process.h process/irq_kstack.h
 	
 Kernel64.bin: startup.o asmlib.o context.o ap_trampoline.o lapic.o smp.o kernel32.o \
 		scheduler.o iomgr.o blkcache.o posixfd.o fat.o ext4.o iso9660.o ramdisk.o \
-		devfs.o irqwrap.o devmgr_error.o kexec.o irq_lifecycle.o vtd.o virtio_blk.o
+		devfs.o irqwrap.o devmgr_error.o kexec.o irq_lifecycle.o vtd.o virtio_blk.o virtio_net.o \
+		net_pbuf.o net_netif.o net_ethernet.o net_arp.o net_ipv4.o net_icmp.o net_inet_config.o
 	$(LD) $(LDFLAGS) $(MAPFLAGS)
 
 clean:

@@ -36,8 +36,8 @@ HOSTG_RTFLAGS := -m64 -std=gnu89 -w -nostdlib -fno-builtin -static -ffreestandin
 vmdex:
 	make -C kernel/
 
-.PHONY: usb-uefi usb-etcher test-usb-uefi-gpt test-vbox-uefi-gpt test-vbox-uefi-gpt-bios test-bochs-uefi-gpt
-.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-ide-thumbdrive
+.PHONY: usb-uefi usb-etcher test-usb-uefi-gpt test-vbox-uefi-gpt test-vbox-uefi-gpt-bios test-bochs-uefi-gpt test-usb-cdc-pico
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-ttycanon-unit test-usbdbg-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -96,6 +96,59 @@ test-lapicx2-unit:
 	@mkdir -p /tmp/icsos-tests
 	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/lapic_x2_unit.c -o /tmp/icsos-tests/lapic_x2_unit
 	@/tmp/icsos-tests/lapic_x2_unit
+
+test-xhcipolicy-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/xhci_policy_unit.c -o /tmp/icsos-tests/xhci_policy_unit
+	@/tmp/icsos-tests/xhci_policy_unit
+
+test-consolemux-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/console_mux_unit.c -o /tmp/icsos-tests/console_mux_unit
+	@/tmp/icsos-tests/console_mux_unit
+
+test-scriptcomment-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/script_comment_unit.c -o /tmp/icsos-tests/script_comment_unit
+	@/tmp/icsos-tests/script_comment_unit
+
+test-cdcacm-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/usb_cdc_acm_unit.c -o /tmp/icsos-tests/usb_cdc_acm_unit
+	@/tmp/icsos-tests/usb_cdc_acm_unit
+
+test-pciscan-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/pci_scan_unit.c -o /tmp/icsos-tests/pci_scan_unit
+	@/tmp/icsos-tests/pci_scan_unit
+
+test-ttycanon-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/tty_canon_unit.c -o /tmp/icsos-tests/tty_canon_unit
+	@/tmp/icsos-tests/tty_canon_unit
+
+test-usbdbg-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/usb_debug_unit.c -o /tmp/icsos-tests/usb_debug_unit
+	@/tmp/icsos-tests/usb_debug_unit
+
+test-netchecksum-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/net_checksum_unit.c -o /tmp/icsos-tests/net_checksum_unit
+	@/tmp/icsos-tests/net_checksum_unit
+
+test-netarp-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/net_arp_unit.c -o /tmp/icsos-tests/net_arp_unit
+	@/tmp/icsos-tests/net_arp_unit
+
+test-neticmp-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/net_icmp_unit.c -o /tmp/icsos-tests/net_icmp_unit
+	@/tmp/icsos-tests/net_icmp_unit
+
+test-net-unit: test-netchecksum-unit test-netarp-unit test-neticmp-unit
+	@echo "test-net-unit PASS"
 
 # Deterministic 64 MiB GPT disk (slot 0: 32 MiB FAT32, slot 1: 16 MiB ext4).
 ics-os-gpt.img: scripts/mkgpt.sh
@@ -185,8 +238,15 @@ usb: apps prep_image
 	rm -fr tmp/ tmp-usb
 
 # GPT + FAT32 EFI System Partition image for 64-bit UEFI (Intel N150).
-# Raw ics-os-uefi.img is a full-disk image Etcher can flash as-is.
-usb-uefi: apps prep_image
+# Ships the same in-OS toolchain as `make dist`: gcc/cc1, as/ld/ar/objcopy,
+# make, tcc, SDK runtime objects, and ldscripts. Raw ics-os-uefi.img is a
+# full-disk image Etcher can flash as-is.
+usb-uefi: apps prep-dist
+	@test -s tmp/apps/gcc.exe && test -s tmp/apps/cc1.exe
+	@test -s tmp/apps/as.exe && test -s tmp/apps/ld.exe && test -s tmp/apps/ar.exe
+	@test -s tmp/apps/make.exe && test -s tmp/apps/objcopy.exe && test -s tmp/apps/tcc.exe
+	@test -s tmp/apps/crt1.o && test -s tmp/apps/posix.o
+	cp base/dist-autoexec.bat tmp/autoexec.bat
 	chmod +x scripts/mkusb-uefi.sh
 	ICSOS_USB_SIZE_MB=$${ICSOS_USB_SIZE_MB:-128} scripts/mkusb-uefi.sh
 	rm -fr tmp/ tmp-usb
@@ -195,8 +255,14 @@ usb-uefi: apps prep_image
 usb-etcher: usb-uefi
 	rm -f ics-os-uefi.img.zip
 	zip -9 -j ics-os-uefi.img.zip ics-os-uefi.img
+	@OFFSET=$$((2048 * 512)); \
+	 for f in gcc.exe cc1.exe as.exe ld.exe ar.exe make.exe objcopy.exe tcc.exe crt1.o; do \
+	   mdir -i "ics-os-uefi.img@@$$OFFSET" ::/apps/$$f >/dev/null \
+	     || { echo "usb-etcher: missing /apps/$$f" >&2; exit 1; }; \
+	 done
 	@echo "Etcher image: $$(pwd)/ics-os-uefi.img"
 	@echo "Etcher zip:   $$(pwd)/ics-os-uefi.img.zip"
+	@echo "Toolchain:    gcc cc1 as ld ar objcopy make tcc (+ SDK .o + ldscripts)"
 
 # Host-built GCC toolchain pieces the distribution ships: the cc1 compiler
 # proper, the thin gcc driver, and the five SDK runtime objects the driver
@@ -416,6 +482,8 @@ test-boot: vmdex
 	@grep -aq "serial console ready" /tmp/icsos-boot.log
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-boot.log
 	@grep -aq "AP scheduling enabled" /tmp/icsos-boot.log
+	@grep -aq "CONSOLE_THREAD_OK" /tmp/icsos-boot.log
+	@grep -aq "CONSOLE_READY" /tmp/icsos-boot.log
 	@grep -aq "FBCONSOLE_PASS" /tmp/icsos-boot.log
 	@! grep -aq "General Protection fault" /tmp/icsos-boot.log
 	@echo "test-boot PASS"
@@ -564,16 +632,21 @@ test-usb-storage-xhci-no-device: vmdex
 	@chmod +x scripts/test-qemu-xhci-no-device.sh
 	@QEMU_X64=$(QEMU_X64) QEMU_MACHINE=q35 scripts/test-qemu-xhci-no-device.sh
 
-# Phase 0 oracle: a CDC-ACM device (QEMU usb-serial) shares the xHCI
-# controller with the MSC root. Characterizes two-device coexistence in both
-# attach orders; gates that the MSC root survives the second device's presence.
-# (Full CDC console write path lands with the usb_cdc_console driver.)
+# q35 xHCI CDC-ACM console sharing the controller with the MSC root.
+# Both attach orders must keep Root mount [OK] and write USB_CDC_CONSOLE_OK
+# to the usb-serial chardev.
 test-usb-cdc-console: vmdex ics-os-usb.img
 	@chmod +x scripts/test-qemu-xhci-cdc-coexist.sh
 	@QEMU_X64=$(QEMU_X64) PORT_ORDER=msc_first \
 		scripts/test-qemu-xhci-cdc-coexist.sh ics-os-usb.img
 	@QEMU_X64=$(QEMU_X64) PORT_ORDER=cdc_first \
 		scripts/test-qemu-xhci-cdc-coexist.sh ics-os-usb.img
+
+# Physical Pico 2 W (2e8a:0005) passed into q35 xHCI. Emulated usb-serial is
+# TX-only; this is the N150 bulk-IN / HTTP RPC path. SKIP if no Pico.
+test-usb-cdc-pico: vmdex ics-os-usb.img
+	@chmod +x scripts/test-qemu-xhci-cdc-pico.sh
+	@QEMU_X64=$(QEMU_X64) scripts/test-qemu-xhci-cdc-pico.sh ics-os-usb.img
 
 test-usb-storage-xhci-late-attach: vmdex ics-os-usb.img
 	@chmod +x scripts/test-qemu-xhci-no-device.sh
@@ -688,6 +761,31 @@ test-virtio: vmdex
 	@! grep -aq "VIRTIO_BLK_FAIL" /tmp/icsos-virtio.log
 	@! grep -aq "General Protection fault" /tmp/icsos-virtio.log
 	@echo "test-virtio PASS"
+
+# Boot with virtio-net on QEMU user (SLIRP) networking; static 10.0.2.15
+# pings the SLIRP gateway 10.0.2.2 via ICMP echo.
+test-net: vmdex
+	@echo "Building Multiboot2 ISO for virtio-net..."
+	@mkdir -p /tmp/icsos-net-iso/boot/grub
+	@cp kernel/Kernel64.bin /tmp/icsos-net-iso/vmdex
+	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
+		> /tmp/icsos-net-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-net.iso /tmp/icsos-net-iso >/dev/null 2>&1
+	@echo "Running virtio-net ping test (TCG, 2 vCPUs)..."
+	@-timeout 60 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
+		-cdrom /tmp/icsos-net.iso -boot d \
+		-netdev user,id=n0 \
+		-device virtio-net-pci,netdev=n0,disable-legacy=on \
+		< /dev/null > /tmp/icsos-net.log 2>&1
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-net.log
+	@grep -aq "VIRTIO_NET_OK" /tmp/icsos-net.log
+	@grep -aq "NETIF_UP" /tmp/icsos-net.log
+	@grep -aq "VIRTIO_NET_IRQ_OK" /tmp/icsos-net.log
+	@grep -aq "NET_PING_OK" /tmp/icsos-net.log
+	@! grep -aq "VIRTIO_NET_FAIL" /tmp/icsos-net.log
+	@! grep -aq "NET_PING_FAIL" /tmp/icsos-net.log
+	@! grep -aq "General Protection fault" /tmp/icsos-net.log
+	@echo "test-net PASS"
 
 # Boot, rebuild TinyCC with itself inside ICS-OS (Multiboot2 ISO).
 # Packs an 8.3-renamed TinyCC tree as one ustar so staging is a single CD read.

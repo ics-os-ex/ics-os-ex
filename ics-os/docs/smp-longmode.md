@@ -226,7 +226,8 @@ F12 still switches virtual consoles; each VT has its own tty. COM1 is
 
 | After `C-b` | Action |
 |-------------|--------|
-| `c` | new console |
+| `[` or `PgUp` | copy-mode scrollback (also bare `PgUp` on the shell) |
+| `c` / `C` / `Ctrl-C` | new console (Caps Lock OK) |
 | `n` / `p` | next / previous (wraps) |
 | `l` | last window |
 | `0`–`9` | select window |
@@ -235,7 +236,10 @@ F12 still switches virtual consoles; each VT has its own tty. COM1 is
 | `?` | help on the status line |
 | `C-b` | send a literal Ctrl-B to the tty |
 
-A blue status line on row 24 shows `[*n:name …]` while the prefix is armed.
+A blue status line on row 24 shows `[n *id:name …]`. It is a C string: the
+painter stops at NUL (it used to read 80 bytes of stack after `console(0)`).
+In copy mode the bar is `[n] COPY off/hist` with Up/Dn/PgUp/PgDn; `q` or Esc
+leaves. Each console keeps 128 scrolled-off rows.
 
 Ring-3: user CS is recorded as `USER_CODE` (64-bit DPL=3 GDT). Software
 context switch still uses kernel CS until TSS.rsp0 + `iretq` is wired;
@@ -311,6 +315,14 @@ that volume take `fat_lock_volume` so the shared FAT cache is not walked while
 another CPU `loadfat()`s into it. `pc_lookup` must find a page-cache line even
 if `pc_claim` stored it outside the 8-slot hash probe (`make test-fatwrite`).
 
+**virtio-net** (`hardware/virtio/virtio_net.c`) plus the in-tree stack under
+`kernel/net/` (Ethernet/ARP/IPv4/ICMP) is milestone-A networking: modern
+virtio-pci, RX+TX queues, MSI-X, static SLIRP addressing (`10.0.2.15` /
+`10.0.2.2`). Boot selftest ARP-resolves the gateway and ICMP-pings it.
+`IRQ_IRETQ_KTEXT_END` must stay above `textEnd` when the stack grows.
+`make test-net` greps `VIRTIO_NET_OK`, `NETIF_UP`, `VIRTIO_NET_IRQ_OK`, and
+`NET_PING_OK`. Host TAP: `make test-net-unit`. No UDP/TCP/sockets yet.
+
 ## Memory map
 
 Identity-mapped low 4GiB. **Source of truth:** `kernel/memory/memlayout.h`.
@@ -339,6 +351,7 @@ on any CPU. TinyCC kbuild is deferred.
 | Block I/O | `kernel/iomgr/iosched.c`, `blkcache.c` |
 | POSIX fds / io_uring / spawn | `kernel/vfs/posixfd.c` |
 | virtio-blk | `kernel/hardware/virtio/virtio_blk.c` |
+| virtio-net / IPv4 | `kernel/hardware/virtio/virtio_net.c`, `kernel/net/` |
 | Concurrent I/O modernization plan | `docs/io-subsystem-modernization-plan.md` |
 | GCC self-host plan | `docs/gcc-selfhost.md` |
 | Memory map | `kernel/memory/memlayout.h` |

@@ -91,6 +91,8 @@ tables. Do not move user-buffer callback drain to a generic worker until those
 pages are pinned and kernel-mapped. Run `make test-io-unit`, `make
 test-posixio`, and `make test-virtio`; the guest tests use two virtual CPUs and
 remain focused regression/functional tests rather than exhaustive stress.
+Networking milestone A: `make test-net-unit` and `make test-net` (virtio-net
+SLIRP ICMP ping).
 
 POSIX fd lookup must hold the process `fd_lock` until it has acquired a typed
 reference on the VFS, block, or io_uring open description. `sys_close()` first
@@ -247,11 +249,20 @@ when `pc_claim` placed it outside the 8-slot hash probe (`kernel/iomgr/blkcache.
 
 Kernel builds are versioned and the kernel log is inspectable. `kernel/Makefile`
 generates `kernel/build_info.h` (release id, git short hash, dirty flag, UTC
-timestamp) at build time and `dex_init` prints a release banner at boot. Console
+timestamp) at build time and `dex_init` prints a release banner at boot. CDC
+bind also prints an unframed `ICSOS_VER release=... build=... ts=... compiled=...`
+line (`compiled` is `__DATE__`/`__TIME__`) so the Pico `/log` and `/health`
+(`kernel=`) still show the identity when STATUS RPC times out. Console
 commands `version`, `uname [-a|-r|-m|-v]`, and `dmesg [-c|-n <lvl>|-l <lvl>]`
 expose the build identity and a fixed-record kernel log (every `printf`/console
 character is captured, gated live by a console-max level). Use `make test-klog`
 for the boot gate and `make test-klog-unit` for the ring unit test.
+
+User programs are ELF64 (`MEM_USER_ELF_BASE` 4 MiB). Console `execp` and
+`posix_spawn` stream PT_LOAD pages from VFS (`elf64_stream_load`); typing
+`hello` retries `hello.exe`. Leftover 32-bit PE/ELF (`ed.exe`, `nasm.exe`,
+`vgademo.exe`) are rejected with an explicit message instead of
+`unidentified executable format`. Use `make test-exec`.
 
 ## 3.3 Device-driver architecture and lifecycle
 
@@ -272,11 +283,32 @@ free a timed-out descriptor still owned by hardware, invoke driver callbacks und
 a global registry lock, or force-unload active in-kernel driver text.
 
 An xHCI HCD keeps up to two per-port slots (`usbdevs[0]` MSC root,
-`usbdevs[1]` optional CDC-ACM). The port scan walks every CCS port instead
-of stopping at the first connect. `usb_enumerate_msc` still addresses
-device 0; a CDC-first physical order can still lose the MSC root until
-class-aware selection is finished. `make test-usb-cdc-console` is the
-two-device QEMU oracle.
+`usbdevs[1]` CDC-ACM console). The port scan walks every CCS port. MSC
+always claims device 0; a later walk claims a remaining CDC-ACM port as
+device 1 without releasing the stick. Control TDs leave Setup Stage Chain
+clear (RsvdZ) and invert the first TRB cycle until Data/Status are posted.
+Console TX is a lock-free ring drained by `usb_cdc_pump` (hotplug thread
+and bind flush); IRQ/fault paths must not issue USB. CDC bulk IN stays posted across empty polls and across MSC/OUT waits.
+Completions that arrive on the shared event ring while waiting for MSC
+are stashed (`xhci_stash_cdc_in_event`) instead of dropped or Stop-EP'd.
+Look for `USB_CDC_CONSOLE_OK` then `ICSOS_VER` then `USB_CDC_RX` on the gadget. Framed
+debug RPC (`usb_debug.h`: KEYS, CMD, STATUS, SCREEN, FB, DMESG, REBOOT,
+KEXEC) plus unframed keystrokes go into the foreground tty.
+`GET /health` on the Pico reports `pico=` firmware and `kernel=` scraped
+from the bind stamp (no RPC), so a frozen `/log` still identifies both
+ends. STATUS also includes `release=`/`build=`/`ts=` when RPC works.
+After a successful `KEXEC`, the target rewrites `/icsos/vmdex` (else
+`/vmdex`) on the USB ESP before `kexec_reboot`, so cold boot matches the
+live image without re-etching. Host helper: `scripts/remote-kexec.sh`
+(see `docs/intel-n150-usb-readiness.md` and the Pico bridge README).
+`make test-cdcacm-unit`, `make test-usbdbg-unit`,
+`make test-xhcipolicy-unit`, `make test-ttycanon-unit`,
+`make test-usb-cdc-console` (both attach orders), and
+`make test-usb-cdc-pico` (real Pico via QEMU `usb-host`; SKIP if unplugged)
+are the gates.
+Canonical `read()` keeps unread line bytes (`tty_canon.h`); a 1-byte
+userland `read` used to drop the rest of `ls`. DDL output applies ONLCR
+so `\n` returns to column 0.
 
 The current USB compatibility path uses `kernel/hardware/dma.h` to validate its
 identity-mapped bus addresses against alignment, overflow, the 32-bit DMA mask,
@@ -290,7 +322,9 @@ device vector targeting the BSP, enables
 interrupter 0, acknowledges it in a minimal hard-IRQ handler, and consumes event
 TRBs in the waiting context. Sparse `hlt` wakeups retain polling between sleeps,
 so a missing completion does not turn the existing spin timeout into millions of
-timer interrupts. Polling alone remains active during interrupt-disabled boot
+timer interrupts. Polling is forced when COM1 is absent or the LAPIC is in
+x2APIC (N150): MSI-X still uses the xAPIC address `0xFEE00000`, which hung that
+PCH. Polling alone also remains active during interrupt-disabled boot
 and when MSI-X setup is unavailable.
 MSI-X drivers allocate vectors from the bounded device domain through
 `hardware/irq_lifecycle.h`; owner-checked reservations exclude platform vectors,
@@ -499,7 +533,8 @@ The target writes `/tmp/icsos-ext4-e2fsck.log` and
  `scripts/mkusb-uefi.sh` builds the GPT ESP image (`make usb-etcher`) with
  `EFI/BOOT/BOOTX64.EFI`, `efi_gop`, `gfxterm`, a baked-in ASCII font, and
  `gfxpayload=keep` so N150 firmware hands a linear GOP framebuffer to
- Multiboot2. Do not probe GRUB `serial` on that image: laptops without COM0
+ Multiboot2. That image also stages the dist toolchain (`gcc`/`cc1`,
+ `as`/`ld`/`ar`/`objcopy`, `make`, `tcc`, SDK `.o` files, ldscripts). Do not probe GRUB `serial` on that image: laptops without COM0
  print `serial port 'com0' isn't found` and then look hung.
  `make test-fbconsole-unit` is the host TAP for packed vs padded pitch
  and per-axis zoom (1920x1080 is 3x2).
@@ -513,7 +548,19 @@ The target writes `/tmp/icsos-ext4-e2fsck.log` and
  `make test-ide-thumbdrive` all assert `FBCONSOLE_PASS` and cover the GRUB
  paths (BIOS VBE, UEFI GOP on MBR FAT, UEFI GOP on GPT ESP, embedded
  i386-pc core).
- 
+
+ The tmux-style multiplexer (`console/foreground.c`, `console_mux.h`)
+ paints a blue status bar on row 24. The painter stops at NUL; a previous
+ 80-byte read showed stack garbage after `3:console(0)`. Each DDL keeps
+ 128 scrolled-off rows. `C-b [` or shell `PgUp` opens copy-mode (vim's
+ alternate screen still gets `PgUp`). Mux letter folding accepts Caps Lock
+ and Ctrl forms of `c/n/p/...` (`fg_mux_letter`). Extra `C-b c` windows use
+ the kernel prompt (no auto `sh.exe`) so a wedged USB-root exec cannot leave
+ a blank tty. Boot starts the console and waits for `CONSOLE_READY` before
+ the xHCI hotplug/CDC pump thread. `make test-consolemux-unit` covers
+ status truncation, hist/view mapping, and mux letters. USB CDC-ACM console
+ (Pico gadget) is `make test-cdcacm-unit` plus `make test-usb-cdc-console`.
+
  # 4. Source Code Directory Structure
 Top level directories.
 
@@ -539,7 +586,8 @@ Kernel source directories.
 |`docs/`        |Documentation files for kernel|
 |`filesystem/`  |Sources for filesystem support (fat12, iso9660, and ext4)|
 |`grub/`        |Files needed by grub|
-|`hardware/`    |Sources for hardware device drivers (ATA PIO, UHCI, virtio-blk, …)|
+|`hardware/`    |Sources for hardware device drivers (ATA PIO, UHCI, virtio-blk, virtio-net, …)|
+|`net/`         |Minimal IPv4 stack (pbuf, netif, Ethernet, ARP, ICMP) for milestone-A networking|
 |`iomgr/`       |I/O manager (bio, per-device blk-mq lock, 4KiB page cache)|
 |`vfs/`         |VFS plus POSIX fd table, io_uring (`posixfd.c`), `waitpid`/`posix_spawn`/`execve`; `/dev/vblk` and optional FAT `/work`|
 |`memory/`      |Memory management routines|

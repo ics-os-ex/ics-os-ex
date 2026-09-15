@@ -8,7 +8,31 @@
 #define VIRTIO_VENDOR_ID          0x1AF4
 #define VIRTIO_DEV_BLK_TRANS      0x1001
 #define VIRTIO_DEV_BLK_MODERN     0x1042
+#define VIRTIO_DEV_NET_TRANS      0x1000
+#define VIRTIO_DEV_NET_MODERN     0x1041
 #define VIRTIO_ID_BLOCK           2
+#define VIRTIO_ID_NET             1
+
+#define VIRTIO_NET_F_MAC          5
+#define VIRTIO_NET_F_STATUS       16
+#define VIRTIO_NET_S_LINK_UP      1
+
+/* With VIRTIO_F_VERSION_1 the header always includes num_buffers. */
+struct virtio_net_hdr {
+   u8 flags;
+   u8 gso_type;
+   u16 hdr_len;
+   u16 gso_size;
+   u16 csum_start;
+   u16 csum_offset;
+   u16 num_buffers;
+} __attribute__((packed));
+
+struct virtio_net_config {
+   u8 mac[6];
+   u16 status;
+} __attribute__((packed));
+
 
 #define VIRTIO_PCI_CAP_COMMON_CFG 1
 #define VIRTIO_PCI_CAP_NOTIFY_CFG 2

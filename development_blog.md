@@ -1,6 +1,615 @@
 # Development blog
 
+## 2026-09-15 (Manila, UTC+8)
+
+### 17:55 — Networking milestone A: virtio-net + ICMP ping
+
+Shipped minimal in-tree IPv4 (`kernel/net/`: pbuf, netif, Ethernet, ARP,
+ICMP) and modern PCI virtio-net with MSI-X. Boot selftest configures
+SLIRP static `10.0.2.15` and pings `10.0.2.2`. Gates: `make test-net-unit`
+(TAP checksum/ARP/ICMP) and `make test-net` (`VIRTIO_NET_OK` /
+`NET_PING_OK`). Bugs hit along the way: `IRQ_IRETQ_KTEXT_END` had to rise
+past new `textEnd`; RX harvest must not hold the driver lock while the
+stack transmits (deadlock); `VIRTIO_F_VERSION_1` virtio-net hdr is 12
+bytes (`num_buffers`). No UDP/TCP/sockets/DHCP yet.
+
+### 17:25 — Stuck `ls /apps`: F4 printed "OS"; C-b c blue bar only
+
+Root cause: plain F4 injected xterm `\x1bOS` (looks like "OS"); only
+Ctrl-Alt-F4 called `kill_foreground`, and that path refused to sigterm
+the console when it owned the keyboard. Large FAT `/apps` mount walked
+under `vfs_busy` with no yield, so the BSP stayed no-preempt-pinned and
+C-b c's new console never ran. Fixes: plain F4 kills (+respawn last
+window); `fat_mount` yields every 32 dirents and honors sigterm; C-b x
+on last window restarts. Ctrl-C now targets console pid when owner unset.
+Current N150 still hung — power-cycle, then etcher rebuild.
+
+### 16:45 — Pico power-cycled; laptop CDC still dead (STATUS 504)
+
+Pico `/health` came back (`14:21:44` stamp from flash log) but `/status`
+504 and then Pico HTTP dropped again under STATUS polling. Target almost
+certainly still hung from the last kexec attempt — needs laptop
+power-button reboot before we can see `kexeced=`.
+
+### 16:35 — remote-kexec on 14:21: curl 240s / 0 bytes; Pico down
+
+Boot `14:21:44` + hello OK. `/kexec` HTTP got no response (timeout);
+Pico Wi‑Fi dead afterward. Possible: kexec_reboot tore down USB before
+Pico flushed HTTP 200 — need Pico power-cycle then check `kexeced=1`.
+
+### 14:18 — Full kexec load + done ACK; hung in post-done TX flush
+
+`14:12:09`: received all bytes, `kexec: staged … entry=0x100040`, Pico
+`kexec staged`, then never `kexec reboot` / jump — stuck in 64×
+`pump_tx` after ACK; keyboard + STATUS dead. Fix: ACK once (write_raw
+already pumps), then `kexec_reboot` immediately. Etcher `~14:18`.
+
+### 14:13 — User: keyboard dead after kexec persist hang
+
+Matches post-`done` FAT persist stall on hotplug thread (STATUS 504).
+Need power-button reboot + etcher `14:12:09` (RAM-only kexec, no persist).
+
+### 14:12 — Kexec received full image + done ACK; hung in vmdex persist
+
+On `13:40:20`: `kexec staged` (ready→full 758832→loading→done). No
+reboot (`kexeced=0`); STATUS 504 afterward. Persist-after-ACK blocked
+`kexec_reboot`. Drop FAT `/vmdex` write from the CDC finish path (RAM
+kexec only); cold boot still needs etcher until a quiet persist exists.
+
+### 13:40 — Kexec TX-quiet survived CDC; hang likely on post-recv persist
+
+`13:28:18` suite PASS. First `/kexec`: curl RST ~152s but `/status` still
+200 afterward (no kexec). Second: curl 240s timeout; Pico HTTP down.
+Likely finish() held the Pico on FAT `vmdex` write before sending `done`.
+Fix: ACK `done` + flush TX **before** persist, then `kexec_reboot`.
+
+### 13:28 — Kexec reached 721/759 KiB then CDC died; mute TX during recv
+
+`13:18:34` + Pico `0.7`: suite PASS; `/kexec` got `ready` and progress
+to 720896/758768 then 504. Progress `printf` + `pump_tx` during body
+recv on the shared xHCI event ring. Fix: clear TXQ after ready, skip
+`pump_tx` while `kexec_left`, progress via `serial_puts` only. Needs
+another etcher; live STATUS dead again.
+
+### 13:22 — Pico bridge flashed to 0.7 (ready/done kexec)
+
+`mpremote cp` + reset. `/health` → `pico=0.7-20260915`. Still need
+etcher of kernel `13:18:34` (ready ACK) before retrying remote-kexec.
+
+### 13:18 — Kexec ready/done handshake (body flood wedged CDC again)
+
+Post-`13:07` suite PASS; `/kexec` printed `kexec recv` then 504 and CDC
+died (header OK, body flood still wedges IN). New protocol: kernel ACKs
+OK `ready` after malloc; Pico waits, then paces 256 B/5 ms; finish ACKs
+`done` before reboot. Pico `0.7`. Etcher + Pico reflash required; live
+box STATUS dead again after the failed attempt.
+
+### 13:11 — Pico bridge flashed to 0.6 (paced kexec)
+
+`mpremote cp` + reset. `/health` → `pico=0.6-20260915`. Still need
+etcher of kernel `13:07:48` (kexec drain/yield fix) before retrying
+`./scripts/remote-kexec.sh`.
+
+### 13:08 — Kexec drain froze keyboard; defer + yield + Pico pace
+
+Failed `/kexec` left N150 with dead keyboard (power-button reboot). Cause:
+`usb_cdc_pump` drained kexec with up to 400000×`XHCI_CDC_IN_SPINS` and
+no `taskswitch`, monopolizing the BSP when bytes stalled. Fix: short
+bursted receive with yields, stall abort, defer `kexec_finish` off the
+feed path, chunked vmdex write + ACK flush before `kexec_reboot`. Pico
+`0.6` paces USB TX 2ms/512B. Needs etcher once more, then Pico reflash.
+
+### 13:03 — Flash 12:56 verified; remote-kexec still 504
+
+Post-etcher boot `compiled=12:56:17`. Remote suite PASS: STATUS, `ls`×2,
+STATUS after each, `hello.exe` (Hello World + stream load), STATUS still
+200. `./scripts/remote-kexec.sh` then HTTP 504 after ~195s; Pico buf
+cleared; STATUS dead again (CDC IN wedged during/after ELF stream).
+Need keyboard reboot; kexec receive/ACK path still broken under load.
+
+### 12:56 — Boot STATUS 504 on 12:30:29; Stop-EP on CDC len mismatch
+
+After user reboot, stick already had `compiled=12:30:29` but Pico STATUS
+504 at idle (CDC IN died after early `USB_CDC_RX`). Cause: `xhci_bulk_in_try`
+called `xhci_cdc_in_drop` (Stop-EP) when posted IN len/buffer differed —
+boot MSC `after_msc` + pump cap races. Fix: abandon on mismatch (no
+Stop-EP); skip `after_msc` until hotplug starts; always post full 512 B
+RX DMA. New image `12:56:17`. CDC IN still dead on live box ⇒ cannot
+remote-kexec; need one more etcher flash, then remote path works.
+
+### 12:45 — Pico bridge flashed to 0.5 (streaming kexec)
+
+`mpremote cp main.py` + reset on `/dev/ttyACM0`.
+`GET /health` → `pico=0.5-20260915` at `192.168.0.174`. Ready for
+N150 keyboard reboot then `./scripts/remote-kexec.sh`.
+
+### 12:42 — remote-kexec OOMed the Pico (0.4 bridge)
+
+User `/kexec` of ~758 KiB Kernel64.bin: bridge buffered the whole body
+then stashed `line+payload` for 400 ms retransmit (~1.5 MiB) → heap
+death; HTTP now accepts TCP then RST. Fix in
+`extras/pico2w-serial-bridge/main.py` (`pico=0.5-20260915`): stream HTTP
+body to USB in 512 B chunks, never retransmit large payloads, free the
+log ring first. Need a Pico reset + reflash of `main.py`, then retry
+`./scripts/remote-kexec.sh`.
+
+### 12:40 — CDC after-MSC re-arm + remote kexec persist
+
+Restored arm-only `usb_cdc_after_msc()` after each MSC block unlock
+(skipped while ELF stream quiesced). `bulk_io_begin` no longer abandons a
+live CDC IN (take-if-done only) — abandon desynced the ring and killed
+Pico RPC after the 2nd remote `ls`. Remote update path: Pico `POST /kexec`
+already staged ELF; `usb_cdc_kexec_finish` now also rewrites
+`/icsos/vmdex` or `/vmdex` before `kexec_reboot` so cold boot matches.
+Helper: `ics-os/scripts/remote-kexec.sh`. Docs in N150 readiness + Pico
+README + wiki. QEMU: `test-exec` PASS, `test-usb-cdc-console` PASS both
+orders. `make usb-etcher` → `ics-os-uefi.img` (`compiled=12:30:29`).
+
+N150 still on `12:10:19` with CDC IN dead (STATUS/CMD/KEYS/telnet reboot
+all fail; console TX still in `/log`). Need a keyboard `reboot` or power
+cycle, then **before** dual-`ls`:
+
+```bash
+cd ics-os && ./scripts/remote-kexec.sh
+```
+
+First push from the old image is RAM-only (no persist code); immediately
+run `./scripts/remote-kexec.sh` a second time on the new image to rewrite
+`/vmdex` on the stick. Or flash the new etcher once.
+
+### 12:25 — User confirms keyboard hello.exe works
+
+N150 console path closed for exec load hang. Remaining: Pico CDC IN/RPC
+dies after 2nd remote `ls` (console listings OK; STATUS 504).
+
+### 12:24 — Remote suite on clean reboot
+
+`ls`#1 + STATUS OK. `ls`#2 CMD ACK + both listings in CDC log + prompt;
+STATUS then 504 — hello CMD never delivered. Keyboard hello remains the
+proven path; remote dual-ls executes but CDC IN still dies after 2nd MSC
+burst.
+
+### 12:20 — Remote try after hello keyboard PASS
+
+Kernel `12:10:19`. CDC log already has keyboard `Hello World` + stream
+load markers. Remote `POST ls` ACK 200 and listings landed; then RPC 504
+(STATUS/SCREEN). Cannot finish remote hello this boot — need clean reboot
+at prompt, then `ls`×2 + `hello.exe` without local typing.
+
+### 12:08 — opening hang: read_block still used spin_lock
+
+Etcher from 11:30 had yielding acquire, but `usb_read_block_raw` had
+been rewritten back to bare `spin_lock` — same deadlock. Also
+`usb_io_lock_release` had been accidentally sed'd into recursive call
+(fixed). begin() now waits+steals lock and abandons CDC IN; CDC waits
+taskswitch every 64 spins.
+
+### 11:28 — stuck at elf64-stream opening: USB lock never yields
+
+Progress: `opening` printed ⇒ hang inside `openfilex`. CDC OUT holds
+`usb_io_lock`; console `spin_lock` only `pause`s (no taskswitch) so
+hotplug never resumes to see quiesced. Fix: `usb_io_lock_acquire` yields
+via `taskswitch`; CDC `xhci_next_event` aborts when quiesced.
+
+### 11:20 — execp stuck before elf64-stream: CDC OUT vs MSC lock
+
+No `elf64-stream:` lines ⇒ hang before/at open. `printf(execp)` queues CDC
+TX; hotplug `pump_tx` holds `usb_io_lock` across a 4M-spin OUT wait and
+blocks MSC `openfilex`. Fix: set `quiesced` + discard TXQ without lock;
+begin before open; CDC bulk waits use `XHCI_CDC_IN_SPINS`; `user_execp`
+quiesces first.
+
+### 11:16 — hello hang: Stop-EP at stream begin was the wedge
+
+Prior image called `xhci_cdc_in_drop` (Stop-EP) at `usb_cdc_bulk_io_begin`;
+that likely wedged Intel so the first MSC fread never returned — stuck at
+`execp: loading` with no further output. Now: quiesce = suppress CDC
+pump IN+OUT only; no Stop; progress prints (`open`/`size`/`hdr ok`).
+
+### 11:10 — hello still hangs: quiesce CDC for whole ELF stream
+
+Per-sector after_msc still hung. New approach: `usb_cdc_bulk_io_begin/end`
+around `elf64_stream_load` — one Stop-EP, no CDC IN re-post until load
+finishes; removed per-block CDC kicks. Hotplug pump TX-only while quiesced.
+
+### 11:01 — Etcher: after_msc arm-only (hello load)
+
+`test-exec` PASS; `test-usb-cdc-console` msc_first PASS (cdc_first IRETQ
+flake once). Image `ics-os/ics-os-uefi.img`. Flash; verify `hello.exe`
+past `execp: loading` and dual `ls` still OK.
+
+### 10:58 — hello.exe stuck at execp loading: per-sector CDC pump
+
+User typed hello.exe; hung at `execp: loading ... (Ctrl-C abort...)`.
+Cause: `usb_cdc_pump` after every MSC block ran 2×40k-spin empty IN
+polls per sector — ELF stream load never finished. Fix: `usb_cdc_after_msc`
+(take/arm with max_spins=0 + TX flush only).
+
+### 10:53 — hello.exe CMD 504 after dual-ls PASS
+
+Dual `ls`+STATUS was green; follow-up `POST hello.exe` got 504 before
+any keystroke reached the log (prompt still `/icsos/ %`). RPC wedged
+again without running the ELF — possible post-burst IN race. User can
+try local keyboard `hello.exe`.
+
+### 10:52 — Pico PASS: dual ls + STATUS on 10:47:10 image
+
+`compiled=Sep 15 2026 10:47:10`. POST `ls` ×2 both ACK; `/status` after
+each OK (`cdc=1`); CDC log shows two full listings and prompt. Stash-by-
+epid + pump-after-MSC unlocked dual-ls RPC. Next: hello.exe / cd apps.
+
+### 10:48 — Etcher: CDC stash by epid + pump after MSC
+
+`ics-os/ics-os-uefi.img` ready. `test-usb-cdc-console` PASS (no IRETQ).
+Flash and retest dual `ls` + `/status`.
+
+### 10:45 — Pico: ls#1 OK then STATUS 504 (re-arm image)
+
+`compiled=10:39:29`. CMD ls ACK + listing in log + prompt; STATUS then
+504. Keyboard still works (user). MSC orphans CDC IN without Stop —
+likely completed Transfer Event dropped when `in_td` missed. Fix: stash
+CDC IN on slot+epid always; `usb_cdc_pump` after each MSC unlock.
+
+### 10:40 — Etcher: re-arm CDC IN before RPC feed
+
+`ics-os/ics-os-uefi.img` rebuilt. QEMU `test-usb-cdc-console` +
+`test-xhcipolicy-unit` PASS. Flash; agent will dual-`ls` without relying
+on SCREEN between commands.
+
+### 10:38 — CDC IN re-post before RPC feed (STATUS→CMD race)
+
+After stash-only flash: `ls`#1+SCREEN+STATUS OK, next `CMD ls` 504.
+Likely IN left unposted during long STATUS/SCREEN TX so Pico's next
+CDC write was dropped. `usb_cdc_pump` now re-arms bulk IN before
+`usb_cdc_feed_in` handles the RPC.
+
+### 10:36 — Pico dual-ls on stash-only image (10:31:44)
+
+Boot OK (`compiled=Sep 15 2026 10:31:44`). `ls` #1 + SCREEN + STATUS all
+OK. `ls` #2 CMD immediately 504; log shows only one listing; RPC stays
+dead. So Stop-EP was not the only failure mode — dies after first
+MSC+RPC burst (possibly SCREEN/CMD cadence or IN re-post race). Need
+reboot + screen-free dual `ls` + keyboard check.
+
+### 10:31 — Etcher: stash-only CDC/MSC (no Stop at BOT)
+
+Image `ics-os/ics-os-uefi.img`, kernel `compiled=Sep 15 2026 10:29:53`.
+`test-xhcipolicy-unit` + `test-usb-cdc-console` PASS (one flaky IRETQ on
+first CDC run). User: flash, leave keyboard idle; agent will dual-`ls` and
+confirm `/status` stays up.
+
+### 10:30 — Revert MSC Stop-EP; stash-only (user can still type)
+
+User: after 2nd remote `ls`, keyboard still works at prompt. CDC log had
+both listings; RPC 504. Cause: Stop-EP at every MSC `xhci_bulk` — pump
+re-posts IN between block reads, next BOT Stops again → Intel CDC IN
+dead after multi-block `ls`. Fix: `xhci_cdc_in_cancel_for_msc()=0` again;
+quiesce only takes a completed IN. Event-ring stash owns coexistence.
+
+### 10:25 — Pico: 1st ls OK, 2nd ls prints then CDC RPC dies
+
+Laptop at prompt. POST `ls` #1: listing + STATUS OK. POST `ls` #2: ACK
+ok; CDC log shows **both** directory listings and prompt again — so MSC
+did not hard-freeze the console. Immediately after, `/status`/`/screen`/
+`/cmd` all 504; CDC TX log frozen. Pattern: Stop-EP quiesce before MSC
+leaves CDC **IN** dead (OUT still carried the 2nd listing).
+
+### 10:20 — Pico recheck after N150 restart (MSC quiesce image)
+
+**Current:** Boot OK — `/health` shows `compiled=Sep 15 2026 08:45:47`,
+first `/status` + `/screen` returned prompt `/icsos/ %` with `cdc=1 usb_root=1`.
+Within seconds kernel RPC went 504 and CDC log froze (`buf`/`log` flat at
+23893) — no remote `ls` possible. Either the original console freeze recurred
+(keyboard/`ls`) or CDC RX wedged after the first RPC burst. Need a clean
+reboot with no local typing, then POST `/cmd` only.
+
+### 08:48 — Etcher rebuild (MSC CDC quiesce)
+
+Flashed image: `ics-os/ics-os-uefi.img` (+ `.zip`), kernel `compiled=Sep 15 2026 08:45:47`.
+QEMU: `test-xhcipolicy-unit`, `test-exec`, `test-usb-cdc-console` PASS.
+Verify on N150: repeated `ls`, `cd apps; ls`, `hello.exe`, Pico `/status` after MSC.
+
+### 08:40 — 2nd ls / hello freeze: quiesce CDC IN before MSC
+
+**Current problem / activity:** First `ls` of mounted `/icsos` is VFS-only;
+`cd apps` / 2nd `ls` / `hello.exe` hit MSC while a posted CDC IN TRB shared
+the xHCI event ring — console freezes. Fix: `xhci_cdc_in_cancel_for_msc()=1`
+and `xhci_cdc_quiesce_for_msc` at MSC `xhci_bulk` entry (take if done, else
+one-shot Stop-EP). Empty-poll Stop stays off. `/cmd` now injects keys to the
+console thread instead of `console_execute` on the hotplug pump.
+
+### 08:35 — Pico retest after virtio-skip / exec-wait flash
+
+**Current problem / activity:** User restarted with Pico. Health shows
+`compiled=Sep 15 2026 08:24:06`. `/status`+`/screen` HTTP 200, prompt at
+`/icsos/ %`, no rem spam. `/cmd ls` ACK ok (CDC grew with a short listing).
+`/cmd hello.exe` then killed RPC (504) and froze CDC TX at buf=2207 — exec
+still wedges MSC/CDC from the CMD path. Need keyboard `hello.exe` check
+on GOP; virtio skip is pre-CDC so not in Pico log.
+
+### 08:25 — virtio bus-0 hang + every-exec freeze
+
+**Current problem / activity:** ~50% of N150 boots freeze at
+`virtio-blk: pci bus 0`; any `hello.exe`/`vim.exe` hangs the console.
+Cause 1: PCI config walk on ADL-N PCH even for bus 0 — skip virtio scan
+entirely when no COM1 (`pci_scan_virtio_allowed`). Cause 2: exec wait
+loop used `delay(1)` after WNOHANG; if ticks stall, delay never returns
+so every waitpid freezes. Removed delay (WNOHANG already taskswitches).
+Rebuild etcher. `test-boot`/`test-exec` PASS. `test-virtio` hits
+`IRETQ-BADRIP` in `vblk_selftest` on this host (QEMU has COM1 so still
+scans); N150 skips the scan entirely so that path is not on the stick.
+
+### 08:10 — rem spam, CDC after MSC, vim hang recovery
+
+**Current problem / activity:** User has prompt + toolchain; `rem` autoexec
+noise; `/cmd` then RPC 504; `vim.exe` freezes console (keys/tmux still
+work). Fixes: `script_comment.h` treats `rem`/`#`/`'`; dist-autoexec uses
+`'` comments; `usb_read/write_block_raw` calls `usb_cdc_pump` after unlock;
+`user_execp` polls waitpid and kills on Ctrl-C; stream load checks SIGINT.
+`test-scriptcomment-unit` added. vim is ~2.2 MiB USB stream — Ctrl-C / F4 /
+C-b c to recover. Direct `usb_cdc_pump`/`taskswitch` from MSC caused
+`IRETQ-BADRIP` in `test-usb-cdc-console`; left MSC path alone (hotplug still
+pumps). `test-boot`/`test-exec`/`test-vim`/`test-usb-cdc-console` PASS.
+New etcher: `ics-os/ics-os-uefi.img`.
+
+### 08:02 — N150: prompt + STATUS/SCREEN RPC live; CMD ls 504
+
+**Current problem / activity:** User reflashed no-seed image with Pico.
+`compiled=Sep 15 2026 07:56:35`. CDC log through welcome banner,
+`CONSOLE_READY`, kernel prompt `/icsos/ %` (buf=2477). `/status` HTTP 200
+(`cdc=1 usb_root=1`) and `/screen` shows the prompt. Autoexec `rem` lines
+are wrongly exec'd as commands (script comments are `'`/`;` only). `/cmd`
+`ls`/`help` timed out 504 — possible MSC touch after CDC is quiet again.
+GOP should be interactive; next: treat `rem` as comment, probe which CMD
+verbs stay safe.
+
+### 07:55 — Stuck on "reading source file" during SDK seed
+
+**Current problem / activity:** User console hung in dist autoexec
+`copy /icsos/apps/crt1.o /ramdisk/...` at `fcopy` "reading source file..".
+CONSOLE_READY was signaled before autoexec, so xHCI CDC pump raced MSC
+reads. Fix: strip boot-time copies from `dist-autoexec.bat` (PATH/SDK
+only); run autoexec before CONSOLE_READY; never auto-exec `sh.exe`;
+`gcc.exe` falls back to `/icsos/apps/*.o` when `/ramdisk` has no crt1.
+Immediate workaround on stuck session: `C-b` then `c` for a kernel prompt.
+`test-boot` PASS. New etcher: `ics-os/ics-os-uefi.img` (+ `.zip`).
+
+### 07:15 — N150: new image reached CONSOLE_THREAD_OK; CDC dies mid-banner
+
+**Current problem / activity:** After etcher flash + reboot with Pico,
+`/health` shows `compiled=Sep 15 2026 07:06:17` (this morning's fix). CDC
+log now goes past Root mount through `CONSOLE_THREAD_OK` and the tmux keys
+line (buf=1306), then freezes mid-printf. `/status` and `/screen` still
+HTTP 504. Console-before-hotplug worked; CDC IN still dies around first
+console paint / autoexec. GOP should have a usable prompt — ask user.
+
+### 07:05 — N150 stuck at Root mount; console before hotplug
+
+**Current problem / activity:** User reports GOP stops at `Root mount [OK]`,
+no prompt; `C-b` then `C` (Caps Lock) opens a blank console that accepts
+keys but does nothing. Same with or without Pico. Cause: init-thread
+`usb_cdc_pump` / hotplug before `console_new`, then autoexec/`sh.exe` on
+USB-root racing CDC. Fixes: console paints `CONSOLE_READY` and bumps
+`console_first` before autoexec; boot waits for that then starts hotplug;
+extra windows skip auto `sh.exe` (kernel prompt); `fg_mux_letter` accepts
+Caps/Ctrl forms; dist autoexec banners before SDK copies; clear Caps LED.
+`test-consolemux-unit` 16/16, `test-boot` (asserts CONSOLE_READY),
+`test-exec` PASS. New etcher: `ics-os/ics-os-uefi.img` (+ `.zip`).
+
+### 06:49 — N150 rebooted: new etcher image, CDC still dead after hotplug
+
+**Current problem / activity:** User rebooted N150 with Pico attached.
+`curl http://192.168.0.174/health` shows `pico=0.4-20260915` and
+`kernel=ICSOS_VER release=0.01-dev build=91ae5b1-dirty ts=2026-09-03T03:47:41Z
+compiled=Sep 15 2026 06:41:19`. That `compiled=` is this morning's etcher
+rebuild, so the laptop is on the GCC image. CDC TX reached
+`USB_CDC_CONSOLE_OK`, `USB_CDC_RX`, FAT32 USB root, `Root mount [OK]`,
+`XHCI_HOTPLUG_MONITOR_READY` (buf=920, was 818 without ICSOS_VER). Then
+silence: `/status` `/screen` `/dmesg` `/cmd` all HTTP 504. GCC on-stick
+cannot be verified over CDC; GOP/keyboard is the remaining check.
+Intel still drops CDC IN after MSC root + hotplug.
+
+### 06:55 — Etcher image ships GCC and build utils
+
+**Current problem / activity:** `make usb-etcher` used `prep_image` only, so
+`gcc.exe`/`cc1.exe` and SDK `.o` files were missing from the N150 stick.
+`usb-uefi` now depends on `prep-dist` (same toolchain as `make dist`),
+seeds `dist-autoexec.bat`, and `usb-etcher` asserts `/apps/gcc.exe`,
+`cc1.exe`, `as`/`ld`/`ar`/`objcopy`, `make`, `tcc`, and `crt1.o` are on
+the FAT ESP. Rebuilt: `ics-os/ics-os-uefi.img` (128 MiB, 97 MiB free)
+and `.zip` (8.9 MiB). On-image: gcc, cc1 (18 MiB), as, ld, ar, objcopy,
+make, tcc, SDK `.o` files.
+
+### 06:50 — Etcher rebuild; 32-bit leftovers rejected; ELF64 stream exec
+
+**Current problem / activity:** User cannot run apps ("executable format is
+not supported"). Console `execp` whole-file mmap missed the ELF64 stream
+path `posix_spawn` already uses; leftover PE32/ELF32 (ed, nasm, vgademo,
+hxdmp) fell through to `unidentified executable format`. `execp` now
+streams ELF64 first, retries `.exe`, and rejects 32-bit PE/ELF with an
+explicit message. `contrib/sh` now links `posix.c` so `sh.exe` rebuilds.
+`make usb-etcher` produced `ics-os/ics-os-uefi.img` (128 MiB) and `.zip`.
+
+### 06:40 — Remote ICS-OS and Pico version stamps
+
+**Current problem / activity:** N150 CDC log still frozen at hotplug READY
+with all RPC 504s; cannot tell if the laptop booted the latest etcher
+image. CDC bind now prints `ICSOS_VER release=... build=... ts=... compiled=...`
+(from `build_info.h` plus `__DATE__`/`__TIME__`) immediately after
+`USB_CDC_CONSOLE_OK`. STATUS adds `release=`/`build=`/`ts=`/`compiled=`.
+Pico firmware `PICO_FW=0.4-20260915` is in `GET /health` and `GET /version`;
+`kernel=` is scraped from `/log` or the flash log tail with no RPC
+(`none` = old image or bind never reached the gadget). TAP
+`test-usbdbg-unit` 21/21 PASS; `test-usb-cdc-console` both orders PASS.
+Pico on this PC is flashed; `/health` shows `pico=0.4-20260915`. Next:
+rebuild etcher, boot N150, curl `/health` on 192.168.0.174.
+
+### 06:23 — N150 still frozen at hotplug READY; all RPC 504
+
+**Current problem / activity:** Pico on N150 (no ttyACM0 here). STA
+`192.168.0.174`. `/health` `buf=818`. Log is the same as 06:05: FAT32 USB
+root, `USB_CDC_RX`, `Root mount [OK]`, `XHCI_HOTPLUG_MONITOR_READY`, then
+silence. `/status` `/screen` `/cmd` `/dmesg` all 504. Pico retry firmware
+is on the gadget. QEMU `test-usb-cdc-pico` passed this kernel+Pico; Intel
+still loses CDC TX/IN at hotplug. Need GOP check for later boot lines /
+`USB_CDC_TX_FAIL`, or confirm the 06:08+ etcher image actually booted.
+
+### 06:11 — QEMU usb-host of the real Pico is the local RPC gate
+
+**Current problem / activity:** Pico on this PC. Flashed retry firmware.
+`make test-usb-cdc-pico` PASS: q35 xHCI `usb-host` 2e8a:0005 (ACM) + MSC
+root, poll mode. Guest `vid=2e8a pid=0005 acm=1`, `USB_CDC_CONSOLE_OK`,
+`USB_CDC_RX`, `STATUS cdc=1`, log through `Root mount [OK]` and hotplug.
+Emulated `usb-serial` stays TX-only. Iterate here before the next N150
+etcher flash. VirtualBox USB filter is possible but not automated.
+
+### 06:05 — N150: Root mount on CDC log, RPC still 504; demux IN events
+
+**Current problem / activity:** `/log` is 818 bytes through FAT32,
+`Root mount [OK]`, `XHCI_HOTPLUG_MONITOR_READY`, and `USB_CDC_RX`.
+`/status` and `/screen` still 504. TX survived ramdisk; CDC IN still dies
+once USB-root MSC starts because MSC waits Stop-EP the posted IN. Event
+ring now stashes CDC IN completions instead of cancelling. QEMU
+`test-usb-cdc-console` both PASS (692 bytes). New `ics-os-uefi.img` ready.
+
+### 05:52 — N150: USB_CDC_RX once, then CDC died; leave IN posted
+
+**Current problem / activity:** Pico on N150. `/log` is 496 bytes:
+`GPT_DETECT usb0`, `usb0p0`, **`USB_CDC_RX`**, then freeze at
+`Initializing the RAM disk...ramd`. `/status` `/screen` `/cmd` still 504.
+First gadget IN worked; Stop+SetDequeue on empty polls likely wedged the
+EP. New kernel leaves the IN TRB posted; MSC/OUT cancel it first. QEMU
+`test-usb-cdc-console` both PASS (msc_first CDC log now 692 bytes through
+ramdisk/FAT). New `ics-os-uefi.img` ready to flash.
+
+### 05:11 — N150 CDC TX ok, RPC IN dead; widening host IN window
+
+**Current problem / activity:** Pico on N150, STA `192.168.0.174`. Log is
+only the 48-byte bind banner; `/status` and `/screen` 504. No `USB_CDC_RX`.
+Widened host IN (pump-first, 1-tick bound delay, ISP+IOC, 40k×2 spins).
+`make test-xhcipolicy-unit` 18/18 PASS. `test-usb-cdc-console` both orders
+PASS (QEMU CDC chardev now 176/240 bytes past bind). New
+`ics-os-uefi.img` built. Reflash N150; Pico RPC retry firmware waits for
+a PC plug.
+
+### 05:08 — `make usb-etcher` ready to flash
+
+**Current problem / activity:** `ics-os/ics-os-uefi.img` (128 MiB) and
+`.zip` (4.8 MiB) built at 05:08. Kernel64.bin includes `kexec_load_mem`,
+`usb_cdc_write_raw`, `tty_canon_read_copy`, `fbconsole_rgb_at`, and the
+debug RPC. Host `contrib/sh` still fails to link (`read`/`write`/`lseek`);
+that is ignored and the staged `apps/sh.exe` is the previous binary — the
+tty remainder/ONLCR fix is in the kernel. Flash with Etcher, then move
+the Pico from this PC to the N150 USB.
+
+### 05:06 — Pico `main.py` flashed on this PC
+
+**Current problem / activity:** Pico (`2e8a:0005`) on `/dev/ttyACM0`.
+Copied `extras/pico2w-serial-bridge/main.py` (19636 bytes) and reset.
+STA `192.168.0.174` pings. `GET /health` is raw text (`up 1`, `mode=sta`,
+`ip=192.168.0.174`), not a Python `bytes` repr. `GET /v1` lists the
+debug catalog. `/status` times out here because USB is the PC, not an
+ICS-OS CDC host. Next: `make usb-etcher`, flash N150, plug Pico back
+into the laptop USB, then `curl /screen` and `POST /cmd`.
+
+### 04:38 — Remote Pico debug API + userland sh tty bugs
+
+**Current problem / activity:** N150 reached userland `sh$`, but Enter
+staircased and `ls` seemed dead. Canonical `tty_read` dropped unread
+bytes after a 1-byte SYSREAD, so `ls` became `l`; Ctrl-C then submitted
+leftover junk (`Command or executable not found`). VT `\n` had no CR
+(ONLCR). CDC debug RPC (`KEYS`/`CMD`/`STATUS`/`SCREEN`/`FB`/`KEXEC`/
+`REBOOT`) plus Pico HTTP `/v1` `/status` `/screen` `/cmd` `/keys`
+`/kexec`. `test-ttycanon-unit` (8) and `test-usbdbg-unit` (16) pass;
+`test-usb-cdc-console` both orders pass. QEMU usb-serial IN is not a
+green RPC gate (FTDI/MSI-X poll); Pico ACM on the N150 is the RX path.
+Need a new etcher image + Pico `main.py` flash.
+
+### 04:33 — N150 USB CDC-ACM console live over Pico Wi-Fi
+
+**Current problem / activity:** Pico back on the N150. Ping 192.168.0.174
+OK. Telnet :23 shows `USB_CDC_CONSOLE_OK` then `usb: CDC-ACM console
+ready`. Buffer is 48 bytes (post-bind only; GOP still has earlier
+virtio/USB lines). HTTP `/` dumps a Python `bytes` repr (`b'...`) so
+curl is truncated; telnet is the oracle. Next: GOP for `virtio-blk:
+none` and USB root, then writable `/icsos`.
+
+### 04:30 — Pico on N150: Wi-Fi up, HTTP/telnet RST (stdin block)
+
+**Current problem / activity:** Pico is not on this PC (`ttyACM0` gone),
+pings at 192.168.0.174, TCP 23/80 handshake, then RST with no payload.
+`usb_cdc_read()` used `read(64)` which blocks until 64 USB bytes. If ICS-OS
+has DTR up but has not streamed a full packet, the MicroPython loop never
+`accept()`s. Change to poll + `read(1)` so Wi-Fi stays live. Need the Pico
+plugged back here to reflash.
+
+### 04:20 — N150 frozen at initializing virtio-blk (Caps+Num on)
+
+**Current problem / activity:** GOP is live (Caps+Num). The hang is
+`virtio_find_blk` probing functions 1-7 of every slot on buses 0-7.
+Empty Intel config reads master-abort-timeout, so it never prints
+`virtio-blk: none` and never reaches USB. Probe like xHCI (skip 0xFFFF
+slots, only extra functions if MF), and on no-COM1 only scan bus 0.
+Refuse virtio MSI-X without COM1 / on x2APIC (same 0xFEE00000 PCH hang).
+
+### 04:20 — USB CDC-ACM host console (Pico gadget)
+
+**Current problem / activity:** N150 has no COM1, so the Pico UART bridge
+cannot see the console. Add xHCI CDC-ACM host: MSC stays device 0, ACM
+claims device 1 on a remaining CCS port, SET_LINE_CODING 115200 8N1 plus
+DTR/RTS, lock-free TX ring drained by `usb_cdc_pump` (not from IRQ).
+Marker `USB_CDC_CONSOLE_OK` must appear on the QEMU usb-serial chardev in
+both attach orders. QEMU `usb-serial` is FTDI (`0403:6001`, vendor class
+0xFF); Pico MicroPython is real CDC-ACM. The host parser accepts both.
+Pico firmware also copies USB CDC stdin into the Wi-Fi/log path.
+
+### 03:45 — Tmux status garbage and copy-mode scrollback
+
+**Current problem / activity:** The blue bar after `3:console(0)` was the
+80-column painter reading past the status NUL into stack garbage, plus a
+long C-b hint `strncpy` without a terminator. Zero the line, stop at NUL,
+truncate names. Add tmux copy-mode: each DDL keeps 128 scrolled-off rows;
+`C-b [` or shell PageUp opens the view (vim alt-screen keeps PgUp).
+
 ## 2026-09-14 (Manila, UTC+8)
+
+### 22:40 — N150 GET_DESCRIPTOR timeout/stall on every CCS port
+
+**Current problem / activity:** Reset now works (ports 1/4/5/8 at speed=3,
+slot assigned). GET_DESCRIPTOR (`request=6`) times out on port 1 and
+returns Stall (`cc=6`) on 4/5/8. Address Device succeeded, so the wire
+works; the control TD did not. Setup TRB had Chain set (RsvdZ on Setup)
+and the first TRB cycle was visible before Data/Status, so Intel could
+fetch an incomplete TD. QEMU ignores both. Clear Chain, give back Setup
+last, Evaluate Context if EP0 MPS changes, and do not latch
+`recovery_needed` on probe control failures.
+
+### 22:25 — N150 all CCS ports reset failed: revert PRC/usb_wait_ms
+
+**Current problem / activity:** Per-port bind tried 1,4,5,8; every
+`xhci: port N reset failed`. The previous flash reset ports 4/5 to
+speed=3. The extra PORTSC PRC-clear and `usb_wait_ms(10)` (can spin
+20e6 if ticks are stuck) dropped PED. Restore that reset write, print
+`sc=` and `no ccs` / `pr stuck` / `no ped` on failure, keep trying
+every CCS port.
+
+### 22:15 — N150 xHCI mapped; GET_DESCRIPTOR timed out on first of 3 ports
+
+**Current problem / activity:** `8086:54ed` BAR `0x6001100000` size 64KiB,
+scratchpads=34, ports=16, `ccs=0x98` (ports 4, 5, 8), poll, ctx=32,
+`x2apic=0`. Control `request=6` timed out then hotplug reconnect failed.
+Only two slots were bound and MSC always talked to device 0, so an
+internal gadget likely ate the first port. Try every CCS port, Address
+Device with BSR=0, disable-slot between tries. QEMU still one-port MSC.
+
+### 22:05 — N150 xHCI: poll, wait CCS, print BAR; no MSI-X on x2APIC
+
+**Current problem / activity:** GOP console is live. Qualify USB root on
+this N150. Skip MSI-X without COM1 or when x2APIC is on (xAPIC MSI
+address 0xFEE00000 hung the PCH). After HC reset, wait for CCS and
+print PCI id, BAR, port bitmap, and device vid/pid/class. High-BAR
+`mmio_map` skips CPUID without COM1. QEMU still uses MSI-X. Flash and
+read the `xhci:` / `usb:` lines; class 9 is a hub (no driver yet).
 
 ### 21:55 — N150 GOP console qualified; next is physical xHCI
 

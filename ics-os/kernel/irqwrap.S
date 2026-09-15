@@ -691,6 +691,17 @@ virtio_msixwrapper:
     POP_ALL
     iretq
 
+.extern virtio_net_irq
+.globl virtio_net_msixwrapper
+virtio_net_msixwrapper:
+    cli
+    PUSH_ALL
+    IRQ_KSTACK_ENTER
+    call virtio_net_irq
+    IRQ_KSTACK_LEAVE
+    POP_ALL
+    iretq
+
 .macro XHCI_MSIX_WRAPPER index
 .globl xhci_msixwrapper\index
 xhci_msixwrapper\index:
