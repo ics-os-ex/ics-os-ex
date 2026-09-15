@@ -211,6 +211,13 @@ void api_init(){
     api_addsystemcall(0xC3,sys_ttyioctl,0,API_REQUIRE_INTS);
      api_addsystemcall(0xC4,sys_ttyselect,0,API_REQUIRE_INTS);
      api_addsystemcall(0xC5,sys_dup,0,API_REQUIRE_INTS);
+     api_addsystemcall(0xC6,sys_socket,0,API_REQUIRE_INTS);
+     api_addsystemcall(0xC7,sys_bind,0,API_REQUIRE_INTS);
+     api_addsystemcall(0xC8,sys_listen,0,API_REQUIRE_INTS);
+     api_addsystemcall(0xC9,sys_accept,0,API_REQUIRE_INTS);
+     api_addsystemcall(0xCA,sys_connect,0,API_REQUIRE_INTS);
+     api_addsystemcall(0xCB,sys_send,0,API_REQUIRE_INTS);
+     api_addsystemcall(0xCC,sys_recv,0,API_REQUIRE_INTS);
   };
 
 
@@ -241,7 +248,9 @@ api_arg_t api_syscall(api_arg_t fxn, api_arg_t val, api_arg_t val2,
              static volatile unsigned long api_badfn_debug = 0;
              void *fnv = api_syscalltable[fxn].function_ptr;
              unsigned long fnp = (unsigned long)fnv;
-             if ((fnp < 0x100000UL || fnp >= 0x170000UL) &&
+             extern char textEnd[];
+             unsigned long text_end = (unsigned long)textEnd;
+             if ((fnp < 0x100000UL || fnp >= text_end) &&
                  api_badfn_debug < 16) {
                 extern int smp_cpu_id(void);
                 extern void serial_puts(const char *s);
@@ -249,10 +258,10 @@ api_arg_t api_syscall(api_arg_t fxn, api_arg_t val, api_arg_t val2,
                 char ab[160];
                 api_badfn_debug++;
                 sprintf(ab,
-                        "APIBADFN cpu=%d pid=%d fxn=0x%lx fn=0x%lx\n",
+                        "APIBADFN cpu=%d pid=%d fxn=0x%lx fn=0x%lx textEnd=0x%lx\n",
                         smp_cpu_id(),
                         current_process ? (int)current_process->processid : -1,
-                        (unsigned long)fxn, fnp);
+                        (unsigned long)fxn, fnp, text_end);
                 serial_puts(ab);
                 current_process->op_success = 0;
                 retval = (api_arg_t)-1;

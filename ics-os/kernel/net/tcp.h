@@ -6,9 +6,10 @@
 #include "net_endian.h"
 
 #define TCP_HDR_MIN       20
-#define TCP_PROTO         IPV4_PROTO_TCP
 #define TCP_ECHO_PORT     7
 #define TCP_TEST_PORT     7778
+#define TCP_PCB_MAX       8
+#define TCP_RX_MAX        512
 
 #define TCP_FIN  0x01
 #define TCP_SYN  0x02
@@ -30,7 +31,7 @@ struct tcp_hdr {
     unsigned short dst_port;
     unsigned int   seq;
     unsigned int   ack;
-    unsigned char  off_res; /* data offset in high nibble */
+    unsigned char  off_res;
     unsigned char  flags;
     unsigned short window;
     unsigned short checksum;
@@ -70,7 +71,6 @@ static inline unsigned short tcp_checksum(unsigned int src_ip_host,
     }
 }
 
-/* Build a minimal 20-byte TCP header (+ optional payload) into dst. */
 static inline unsigned int tcp_build(unsigned char *dst,
                                      unsigned short sport, unsigned short dport,
                                      unsigned int seq, unsigned int ack,
@@ -100,11 +100,26 @@ static inline unsigned int tcp_build(unsigned char *dst,
 
 struct netif;
 struct pbuf;
+struct tcp_pcb;
 
 void tcp_init(void);
 void tcp_listen_echo(unsigned short port);
 void tcp_input(struct netif *nif, struct pbuf *p, unsigned int ip_hdr_len);
 int  tcp_echo_client(struct netif *nif, unsigned int dst_host,
                      unsigned short dst_port, unsigned int timeout_spins);
+
+/* Socket-facing TCP PCB API. */
+struct tcp_pcb *tcp_pcb_new(struct netif *nif);
+void tcp_pcb_free(struct tcp_pcb *pcb);
+int  tcp_pcb_connect(struct tcp_pcb *pcb, unsigned int dst_host,
+                     unsigned short dst_port, unsigned int timeout_spins);
+int  tcp_pcb_listen(struct tcp_pcb *pcb, unsigned short port);
+struct tcp_pcb *tcp_pcb_accept(struct tcp_pcb *listener,
+                               unsigned int timeout_spins);
+int  tcp_pcb_send(struct tcp_pcb *pcb, const void *buf, unsigned int len);
+int  tcp_pcb_recv(struct tcp_pcb *pcb, void *buf, unsigned int len,
+                  unsigned int timeout_spins);
+int  tcp_pcb_close(struct tcp_pcb *pcb);
+int  tcp_pcb_state(struct tcp_pcb *pcb);
 
 #endif

@@ -280,6 +280,7 @@ typedef struct _PCB386 {
 #define FD_URING 3
 #define FD_BLK   4
 #define FD_RESERVED 5
+#define FD_SOCK  6
 /* Compiler frontends retain handles for their include-search directories.
    Sixteen descriptors is exhausted by GCC's normal internal header set before
    it can open config.h; 64 remains compact while meeting the POSIX minimum

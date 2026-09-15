@@ -37,7 +37,7 @@ vmdex:
 	make -C kernel/
 
 .PHONY: usb-uefi usb-etcher test-usb-uefi-gpt test-vbox-uefi-gpt test-vbox-uefi-gpt-bios test-bochs-uefi-gpt test-usb-cdc-pico
-.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-ttycanon-unit test-usbdbg-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-ttycanon-unit test-usbdbg-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -157,7 +157,12 @@ test-nettcp-unit:
 	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/net_tcp_unit.c -o /tmp/icsos-tests/net_tcp_unit
 	@/tmp/icsos-tests/net_tcp_unit
 
-test-net-unit: test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit
+test-netsock-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/net_sock_unit.c -o /tmp/icsos-tests/net_sock_unit
+	@/tmp/icsos-tests/net_sock_unit
+
+test-net-unit: test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit
 	@echo "test-net-unit PASS"
 
 # Deterministic 64 MiB GPT disk (slot 0: 32 MiB FAT32, slot 1: 16 MiB ext4).
@@ -332,6 +337,8 @@ test-dist: prep-dist
 apps:
 	-$(MAKE) -C contrib/hello
 	-$(MAKE) -C contrib/hello install
+	-$(MAKE) -C contrib/netecho
+	-$(MAKE) -C contrib/netecho install
 	-$(MAKE) -C contrib/posixio
 	-$(MAKE) -C contrib/posixio install
 	-$(MAKE) -C contrib/termtest
@@ -773,11 +780,17 @@ test-virtio: vmdex
 	@echo "test-virtio PASS"
 
 # Boot with virtio-net on QEMU user (SLIRP) networking; static 10.0.2.15
-# pings 10.0.2.2, UDP-echoes :7777, TCP-echoes :7778 on the host.
-test-net: vmdex
-	@echo "Building Multiboot2 ISO for virtio-net..."
-	@mkdir -p /tmp/icsos-net-iso/boot/grub
+# pings 10.0.2.2, UDP-echoes :7777, TCP-echoes :7778 on the host, then
+# userland netecho.exe exercises Berkeley sockets (NET_SOCK_OK).
+apps/netecho.exe: contrib/netecho/netecho.c contrib/netecho/Makefile sdk/posix.c sdk/include/sys/socket.h
+	$(MAKE) -C contrib/netecho install
+
+test-net: vmdex apps/netecho.exe
+	@echo "Building Multiboot2 ISO for virtio-net + sockets..."
+	@mkdir -p /tmp/icsos-net-iso/boot/grub /tmp/icsos-net-iso/apps
 	@cp kernel/Kernel64.bin /tmp/icsos-net-iso/vmdex
+	@cp apps/netecho.exe /tmp/icsos-net-iso/apps/netecho.exe
+	@printf '%s\n' 'netecho' 'reboot' > /tmp/icsos-net-iso/autoexec.bat
 	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
 		> /tmp/icsos-net-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-net.iso /tmp/icsos-net-iso >/dev/null 2>&1
@@ -785,8 +798,8 @@ test-net: vmdex
 	@chmod +x scripts/udp_echo_server.py scripts/tcp_echo_server.py
 	@python3 scripts/udp_echo_server.py 7777 >/tmp/icsos-udp-echo.log 2>&1 & echo $$! > /tmp/icsos-udp-echo.pid
 	@python3 scripts/tcp_echo_server.py 7778 >/tmp/icsos-tcp-echo.log 2>&1 & echo $$! > /tmp/icsos-tcp-echo.pid
-	@echo "Running virtio-net ping+UDP+TCP test (TCG, 2 vCPUs)..."
-	@-timeout 60 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
+	@echo "Running virtio-net ping+UDP+TCP+socket test (TCG, 2 vCPUs)..."
+	@-timeout 70 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
 		-cdrom /tmp/icsos-net.iso -boot d \
 		-netdev user,id=n0 \
 		-device virtio-net-pci,netdev=n0,disable-legacy=on \
@@ -802,10 +815,12 @@ test-net: vmdex
 	@grep -aq "NET_PING_OK" /tmp/icsos-net.log
 	@grep -aq "NET_UDP_OK" /tmp/icsos-net.log
 	@grep -aq "NET_TCP_OK" /tmp/icsos-net.log
+	@grep -aq "NET_SOCK_OK" /tmp/icsos-net.log
 	@! grep -aq "VIRTIO_NET_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_PING_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_UDP_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_TCP_FAIL" /tmp/icsos-net.log
+	@! grep -aq "NET_SOCK_FAIL" /tmp/icsos-net.log
 	@! grep -aq "General Protection fault" /tmp/icsos-net.log
 	@echo "test-net PASS"
 

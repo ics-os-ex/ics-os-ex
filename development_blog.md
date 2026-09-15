@@ -2,6 +2,15 @@
 
 ## 2026-09-15 (Manila, UTC+8)
 
+### 18:45 — Berkeley sockets + netecho
+
+Current problem: expose TCP/UDP to userland over POSIX fds.
+Activity: `FD_SOCK`, syscalls `0xC6`–`0xCC` (`socket`/`bind`/`listen`/
+`accept`/`connect`/`send`/`recv`), SDK `sys/socket.h` + `arpa/inet.h`,
+`contrib/netecho` connects to host `:7778` and prints `NET_SOCK_OK`.
+`make test-net` packs `netecho.exe` via autoexec; `test-netsock-unit`
+covers htons/inet_addr. No DHCP yet.
+
 ### 18:20 — Networking milestone C: minimal TCP
 
 In-tree TCP with SYN handshake, data+ACK, FIN teardown, guest echo on

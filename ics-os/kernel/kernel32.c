@@ -133,6 +133,7 @@ extern void textcolor(unsigned char c);
 #include "iomgr/iosched.h"
 #include "hardware/virtio/virtio_blk.h"
 #include "hardware/virtio/virtio_net.h"
+#include "net/sock.h"
 #include "kexec.h"
 
 //structure to hold the boot info

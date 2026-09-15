@@ -25,6 +25,7 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/poll.h>
+#include <sys/socket.h>
 
 extern unsigned long dexsdk_systemcall(int function_number,long p1,long p2,
                   long p3,long p4,long p5);
@@ -70,6 +71,13 @@ extern void exit(int status);
 #define FXN_TTYIOCTL  0xC3
 #define FXN_TTYSELECT 0xC4
 #define FXN_DUP 0xC5
+#define FXN_SOCKET  0xC6
+#define FXN_BIND    0xC7
+#define FXN_LISTEN  0xC8
+#define FXN_ACCEPT  0xC9
+#define FXN_CONNECT 0xCA
+#define FXN_SEND    0xCB
+#define FXN_RECV    0xCC
 #define FXN_DELAY 0x9B
 #define FXN_PRECISTIME 0x96
 
@@ -1919,3 +1927,38 @@ char *mktemp(char *template)
     }
     return 0;
  }
+
+int socket(int domain, int type, int protocol)
+{
+   return (int)ics_sys(FXN_SOCKET, domain, type, protocol, 0, 0);
+}
+
+int bind(int fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+   return (int)ics_sys(FXN_BIND, fd, (long)addr, (long)addrlen, 0, 0);
+}
+
+int listen(int fd, int backlog)
+{
+   return (int)ics_sys(FXN_LISTEN, fd, backlog, 0, 0, 0);
+}
+
+int accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+   return (int)ics_sys(FXN_ACCEPT, fd, (long)addr, (long)addrlen, 0, 0);
+}
+
+int connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+   return (int)ics_sys(FXN_CONNECT, fd, (long)addr, (long)addrlen, 0, 0);
+}
+
+ssize_t send(int fd, const void *buf, size_t len, int flags)
+{
+   return (ssize_t)ics_sys(FXN_SEND, fd, (long)buf, (long)len, flags, 0);
+}
+
+ssize_t recv(int fd, void *buf, size_t len, int flags)
+{
+   return (ssize_t)ics_sys(FXN_RECV, fd, (long)buf, (long)len, flags, 0);
+}

@@ -91,8 +91,9 @@ tables. Do not move user-buffer callback drain to a generic worker until those
 pages are pinned and kernel-mapped. Run `make test-io-unit`, `make
 test-posixio`, and `make test-virtio`; the guest tests use two virtual CPUs and
 remain focused regression/functional tests rather than exhaustive stress.
-Networking milestones A–C: `make test-net-unit` and `make test-net`
-(virtio-net SLIRP ICMP + UDP + TCP echo).
+Networking milestones A–C plus Berkeley sockets: `make test-net-unit` and
+`make test-net` (virtio-net SLIRP ICMP + UDP + TCP echo + `netecho.exe`
+sockets → `NET_SOCK_OK`).
 
 POSIX fd lookup must hold the process `fd_lock` until it has acquired a typed
 reference on the VFS, block, or io_uring open description. `sys_close()` first
@@ -587,7 +588,7 @@ Kernel source directories.
 |`filesystem/`  |Sources for filesystem support (fat12, iso9660, and ext4)|
 |`grub/`        |Files needed by grub|
 |`hardware/`    |Sources for hardware device drivers (ATA PIO, UHCI, virtio-blk, virtio-net, …)|
-|`net/`         |Minimal IPv4 stack (pbuf, netif, Ethernet, ARP, ICMP, UDP, TCP) for networking milestones A–C|
+|`net/`         |Minimal IPv4 stack (pbuf, netif, Ethernet, ARP, ICMP, UDP, TCP) plus `sock.c` Berkeley sockets (`FD_SOCK`)|
 |`iomgr/`       |I/O manager (bio, per-device blk-mq lock, 4KiB page cache)|
 |`vfs/`         |VFS plus POSIX fd table, io_uring (`posixfd.c`), `waitpid`/`posix_spawn`/`execve`; `/dev/vblk` and optional FAT `/work`|
 |`memory/`      |Memory management routines|

@@ -74,8 +74,8 @@ Useful individual targets (from `ics-os/`):
 | `test-usb-cdc-pico` | Physical Pico 2 W (`2e8a:0005`) via QEMU `usb-host` on q35 xHCI; curls Pico Wi-Fi for `USB_CDC_CONSOLE_OK`, `ICSOS_VER`, `pico=`, `USB_CDC_RX`, and `STATUS cdc=1`/`release=`. SKIP if the gadget is not plugged into the host |
 | `test-posixio` | POSIX fds + preadv/pwritev/fsync + io_uring; ramdisk `POSIXIO_PASS`/`URING_PASS`; virtio `/dev/vblk` `URING_VBLK_PASS` |
 | `test-virtio` | QEMU virtio-blk DMA; MSI-X completions; `VIRTIO_BLK_OK` + `VIRTIO_IRQ_OK` |
-| `test-net` | QEMU virtio-net + SLIRP; ICMP + UDP `:7777` + TCP `:7778` echo; `NET_PING_OK`/`NET_UDP_OK`/`NET_TCP_OK` |
-| `test-net-unit` | Host TAP for checksum / ARP / ICMP / UDP / TCP (`tests/net_*_unit.c`) |
+| `test-net` | QEMU virtio-net + SLIRP; ICMP + UDP `:7777` + TCP `:7778` + userland sockets (`netecho.exe`); `NET_PING_OK`/`NET_UDP_OK`/`NET_TCP_OK`/`NET_SOCK_OK` |
+| `test-net-unit` | Host TAP for checksum / ARP / ICMP / UDP / TCP / sockaddr helpers (`tests/net_*_unit.c`) |
 | `test-ext4` | ext4 virtio-blk read/create/write; guest marker plus host `e2fsck`/`debugfs` validation of the post-test image |
 | `test-spawn` | `posix_spawn` + `waitpid` of `hello.exe` (`SPAWN_PASS`); FAT `/work` on virtio (`WORK_DISK_PASS`) |
 | `test-stress` | SMP=4 spawn/exit/reap + short fork+ELF overlap (`STRESSPROC_PASS`); no GPF/PF |
@@ -102,6 +102,7 @@ Useful individual targets (from `ics-os/`):
 | `test-neticmp-unit` | Host-native TAP for ICMP echo request→reply transform (`tests/net_icmp_unit.c`) |
 | `test-netudp-unit` | Host-native TAP for UDP build/checksum (`tests/net_udp_unit.c`) |
 | `test-nettcp-unit` | Host-native TAP for TCP build/checksum (`tests/net_tcp_unit.c`) |
+| `test-netsock-unit` | Host-native TAP for htons/inet_addr sockaddr helpers (`tests/net_sock_unit.c`) |
 | `test-usbdbg-unit` | Host-native TAP for the CDC debug RPC line parser, KEYS hex, SCREEN dump, PPM size, and ICSOS_VER bind/STATUS stamps (`tests/usb_debug_unit.c`) |
 | `test-ttycanon-unit` | Host-native TAP for canonical tty read remainder (`tests/tty_canon_unit.c`) |
 | `test-pciscan-unit` | Host-native TAP for PCI slot function-count (empty slots skip fn 1-7; `tests/pci_scan_unit.c`) |

@@ -18,6 +18,7 @@
 #include "../cpu/spinlock.h"
 #include "../process/completion.h"
 #include "../stdlib/time.h"
+#include "../net/sock.h"
 #include "posixfd.h"
 
 extern void *malloc(unsigned int);
@@ -200,6 +201,33 @@ static void fd_release_slot(int fd)
       current_process->fds[fd].ptr=0;
    }
    spin_unlock(&current_process->fd_lock);
+}
+
+int sock_fd_alloc(void)
+{
+   return fd_alloc_slot();
+}
+
+void sock_fd_install(int fd, void *sock)
+{
+   fd_install(fd, FD_SOCK, sock);
+}
+
+void sock_fd_release(int fd)
+{
+   fd_release_slot(fd);
+}
+
+struct sock *sock_from_fd(int fd)
+{
+   void *ptr = 0;
+   if (!current_process || fd < 0 || fd >= FD_MAX)
+      return 0;
+   spin_lock(&current_process->fd_lock);
+   if (current_process->fds[fd].type == FD_SOCK)
+      ptr = current_process->fds[fd].ptr;
+   spin_unlock(&current_process->fd_lock);
+   return (struct sock *)ptr;
 }
 
 static file_PCB *fd_file_get(int fd)
@@ -539,6 +567,10 @@ long sys_close(int fd)
         fd_blk_close((fd_blk_t *)ptr);
         return 0;
      }
+    if (type==FD_SOCK) {
+       sock_close(ptr);
+       return 0;
+    }
     /* FD_TTY: the tty is a shared, never-destroyed resource (see sys_dup);
        closing a dup'd tty descriptor only releases the fd slot. */
     return 0;
@@ -603,6 +635,11 @@ long sys_read(int fd, void *buf, long n)
    if (t)
       return tty_read(t, (char *)buf, (int)n);
    {
+      struct sock *sk = sock_from_fd(fd);
+      if (sk)
+         return sock_read(sk, buf, n);
+   }
+   {
       fd_blk_t *b = fd_blk_get(fd);
       if (b) {
          long got;
@@ -636,6 +673,11 @@ long sys_write(int fd, const void *buf, long n)
       return tty_write(t, (const char *)buf, (int)n);
    if (current_process && current_process->ctty && (fd == 1 || fd == 2))
       return tty_write(current_process->ctty, (const char *)buf, (int)n);
+   {
+      struct sock *sk = sock_from_fd(fd);
+      if (sk)
+         return sock_write(sk, buf, n);
+   }
    {
       fd_blk_t *b = fd_blk_get(fd);
       if (b) {
@@ -1305,6 +1347,8 @@ void posix_fd_close_all(struct _PCB386 *process)
          fd_blk_close((fd_blk_t *)ptr);
       else if (type==FD_URING)
          uring_close((ics_uring *)ptr);
+      else if (type==FD_SOCK)
+         sock_close(ptr);
    }
 }
 
