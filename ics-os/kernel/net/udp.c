@@ -4,6 +4,7 @@
 #include "ipv4.h"
 #include "net_endian.h"
 #include "net_sync.h"
+#include "dhcp.h"
 
 extern void *memcpy(void *d, const void *s, unsigned int n);
 extern int memcmp(const void *s1, const void *s2, unsigned int n);
@@ -59,6 +60,11 @@ void udp_input(struct netif *nif, struct pbuf *p, unsigned int ip_hdr_len)
     dport = net_ntohs(uh->dst_port);
     payload = p->data + ip_hdr_len + UDP_HDR_LEN;
     payload_len = udp_len - UDP_HDR_LEN;
+
+    if (dhcp_udp_deliver(dport, payload, payload_len)) {
+        pbuf_free(p);
+        return;
+    }
 
     /* Guest echo server (port 7). */
     if (dport == UDP_ECHO_PORT && nif->configured) {

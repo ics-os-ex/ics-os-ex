@@ -91,7 +91,9 @@ tables. Do not move user-buffer callback drain to a generic worker until those
 pages are pinned and kernel-mapped. Run `make test-io-unit`, `make
 test-posixio`, and `make test-virtio`; the guest tests use two virtual CPUs and
 remain focused regression/functional tests rather than exhaustive stress.
-Networking milestones A–C plus Berkeley sockets: `make test-net-unit`,
+Networking milestones A–C plus Berkeley sockets, SMP netstress, and DHCP:
+`make test-net-unit`, `make test-net` (`NET_DHCP_OK` + sockets), and
+`make test-net-stress`.
 `make test-net`, and `make test-net-stress` (virtio-net SLIRP ICMP + UDP +
 TCP + sockets, plus concurrent `user-smp` socket hammer → `NETSTRESS_PASS`).
 
@@ -588,7 +590,7 @@ Kernel source directories.
 |`filesystem/`  |Sources for filesystem support (fat12, iso9660, and ext4)|
 |`grub/`        |Files needed by grub|
 |`hardware/`    |Sources for hardware device drivers (ATA PIO, UHCI, virtio-blk, virtio-net, …)|
-|`net/`         |Minimal IPv4 stack (pbuf, netif, Ethernet, ARP, ICMP, UDP, TCP) plus `sock.c` Berkeley sockets (`FD_SOCK`)|
+|`net/`         |Minimal IPv4 stack (pbuf, netif, Ethernet, ARP, ICMP, UDP, TCP, DHCP) plus `sock.c` Berkeley sockets (`FD_SOCK`) and `net_sync` softnet lock|
 |`iomgr/`       |I/O manager (bio, per-device blk-mq lock, 4KiB page cache)|
 |`vfs/`         |VFS plus POSIX fd table, io_uring (`posixfd.c`), `waitpid`/`posix_spawn`/`execve`; `/dev/vblk` and optional FAT `/work`|
 |`memory/`      |Memory management routines|

@@ -19,6 +19,7 @@
 #include "../../net/tcp.h"
 #include "../../net/arp.h"
 #include "../../net/net_sync.h"
+#include "../../net/dhcp.h"
 #include "../irq_lifecycle.h"
 
 extern void *malloc(unsigned int);
@@ -657,9 +658,9 @@ static void vnet_selftest(struct vnet_dev *d)
 {
    struct inet_config cfg;
    unsigned int spins;
+   int dhcp_ok = 0;
 
    inet_config_from_cmdline(&cfg, kernel_cmdline);
-   netif_set_addr(&d->nif, cfg.ip, cfg.netmask, cfg.gateway);
 
    /* Prefer status bit when available; do not depend on the timer yet
       (early boot may still be before a reliable tick source). */
@@ -667,19 +668,34 @@ static void vnet_selftest(struct vnet_dev *d)
       __asm__ volatile ("pause");
 
    if (!vnet_link_up(d) && d->has_status) {
-      /* SLIRP usually reports link-up; if not, proceed anyway so the
-         ping attempt still exercises TX/RX. */
       printf("virtio-net: link status not up yet; continuing\n");
    }
-   netif_set_up(&d->nif);
-   printf("NETIF_UP ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
-          (cfg.ip >> 24) & 0xFF, (cfg.ip >> 16) & 0xFF,
-          (cfg.ip >> 8) & 0xFF, cfg.ip & 0xFF,
-          (cfg.gateway >> 24) & 0xFF, (cfg.gateway >> 16) & 0xFF,
-          (cfg.gateway >> 8) & 0xFF, cfg.gateway & 0xFF);
 
    arp_init(&d->nif);
    tcp_init();
+
+   /* Bring the interface up for TX/RX before DHCP (no IP yet). */
+   d->nif.link_up = 1;
+   if (dhcp_client(&d->nif, &cfg, 4000000) == 0) {
+      dhcp_ok = 1;
+      printf("NET_DHCP_OK ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
+             (cfg.ip >> 24) & 0xFF, (cfg.ip >> 16) & 0xFF,
+             (cfg.ip >> 8) & 0xFF, cfg.ip & 0xFF,
+             (cfg.gateway >> 24) & 0xFF, (cfg.gateway >> 16) & 0xFF,
+             (cfg.gateway >> 8) & 0xFF, cfg.gateway & 0xFF);
+   } else {
+      printf("NET_DHCP_FAIL\n");
+      inet_config_from_cmdline(&cfg, kernel_cmdline);
+   }
+
+   netif_set_addr(&d->nif, cfg.ip, cfg.netmask, cfg.gateway);
+   netif_set_up(&d->nif);
+   printf("NETIF_UP ip=%u.%u.%u.%u gw=%u.%u.%u.%u dhcp=%d\n",
+          (cfg.ip >> 24) & 0xFF, (cfg.ip >> 16) & 0xFF,
+          (cfg.ip >> 8) & 0xFF, cfg.ip & 0xFF,
+          (cfg.gateway >> 24) & 0xFF, (cfg.gateway >> 16) & 0xFF,
+          (cfg.gateway >> 8) & 0xFF, cfg.gateway & 0xFF, dhcp_ok);
+
    tcp_listen_echo(TCP_ECHO_PORT);
 
    if (icmp_ping(&d->nif, cfg.gateway, 300) == 0)
@@ -687,14 +703,11 @@ static void vnet_selftest(struct vnet_dev *d)
    else
       printf("NET_PING_FAIL\n");
 
-   /* UDP echo client to host (SLIRP gateway). Host must run an echo
-      server on UDP_TEST_PORT for NET_UDP_OK; otherwise FAIL. */
    if (udp_echo_client(&d->nif, cfg.gateway, UDP_TEST_PORT, 2000000) == 0)
       printf("NET_UDP_OK\n");
    else
       printf("NET_UDP_FAIL\n");
 
-   /* TCP echo client to host :7778. */
    if (tcp_echo_client(&d->nif, cfg.gateway, TCP_TEST_PORT, 4000000) == 0)
       printf("NET_TCP_OK\n");
    else
