@@ -111,6 +111,7 @@ int  tcp_echo_client(struct netif *nif, unsigned int dst_host,
 /* Socket-facing TCP PCB API. */
 struct tcp_pcb *tcp_pcb_new(struct netif *nif);
 void tcp_pcb_free(struct tcp_pcb *pcb);
+int  tcp_pcb_bind(struct tcp_pcb *pcb, unsigned short port);
 int  tcp_pcb_connect(struct tcp_pcb *pcb, unsigned int dst_host,
                      unsigned short dst_port, unsigned int timeout_spins);
 int  tcp_pcb_listen(struct tcp_pcb *pcb, unsigned short port);
@@ -123,5 +124,14 @@ int  tcp_pcb_close(struct tcp_pcb *pcb);
 int  tcp_pcb_state(struct tcp_pcb *pcb);
 unsigned int tcp_pcb_remote_ip(struct tcp_pcb *pcb);
 unsigned short tcp_pcb_remote_port(struct tcp_pcb *pcb);
+
+/* Softnet / RTO: retransmit unacked data. */
+void tcp_timer(unsigned int now_ticks);
+unsigned int tcp_rexmit_count(void);
+/* Test hook: drop the next data segment on the wire once (still queued). */
+void tcp_test_drop_next_data(int enable);
+int  tcp_echo_rexmit_selftest(struct netif *nif, unsigned int dst_host,
+                             unsigned short dst_port,
+                             unsigned int timeout_spins);
 
 #endif

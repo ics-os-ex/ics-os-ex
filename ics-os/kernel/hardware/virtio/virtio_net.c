@@ -20,6 +20,8 @@
 #include "../../net/arp.h"
 #include "../../net/net_sync.h"
 #include "../../net/dhcp.h"
+#include "../../net/softnet.h"
+#include "../../net/dns.h"
 #include "../irq_lifecycle.h"
 
 extern void *malloc(unsigned int);
@@ -727,6 +729,26 @@ static void vnet_selftest(struct vnet_dev *d)
       printf("NET_TCP_OK\n");
    else
       printf("NET_TCP_FAIL\n");
+
+   if (tcp_echo_rexmit_selftest(&d->nif, cfg.gateway, TCP_TEST_PORT,
+                                8000000) == 0)
+      printf("NET_TCP_REXMIT_OK\n");
+   else
+      printf("NET_TCP_REXMIT_FAIL\n");
+
+   {
+      unsigned int dip = 0;
+      if (dns_query_a(&d->nif, cfg.gateway, DNS_TEST_PORT, "icsos.test",
+                      &dip, 4000000) == 0 && dip == 0x0A000202u)
+         printf("NET_DNS_OK ip=%u.%u.%u.%u\n",
+                (dip >> 24) & 0xFF, (dip >> 16) & 0xFF,
+                (dip >> 8) & 0xFF, dip & 0xFF);
+      else
+         printf("NET_DNS_FAIL\n");
+   }
+
+   softnet_init();
+   printf("NET_SOFTNET_OK\n");
 }
 
 void virtio_net_init(void)

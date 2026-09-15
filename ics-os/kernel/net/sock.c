@@ -327,6 +327,8 @@ long sys_connect(int fd, const struct sockaddr *addr, unsigned int addrlen)
             ret = -EINVAL;
             goto out;
         }
+        if (s->bound && s->local_port)
+            (void)tcp_pcb_bind(s->pcb, s->local_port);
         if (tcp_pcb_connect(s->pcb, ip, port, 4000000) != 0) {
             ret = -ENOTCONN;
             goto out;

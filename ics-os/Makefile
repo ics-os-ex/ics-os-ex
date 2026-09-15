@@ -167,7 +167,12 @@ test-netdhcp-unit:
 	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/net_dhcp_unit.c -o /tmp/icsos-tests/net_dhcp_unit
 	@/tmp/icsos-tests/net_dhcp_unit
 
-test-net-unit: test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-netdhcp-unit
+test-netdns-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/net_dns_unit.c -o /tmp/icsos-tests/net_dns_unit
+	@/tmp/icsos-tests/net_dns_unit
+
+test-net-unit: test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-netdhcp-unit test-netdns-unit
 	@echo "test-net-unit PASS"
 
 # Deterministic 64 MiB GPT disk (slot 0: 32 MiB FAT32, slot 1: 16 MiB ext4).
@@ -814,15 +819,16 @@ test-net: vmdex apps/netecho.exe apps/httpd.exe apps/nc.exe
 	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
 		> /tmp/icsos-net-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-net.iso /tmp/icsos-net-iso >/dev/null 2>&1
-	@echo "Starting host UDP/TCP echo + listen/HTTP probes..."
+	@echo "Starting host UDP/TCP echo + listen/HTTP/DNS probes..."
 	@chmod +x scripts/udp_echo_server.py scripts/tcp_echo_server.py \
-		scripts/tcp_connect_probe.py scripts/http_get_probe.py
+		scripts/tcp_connect_probe.py scripts/http_get_probe.py scripts/dns_stub.py
 	@python3 scripts/udp_echo_server.py 7777 >/tmp/icsos-udp-echo.log 2>&1 & echo $$! > /tmp/icsos-udp-echo.pid
 	@python3 scripts/tcp_echo_server.py 7778 >/tmp/icsos-tcp-echo.log 2>&1 & echo $$! > /tmp/icsos-tcp-echo.pid
 	@python3 scripts/tcp_connect_probe.py 17779 >/tmp/icsos-tcp-probe.log 2>&1 & echo $$! > /tmp/icsos-tcp-probe.pid
 	@python3 scripts/http_get_probe.py 18080 >/tmp/icsos-http-probe.log 2>&1 & echo $$! > /tmp/icsos-http-probe.pid
+	@python3 scripts/dns_stub.py 5353 >/tmp/icsos-dns-stub.log 2>&1 & echo $$! > /tmp/icsos-dns-stub.pid
 	@echo "Running virtio-net ping+UDP+TCP+socket+httpd+nc test (TCG, 2 vCPUs)..."
-	@-timeout 90 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
+	@-timeout 120 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
 		-cdrom /tmp/icsos-net.iso -boot d \
 		-netdev user,id=n0,hostfwd=tcp::17779-:7779,hostfwd=tcp::18080-:8080 \
 		-device virtio-net-pci,netdev=n0,disable-legacy=on \
@@ -832,6 +838,7 @@ test-net: vmdex apps/netecho.exe apps/httpd.exe apps/nc.exe
 	 if [ -f /tmp/icsos-tcp-echo.pid ]; then kill $$(cat /tmp/icsos-tcp-echo.pid) 2>/dev/null || true; rm -f /tmp/icsos-tcp-echo.pid; fi; \
 	 if [ -f /tmp/icsos-tcp-probe.pid ]; then wait $$(cat /tmp/icsos-tcp-probe.pid) 2>/dev/null || true; rm -f /tmp/icsos-tcp-probe.pid; fi; \
 	 if [ -f /tmp/icsos-http-probe.pid ]; then wait $$(cat /tmp/icsos-http-probe.pid) 2>/dev/null || true; rm -f /tmp/icsos-http-probe.pid; fi; \
+	 if [ -f /tmp/icsos-dns-stub.pid ]; then kill $$(cat /tmp/icsos-dns-stub.pid) 2>/dev/null || true; rm -f /tmp/icsos-dns-stub.pid; fi; \
 	 exit 0
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-net.log
 	@grep -aq "VIRTIO_NET_OK" /tmp/icsos-net.log
@@ -843,6 +850,9 @@ test-net: vmdex apps/netecho.exe apps/httpd.exe apps/nc.exe
 	@grep -aq "NET_PING_OK" /tmp/icsos-net.log
 	@grep -aq "NET_UDP_OK" /tmp/icsos-net.log
 	@grep -aq "NET_TCP_OK" /tmp/icsos-net.log
+	@grep -aq "NET_TCP_REXMIT_OK" /tmp/icsos-net.log
+	@grep -aq "NET_DNS_OK" /tmp/icsos-net.log
+	@grep -aq "NET_SOFTNET_OK" /tmp/icsos-net.log
 	@grep -aq "NET_SOCK_OK" /tmp/icsos-net.log
 	@grep -aq "NET_SOCK_UDP_OK" /tmp/icsos-net.log
 	@grep -aq "NET_SOCK_LISTEN_OK" /tmp/icsos-net.log
@@ -855,6 +865,8 @@ test-net: vmdex apps/netecho.exe apps/httpd.exe apps/nc.exe
 	@! grep -aq "NET_PING_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_UDP_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_TCP_FAIL" /tmp/icsos-net.log
+	@! grep -aq "NET_TCP_REXMIT_FAIL" /tmp/icsos-net.log
+	@! grep -aq "NET_DNS_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_SOCK_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_HTTPD_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_NC_FAIL" /tmp/icsos-net.log

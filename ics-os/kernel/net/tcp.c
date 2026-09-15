@@ -9,12 +9,17 @@ extern void *memcpy(void *d, const void *s, unsigned int n);
 extern void *memmove(void *d, const void *s, unsigned int n);
 extern void *memset(void *s, int c, unsigned int n);
 extern int memcmp(const void *s1, const void *s2, unsigned int n);
+extern unsigned int ticks;
+
+#define TCP_UNA_MAX       512
+#define TCP_RTO_TICKS     40   /* ~200ms at 200Hz */
+#define TCP_RTO_MAX_TICKS 800  /* ~4s */
 
 struct tcp_pcb {
     unsigned char state;
     unsigned char echo;
     unsigned char in_use;
-    unsigned char pending_accept; /* child ready for accept() */
+    unsigned char pending_accept;
     unsigned short local_port;
     unsigned short remote_port;
     unsigned int remote_ip;
@@ -24,12 +29,29 @@ struct tcp_pcb {
     unsigned int iss;
     unsigned char rx_buf[TCP_RX_MAX];
     unsigned int rx_len;
-    struct tcp_pcb *parent; /* listen parent for accepted children */
+    unsigned char una_buf[TCP_UNA_MAX];
+    unsigned int una_len;
+    unsigned int una_seq;
+    unsigned int rto_deadline;
+    unsigned int rto_ticks;
+    struct tcp_pcb *parent;
     struct netif *nif;
 };
 
 static struct tcp_pcb pcbs[TCP_PCB_MAX];
 static unsigned short ephemeral = 41000;
+static unsigned int g_rexmit_count;
+static int g_drop_next_data;
+
+void tcp_test_drop_next_data(int enable)
+{
+    g_drop_next_data = enable ? 1 : 0;
+}
+
+unsigned int tcp_rexmit_count(void)
+{
+    return g_rexmit_count;
+}
 
 static struct tcp_pcb *tcp_find(unsigned short local, unsigned short remote,
                                 unsigned int remote_ip, int allow_listen)
@@ -60,6 +82,7 @@ struct tcp_pcb *tcp_pcb_new(struct netif *nif)
             pcbs[i].in_use = 1;
             pcbs[i].state = TCP_CLOSED;
             pcbs[i].nif = nif;
+            pcbs[i].rto_ticks = TCP_RTO_TICKS;
             return &pcbs[i];
         }
     }
@@ -71,6 +94,14 @@ void tcp_pcb_free(struct tcp_pcb *pcb)
     if (!pcb)
         return;
     memset(pcb, 0, sizeof(*pcb));
+}
+
+int tcp_pcb_bind(struct tcp_pcb *pcb, unsigned short port)
+{
+    if (!pcb || !port)
+        return -1;
+    pcb->local_port = port;
+    return 0;
 }
 
 int tcp_pcb_state(struct tcp_pcb *pcb)
@@ -116,7 +147,95 @@ static int tcp_output(struct tcp_pcb *pcb, unsigned char flags,
     if (flags & TCP_FIN)
         pcb->snd_nxt++;
 
+    if (payload_len && g_drop_next_data) {
+        g_drop_next_data = 0;
+        pbuf_free(p);
+        return 0;
+    }
     return ipv4_output(pcb->nif, p, pcb->remote_ip, IPV4_PROTO_TCP);
+}
+
+/* Retransmit without advancing snd_nxt. */
+static int tcp_rexmit_una(struct tcp_pcb *pcb)
+{
+    struct pbuf *p;
+    unsigned int tcp_len;
+
+    if (!pcb || !pcb->una_len || !pcb->nif)
+        return -1;
+    if (TCP_HDR_MIN + pcb->una_len > PBUF_SIZE)
+        return -1;
+    p = pbuf_alloc((u16)(TCP_HDR_MIN + pcb->una_len));
+    if (!p)
+        return -1;
+    tcp_len = tcp_build(p->data, pcb->local_port, pcb->remote_port,
+                        pcb->una_seq, pcb->rcv_nxt, TCP_PSH | TCP_ACK,
+                        pcb->una_buf, pcb->una_len,
+                        pcb->nif->ip, pcb->remote_ip);
+    p->len = (u16)tcp_len;
+    g_rexmit_count++;
+    return ipv4_output(pcb->nif, p, pcb->remote_ip, IPV4_PROTO_TCP);
+}
+
+static void tcp_arm_rto(struct tcp_pcb *pcb)
+{
+    pcb->rto_deadline = ticks + pcb->rto_ticks;
+}
+
+static void tcp_on_ack(struct tcp_pcb *pcb, unsigned int ack)
+{
+    unsigned int acked;
+
+    if (!pcb->una_len)
+        return;
+    if ((int)(ack - pcb->una_seq) <= 0)
+        return;
+    acked = ack - pcb->una_seq;
+    if (acked >= pcb->una_len) {
+        pcb->una_len = 0;
+        pcb->rto_ticks = TCP_RTO_TICKS;
+        pcb->rto_deadline = 0;
+    } else {
+        memmove(pcb->una_buf, pcb->una_buf + acked, pcb->una_len - acked);
+        pcb->una_len -= acked;
+        pcb->una_seq = ack;
+        tcp_arm_rto(pcb);
+    }
+    pcb->snd_una = ack;
+}
+
+void tcp_timer(unsigned int now_ticks)
+{
+    int i;
+    for (i = 0; i < TCP_PCB_MAX; i++) {
+        struct tcp_pcb *pcb = &pcbs[i];
+        if (!pcb->in_use || !pcb->una_len)
+            continue;
+        if (pcb->state != TCP_ESTABLISHED && pcb->state != TCP_FIN_WAIT_1)
+            continue;
+        /* deadline==0 means "due now" (used when IRQs are held off under
+           net_lock so ticks cannot advance). */
+        if (pcb->rto_deadline && (int)(now_ticks - pcb->rto_deadline) < 0)
+            continue;
+        (void)tcp_rexmit_una(pcb);
+        if (pcb->rto_ticks < TCP_RTO_MAX_TICKS) {
+            pcb->rto_ticks *= 2;
+            if (pcb->rto_ticks > TCP_RTO_MAX_TICKS)
+                pcb->rto_ticks = TCP_RTO_MAX_TICKS;
+        }
+        tcp_arm_rto(pcb);
+    }
+}
+
+static void tcp_maybe_rexmit_spin(struct tcp_pcb *pcb, unsigned int spins)
+{
+    if (!pcb || !pcb->una_len)
+        return;
+    /* Under net_lock IRQs are off; force RTO on spin budget. */
+    if ((spins % 100000u) == 99999u) {
+        pcb->rto_deadline = 0;
+        tcp_timer(ticks);
+    }
 }
 
 static void tcp_rx_append(struct tcp_pcb *pcb, const unsigned char *data,
@@ -179,15 +298,18 @@ static void tcp_handle(struct netif *nif, struct tcp_pcb *pcb,
 
     if (pcb->state == TCP_ESTABLISHED || pcb->state == TCP_CLOSE_WAIT ||
         pcb->state == TCP_SYN_RCVD) {
-        if (flags & TCP_ACK)
+        if (flags & TCP_ACK) {
             pcb->snd_una = ack;
+            tcp_on_ack(pcb, ack);
+        }
 
         if (plen && seq == pcb->rcv_nxt) {
             pcb->rcv_nxt = seq + plen;
             tcp_rx_append(pcb, payload, plen);
             if (pcb->echo)
-                (void)tcp_output(pcb, TCP_PSH | TCP_ACK, payload, plen);
-            (void)tcp_output(pcb, TCP_ACK, 0, 0);
+                (void)tcp_pcb_send(pcb, payload, plen);
+            else
+                (void)tcp_output(pcb, TCP_ACK, 0, 0);
         }
 
         if (flags & TCP_FIN) {
@@ -207,6 +329,8 @@ static void tcp_handle(struct netif *nif, struct tcp_pcb *pcb,
     }
 
     if (pcb->state == TCP_FIN_WAIT_1) {
+        if (flags & TCP_ACK)
+            tcp_on_ack(pcb, ack);
         if ((flags & TCP_ACK) && ack == pcb->snd_nxt)
             pcb->state = TCP_CLOSED;
         if (flags & TCP_FIN) {
@@ -283,6 +407,8 @@ void tcp_init(void)
 {
     memset(pcbs, 0, sizeof(pcbs));
     ephemeral = 41000;
+    g_rexmit_count = 0;
+    g_drop_next_data = 0;
 }
 
 void tcp_listen_echo(unsigned short port)
@@ -315,6 +441,7 @@ struct tcp_pcb *tcp_pcb_accept(struct tcp_pcb *listener,
         return 0;
     while (spins++ < timeout_spins) {
         netif_poll(listener->nif ? listener->nif : netif_default());
+        tcp_timer(ticks);
         for (i = 0; i < TCP_PCB_MAX; i++) {
             if (pcbs[i].in_use && pcbs[i].parent == listener &&
                 pcbs[i].pending_accept &&
@@ -336,9 +463,11 @@ int tcp_pcb_connect(struct tcp_pcb *pcb, unsigned int dst_host,
 
     if (!pcb || !pcb->nif)
         return -1;
-    pcb->local_port = ephemeral++;
-    if (ephemeral < 41000)
-        ephemeral = 41000;
+    if (!pcb->local_port) {
+        pcb->local_port = ephemeral++;
+        if (ephemeral < 41000)
+            ephemeral = 41000;
+    }
     pcb->remote_port = dst_port;
     pcb->remote_ip = dst_host;
     pcb->iss = 1000 + pcb->local_port;
@@ -346,6 +475,8 @@ int tcp_pcb_connect(struct tcp_pcb *pcb, unsigned int dst_host,
     pcb->snd_una = pcb->iss;
     pcb->rcv_nxt = 0;
     pcb->rx_len = 0;
+    pcb->una_len = 0;
+    pcb->rto_ticks = TCP_RTO_TICKS;
     pcb->state = TCP_SYN_SENT;
 
     if (tcp_output(pcb, TCP_SYN, 0, 0) != 0) {
@@ -355,6 +486,7 @@ int tcp_pcb_connect(struct tcp_pcb *pcb, unsigned int dst_host,
 
     while (pcb->state != TCP_ESTABLISHED && spins < timeout_spins) {
         netif_poll(pcb->nif);
+        tcp_timer(ticks);
         if (pcb->state == TCP_CLOSED)
             return -1;
         if (pcb->state == TCP_SYN_SENT && (spins % 200000) == 199999 &&
@@ -371,11 +503,36 @@ int tcp_pcb_connect(struct tcp_pcb *pcb, unsigned int dst_host,
 
 int tcp_pcb_send(struct tcp_pcb *pcb, const void *buf, unsigned int len)
 {
+    unsigned int spins = 0;
+    unsigned int n;
+
     if (!pcb || pcb->state != TCP_ESTABLISHED || !buf || !len)
         return -1;
-    if (tcp_output(pcb, TCP_PSH | TCP_ACK, (const unsigned char *)buf, len) != 0)
+    if (len > TCP_UNA_MAX)
+        len = TCP_UNA_MAX;
+
+    /* One outstanding data segment: wait for prior ACK. */
+    while (pcb->una_len && spins++ < 4000000) {
+        netif_poll(pcb->nif);
+        tcp_timer(ticks);
+        tcp_maybe_rexmit_spin(pcb, spins);
+        __asm__ volatile ("pause");
+    }
+    if (pcb->una_len)
         return -1;
-    return (int)len;
+
+    n = len;
+    memcpy(pcb->una_buf, buf, n);
+    pcb->una_len = n;
+    pcb->una_seq = pcb->snd_nxt;
+    pcb->rto_ticks = TCP_RTO_TICKS;
+    tcp_arm_rto(pcb);
+
+    if (tcp_output(pcb, TCP_PSH | TCP_ACK, (const unsigned char *)buf, n) != 0) {
+        pcb->una_len = 0;
+        return -1;
+    }
+    return (int)n;
 }
 
 int tcp_pcb_recv(struct tcp_pcb *pcb, void *buf, unsigned int len,
@@ -389,6 +546,8 @@ int tcp_pcb_recv(struct tcp_pcb *pcb, void *buf, unsigned int len,
     while (pcb->rx_len == 0 && pcb->state == TCP_ESTABLISHED &&
            spins++ < timeout_spins) {
         netif_poll(pcb->nif ? pcb->nif : netif_default());
+        tcp_timer(ticks);
+        tcp_maybe_rexmit_spin(pcb, spins);
         __asm__ volatile ("pause");
     }
     if (pcb->rx_len == 0)
@@ -412,6 +571,7 @@ int tcp_pcb_close(struct tcp_pcb *pcb)
                                                     : TCP_FIN_WAIT_1;
         for (spins = 0; spins < 200000 && pcb->state != TCP_CLOSED; spins++) {
             netif_poll(pcb->nif);
+            tcp_timer(ticks);
             __asm__ volatile ("pause");
         }
     }
@@ -449,6 +609,46 @@ int tcp_echo_client(struct netif *nif, unsigned int dst_host,
     tcp_pcb_close(pcb);
     ret = 0;
 out:
+    net_unlock();
+    return ret;
+}
+
+int tcp_echo_rexmit_selftest(struct netif *nif, unsigned int dst_host,
+                             unsigned short dst_port,
+                             unsigned int timeout_spins)
+{
+    static const unsigned char payload[] = "ICS-RXT!";
+    unsigned char buf[16];
+    struct tcp_pcb *pcb;
+    unsigned int before;
+    int n;
+    int ret = -1;
+
+    net_lock();
+    before = g_rexmit_count;
+    pcb = tcp_pcb_new(nif);
+    if (!pcb)
+        goto out;
+    if (tcp_pcb_connect(pcb, dst_host, dst_port, timeout_spins) != 0) {
+        tcp_pcb_free(pcb);
+        goto out;
+    }
+    tcp_test_drop_next_data(1);
+    if (tcp_pcb_send(pcb, payload, sizeof(payload) - 1) < 0) {
+        tcp_pcb_close(pcb);
+        goto out;
+    }
+    n = tcp_pcb_recv(pcb, buf, sizeof(buf), timeout_spins);
+    if (n != (int)(sizeof(payload) - 1) ||
+        memcmp(buf, payload, sizeof(payload) - 1) != 0 ||
+        g_rexmit_count <= before) {
+        tcp_pcb_close(pcb);
+        goto out;
+    }
+    tcp_pcb_close(pcb);
+    ret = 0;
+out:
+    tcp_test_drop_next_data(0);
     net_unlock();
     return ret;
 }

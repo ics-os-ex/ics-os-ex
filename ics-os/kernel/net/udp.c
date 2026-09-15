@@ -5,6 +5,11 @@
 #include "net_endian.h"
 #include "net_sync.h"
 #include "dhcp.h"
+#include "dns.h"
+
+extern int sock_udp_deliver(unsigned short dport, unsigned short sport,
+                           unsigned int sip, const unsigned char *payload,
+                           unsigned int plen);
 
 extern void *memcpy(void *d, const void *s, unsigned int n);
 extern int memcmp(const void *s1, const void *s2, unsigned int n);
@@ -62,6 +67,10 @@ void udp_input(struct netif *nif, struct pbuf *p, unsigned int ip_hdr_len)
     payload_len = udp_len - UDP_HDR_LEN;
 
     if (dhcp_udp_deliver(dport, payload, payload_len)) {
+        pbuf_free(p);
+        return;
+    }
+    if (dns_udp_deliver(dport, payload, payload_len)) {
         pbuf_free(p);
         return;
     }
