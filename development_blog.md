@@ -2,6 +2,14 @@
 
 ## 2026-09-15 (Manila, UTC+8)
 
+### 19:55 — Follow-ons: nc + DHCP T1/T2 timer FSM
+
+Current problem: remaining post-httpd follow-ons were a userland netcat and
+timer-driven renew/rebind (not only an explicit renew call).
+Activity: `contrib/nc` TCP client (`NET_NC_OK`); `dhcp_service` + T1/T2 arming
+with selftest-forced due times (`NET_DHCP_RENEW_OK`/`NET_DHCP_REBIND_OK`);
+unit coverage for rebind wire shape and T1/T2 fractions.
+
 ### 19:40 — Follow-ons: httpd + DHCP renew/rebind
 
 Current problem: close the post-DHCP networking follow-ons (userland HTTP

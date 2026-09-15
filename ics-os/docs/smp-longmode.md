@@ -321,11 +321,12 @@ virtio-pci, RX+TX queues, MSI-X, static SLIRP addressing (`10.0.2.15` /
 `10.0.2.2`). Boot selftest ARP-resolves the gateway and ICMP-pings it.
 `IRQ_IRETQ_KTEXT_END` must stay above `textEnd` when the stack grows.
 `make test-net` greps `VIRTIO_NET_OK`, `NETIF_UP`, `VIRTIO_NET_IRQ_OK`,
-`NET_DHCP_OK`, `NET_DHCP_RENEW_OK`, `NET_PING_OK`, `NET_UDP_OK`, `NET_TCP_OK`,
-`NET_SOCK_OK`, `NET_SOCK_UDP_OK`, `NET_SOCK_LISTEN_OK`, and `NET_HTTPD_OK`
-(SLIRP DHCP DORA+renew; host echo on UDP `:7777`/TCP `:7778`; userland
-`netecho.exe` and `httpd.exe` on `:7779`/`:8080` via QEMU `hostfwd`). Softnet
-state is serialized by a recursive `net_lock` (with a separate pbuf spinlock);
+`NET_DHCP_OK`, `NET_DHCP_RENEW_OK`, `NET_DHCP_REBIND_OK`, `NET_PING_OK`,
+`NET_UDP_OK`, `NET_TCP_OK`, `NET_SOCK_OK`, `NET_SOCK_UDP_OK`,
+`NET_SOCK_LISTEN_OK`, `NET_HTTPD_OK`, and `NET_NC_OK` (SLIRP DHCP DORA with
+T1/T2 timer FSM renew/rebind; host echo on UDP `:7777`/TCP `:7778`; userland
+`netecho.exe`, `httpd.exe`, and `nc.exe` via QEMU `hostfwd`). Softnet state
+is serialized by a recursive `net_lock` (with a separate pbuf spinlock);
 `make test-net-stress` runs forked concurrent TCP/UDP clients under `user-smp`
 (`NETSTRESS_PASS`). Host TAP: `make test-net-unit`. Guest also echoes UDP/TCP
 on port 7.

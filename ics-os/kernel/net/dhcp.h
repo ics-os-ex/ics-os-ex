@@ -91,6 +91,16 @@ int dhcp_parse_reply(const unsigned char *pkt, unsigned int len,
 int dhcp_udp_deliver(unsigned short dport, const unsigned char *payload,
                      unsigned int plen);
 
+/* Lease FSM states (RFC 2131). */
+#define DHCP_ST_INIT       0
+#define DHCP_ST_BOUND      1
+#define DHCP_ST_RENEWING   2
+#define DHCP_ST_REBINDING  3
+
+/* Pure helpers for T1/T2 (unit-testable). Defaults when lease_secs==0. */
+unsigned int dhcp_t1_secs(unsigned int lease_secs);
+unsigned int dhcp_t2_secs(unsigned int lease_secs);
+
 /* Run DORA; fills cfg on success. Returns 0 on ACK. */
 int dhcp_client(struct netif *nif, struct inet_config *cfg,
                 unsigned int timeout_spins);
@@ -100,5 +110,14 @@ int dhcp_renew(struct netif *nif, struct inet_config *cfg,
 /* Broadcast rebind (RFC 2131 REBINDING). */
 int dhcp_rebind(struct netif *nif, struct inet_config *cfg,
                 unsigned int timeout_spins);
+
+/* Arm T1/T2 from now_secs + lease; used after ACK and by tests. */
+void dhcp_arm_timers(unsigned int now_secs, unsigned int lease_secs);
+/* Advance FSM using wall-clock seconds; may call renew/rebind. */
+int dhcp_service(struct netif *nif, struct inet_config *cfg,
+                 unsigned int now_secs, unsigned int timeout_spins);
+/* Test hook: force T1/T2 into the past relative to now_secs. */
+void dhcp_force_timer_due(unsigned int now_secs, int past_t2);
+int dhcp_lease_state(void);
 
 #endif

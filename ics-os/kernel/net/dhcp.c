@@ -18,8 +18,56 @@ static const unsigned char eth_broadcast[6] = {
 static volatile int dhcp_waiting;
 static unsigned char dhcp_rx[576];
 static volatile unsigned int dhcp_rx_len;
+extern unsigned int time_count;
+
 static struct dhcp_lease dhcp_active;
 static int dhcp_have_lease;
+static int dhcp_state;
+static unsigned int dhcp_t1_abs;
+static unsigned int dhcp_t2_abs;
+static unsigned int dhcp_lease_abs;
+
+unsigned int dhcp_t1_secs(unsigned int lease_secs)
+{
+    if (!lease_secs)
+        lease_secs = 86400u;
+    return lease_secs / 2u;
+}
+
+unsigned int dhcp_t2_secs(unsigned int lease_secs)
+{
+    if (!lease_secs)
+        lease_secs = 86400u;
+    return (lease_secs * 7u) / 8u;
+}
+
+void dhcp_arm_timers(unsigned int now_secs, unsigned int lease_secs)
+{
+    unsigned int ls = lease_secs ? lease_secs : 86400u;
+    dhcp_t1_abs = now_secs + dhcp_t1_secs(ls);
+    dhcp_t2_abs = now_secs + dhcp_t2_secs(ls);
+    dhcp_lease_abs = now_secs + ls;
+    if (dhcp_have_lease)
+        dhcp_state = DHCP_ST_BOUND;
+}
+
+void dhcp_force_timer_due(unsigned int now_secs, int past_t2)
+{
+    if (past_t2) {
+        dhcp_t1_abs = now_secs ? now_secs - 1u : 0;
+        dhcp_t2_abs = now_secs ? now_secs - 1u : 0;
+        dhcp_state = DHCP_ST_RENEWING;
+    } else {
+        dhcp_t1_abs = now_secs ? now_secs - 1u : 0;
+        dhcp_t2_abs = now_secs + 3600u;
+        dhcp_state = DHCP_ST_BOUND;
+    }
+}
+
+int dhcp_lease_state(void)
+{
+    return dhcp_state;
+}
 
 static void opt_put(unsigned char **pp, unsigned char code,
                     unsigned char len, const unsigned char *val)
@@ -370,6 +418,8 @@ int dhcp_client(struct netif *nif, struct inet_config *cfg,
     if (!dhcp_active.gateway)
         dhcp_active.gateway = cfg->gateway;
     dhcp_have_lease = 1;
+    dhcp_state = DHCP_ST_BOUND;
+    dhcp_arm_timers(time_count, dhcp_active.lease_secs);
     ret = 0;
 out:
     net_unlock();
@@ -422,6 +472,8 @@ static int dhcp_renew_or_rebind(struct netif *nif, struct inet_config *cfg,
     if (ack.lease_secs)
         dhcp_active.lease_secs = ack.lease_secs;
     netif_set_addr(nif, cfg->ip, cfg->netmask, cfg->gateway);
+    dhcp_state = DHCP_ST_BOUND;
+    dhcp_arm_timers(time_count, dhcp_active.lease_secs);
     ret = 0;
 out:
     net_unlock();
@@ -438,4 +490,32 @@ int dhcp_rebind(struct netif *nif, struct inet_config *cfg,
                 unsigned int timeout_spins)
 {
     return dhcp_renew_or_rebind(nif, cfg, timeout_spins, 1);
+}
+
+int dhcp_service(struct netif *nif, struct inet_config *cfg,
+                 unsigned int now_secs, unsigned int timeout_spins)
+{
+    int ret = -1;
+
+    if (!nif || !cfg || !dhcp_have_lease || !nif->configured)
+        return -1;
+
+    if (dhcp_state == DHCP_ST_BOUND && now_secs >= dhcp_t1_abs) {
+        dhcp_state = DHCP_ST_RENEWING;
+        if (dhcp_renew(nif, cfg, timeout_spins) == 0)
+            return 0;
+    }
+
+    if ((dhcp_state == DHCP_ST_RENEWING || dhcp_state == DHCP_ST_BOUND) &&
+        now_secs >= dhcp_t2_abs) {
+        dhcp_state = DHCP_ST_REBINDING;
+        if (dhcp_rebind(nif, cfg, timeout_spins) == 0)
+            return 0;
+    }
+
+    if (dhcp_state == DHCP_ST_REBINDING && now_secs >= dhcp_t2_abs) {
+        if (dhcp_rebind(nif, cfg, timeout_spins) == 0)
+            ret = 0;
+    }
+    return ret;
 }

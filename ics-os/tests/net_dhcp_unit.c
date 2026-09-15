@@ -50,6 +50,20 @@ struct dhcp_lease {
     unsigned int ip, netmask, gateway, server, lease_secs;
 };
 
+/* Mirrored from kernel/net/dhcp.c */
+static unsigned int dhcp_t1_secs(unsigned int lease_secs)
+{
+    if (!lease_secs)
+        lease_secs = 86400u;
+    return lease_secs / 2u;
+}
+static unsigned int dhcp_t2_secs(unsigned int lease_secs)
+{
+    if (!lease_secs)
+        lease_secs = 86400u;
+    return (lease_secs * 7u) / 8u;
+}
+
 static void opt_put(unsigned char **pp, unsigned char code,
                     unsigned char len, const unsigned char *val)
 {
@@ -190,7 +204,7 @@ int main(void)
     unsigned char mtype;
     struct dhcp_lease lease;
 
-    printf("1..6\n");
+    printf("1..9\n");
     len = build_discover(pkt, xid, mac);
     OK(len > DHCP_MIN_PKT, "discover length");
     OK(pkt[DHCP_FIXED_LEN] == DHCP_MAGIC_0 &&
@@ -225,6 +239,33 @@ int main(void)
     OK(((struct dhcp_msg *)pkt)->ciaddr == htonl_u(0x0A00020Fu) &&
        ((struct dhcp_msg *)pkt)->flags == 0 &&
        pkt[DHCP_FIXED_LEN + 6] == DHCP_REQUEST, "renew wire shape");
+
+    /* Rebind: ciaddr set, broadcast flag. */
+    memset(pkt, 0, sizeof(pkt));
+    {
+        struct dhcp_msg *m = (struct dhcp_msg *)pkt;
+        unsigned char *opt;
+        unsigned int i;
+        m->op = DHCP_BOOTREQUEST;
+        m->htype = 1;
+        m->hlen = 6;
+        m->xid = htonl_u(xid);
+        m->flags = htons_u(0x8000u);
+        m->ciaddr = htonl_u(0x0A00020Fu);
+        for (i = 0; i < 6; i++)
+            m->chaddr[i] = mac[i];
+        opt = pkt + DHCP_FIXED_LEN;
+        *opt++ = DHCP_MAGIC_0; *opt++ = DHCP_MAGIC_1;
+        *opt++ = DHCP_MAGIC_2; *opt++ = DHCP_MAGIC_3;
+        *opt++ = DHCP_OPT_MSG_TYPE; *opt++ = 1; *opt++ = DHCP_REQUEST;
+        *opt++ = DHCP_OPT_END;
+    }
+    OK(((struct dhcp_msg *)pkt)->flags == htons_u(0x8000u) &&
+       ((struct dhcp_msg *)pkt)->ciaddr == htonl_u(0x0A00020Fu),
+       "rebind wire shape");
+
+    OK(dhcp_t1_secs(100) == 50 && dhcp_t2_secs(100) == 87, "T1/T2 fractions");
+    OK(dhcp_t1_secs(0) == 43200 && dhcp_t2_secs(0) == 75600, "T1/T2 default day");
 
     return tests_failed ? 1 : 0;
 }

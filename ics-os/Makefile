@@ -346,6 +346,8 @@ apps:
 	-$(MAKE) -C contrib/netecho install
 	-$(MAKE) -C contrib/httpd
 	-$(MAKE) -C contrib/httpd install
+	-$(MAKE) -C contrib/nc
+	-$(MAKE) -C contrib/nc install
 	-$(MAKE) -C contrib/netstress
 	-$(MAKE) -C contrib/netstress install
 	-$(MAKE) -C contrib/posixio
@@ -790,21 +792,25 @@ test-virtio: vmdex
 
 # Boot with virtio-net on QEMU user (SLIRP) networking; static 10.0.2.15
 # pings 10.0.2.2, UDP-echoes :7777, TCP-echoes :7778 on the host, then
-# userland netecho.exe + httpd.exe exercise sockets and HTTP via hostfwd
-# :17779→:7779 and :18080→:8080.
+# userland netecho.exe + httpd.exe + nc.exe exercise sockets/HTTP/netcat
+# via hostfwd :17779→:7779 and :18080→:8080.
 apps/netecho.exe: contrib/netecho/netecho.c contrib/netecho/Makefile sdk/posix.c sdk/include/sys/socket.h
 	$(MAKE) -C contrib/netecho install
 
 apps/httpd.exe: contrib/httpd/httpd.c contrib/httpd/Makefile sdk/posix.c sdk/include/sys/socket.h
 	$(MAKE) -C contrib/httpd install
 
-test-net: vmdex apps/netecho.exe apps/httpd.exe
-	@echo "Building Multiboot2 ISO for virtio-net + sockets + httpd..."
+apps/nc.exe: contrib/nc/nc.c contrib/nc/Makefile sdk/posix.c sdk/include/sys/socket.h
+	$(MAKE) -C contrib/nc install
+
+test-net: vmdex apps/netecho.exe apps/httpd.exe apps/nc.exe
+	@echo "Building Multiboot2 ISO for virtio-net + sockets + httpd + nc..."
 	@mkdir -p /tmp/icsos-net-iso/boot/grub /tmp/icsos-net-iso/apps
 	@cp kernel/Kernel64.bin /tmp/icsos-net-iso/vmdex
 	@cp apps/netecho.exe /tmp/icsos-net-iso/apps/netecho.exe
 	@cp apps/httpd.exe /tmp/icsos-net-iso/apps/httpd.exe
-	@printf '%s\n' 'netecho' 'httpd' 'reboot' > /tmp/icsos-net-iso/autoexec.bat
+	@cp apps/nc.exe /tmp/icsos-net-iso/apps/nc.exe
+	@printf '%s\n' 'netecho' 'httpd' 'nc' 'reboot' > /tmp/icsos-net-iso/autoexec.bat
 	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
 		> /tmp/icsos-net-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-net.iso /tmp/icsos-net-iso >/dev/null 2>&1
@@ -815,7 +821,7 @@ test-net: vmdex apps/netecho.exe apps/httpd.exe
 	@python3 scripts/tcp_echo_server.py 7778 >/tmp/icsos-tcp-echo.log 2>&1 & echo $$! > /tmp/icsos-tcp-echo.pid
 	@python3 scripts/tcp_connect_probe.py 17779 >/tmp/icsos-tcp-probe.log 2>&1 & echo $$! > /tmp/icsos-tcp-probe.pid
 	@python3 scripts/http_get_probe.py 18080 >/tmp/icsos-http-probe.log 2>&1 & echo $$! > /tmp/icsos-http-probe.pid
-	@echo "Running virtio-net ping+UDP+TCP+socket+httpd test (TCG, 2 vCPUs)..."
+	@echo "Running virtio-net ping+UDP+TCP+socket+httpd+nc test (TCG, 2 vCPUs)..."
 	@-timeout 90 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
 		-cdrom /tmp/icsos-net.iso -boot d \
 		-netdev user,id=n0,hostfwd=tcp::17779-:7779,hostfwd=tcp::18080-:8080 \
@@ -833,6 +839,7 @@ test-net: vmdex apps/netecho.exe apps/httpd.exe
 	@grep -aq "VIRTIO_NET_IRQ_OK" /tmp/icsos-net.log
 	@grep -aq "NET_DHCP_OK" /tmp/icsos-net.log
 	@grep -aq "NET_DHCP_RENEW_OK" /tmp/icsos-net.log
+	@grep -aq "NET_DHCP_REBIND_OK" /tmp/icsos-net.log
 	@grep -aq "NET_PING_OK" /tmp/icsos-net.log
 	@grep -aq "NET_UDP_OK" /tmp/icsos-net.log
 	@grep -aq "NET_TCP_OK" /tmp/icsos-net.log
@@ -840,14 +847,17 @@ test-net: vmdex apps/netecho.exe apps/httpd.exe
 	@grep -aq "NET_SOCK_UDP_OK" /tmp/icsos-net.log
 	@grep -aq "NET_SOCK_LISTEN_OK" /tmp/icsos-net.log
 	@grep -aq "NET_HTTPD_OK" /tmp/icsos-net.log
+	@grep -aq "NET_NC_OK" /tmp/icsos-net.log
 	@! grep -aq "VIRTIO_NET_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_DHCP_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_DHCP_RENEW_FAIL" /tmp/icsos-net.log
+	@! grep -aq "NET_DHCP_REBIND_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_PING_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_UDP_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_TCP_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_SOCK_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_HTTPD_FAIL" /tmp/icsos-net.log
+	@! grep -aq "NET_NC_FAIL" /tmp/icsos-net.log
 	@! grep -aq "General Protection fault" /tmp/icsos-net.log
 	@echo "test-net PASS"
 

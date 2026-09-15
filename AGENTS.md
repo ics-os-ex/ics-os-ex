@@ -74,7 +74,7 @@ Useful individual targets (from `ics-os/`):
 | `test-usb-cdc-pico` | Physical Pico 2 W (`2e8a:0005`) via QEMU `usb-host` on q35 xHCI; curls Pico Wi-Fi for `USB_CDC_CONSOLE_OK`, `ICSOS_VER`, `pico=`, `USB_CDC_RX`, and `STATUS cdc=1`/`release=`. SKIP if the gadget is not plugged into the host |
 | `test-posixio` | POSIX fds + preadv/pwritev/fsync + io_uring; ramdisk `POSIXIO_PASS`/`URING_PASS`; virtio `/dev/vblk` `URING_VBLK_PASS` |
 | `test-virtio` | QEMU virtio-blk DMA; MSI-X completions; `VIRTIO_BLK_OK` + `VIRTIO_IRQ_OK` |
-| `test-net` | QEMU virtio-net + SLIRP; DHCP+renew + ICMP + UDP/TCP echo + sockets (`netecho.exe`) + `httpd.exe`; `NET_DHCP_OK`/`NET_DHCP_RENEW_OK`/`NET_SOCK_*`/`NET_HTTPD_OK` |
+| `test-net` | QEMU virtio-net + SLIRP; DHCP DORA+T1 renew+T2 rebind + ICMP + UDP/TCP echo + sockets (`netecho.exe`) + `httpd.exe` + `nc.exe`; `NET_DHCP_OK`/`NET_DHCP_RENEW_OK`/`NET_DHCP_REBIND_OK`/`NET_SOCK_*`/`NET_HTTPD_OK`/`NET_NC_OK` |
 | `test-net-stress` | KVM `-smp 4` + `user-smp`; forked concurrent TCP/UDP socket clients (`netstress.exe`); `NETSTRESS_PASS` + `USER_RUN cpu=[1-7]`; no PF/GPF |
 | `test-net-unit` | Host TAP for checksum / ARP / ICMP / UDP / TCP / sockaddr / DHCP helpers (`tests/net_*_unit.c`) |
 | `test-ext4` | ext4 virtio-blk read/create/write; guest marker plus host `e2fsck`/`debugfs` validation of the post-test image |

@@ -92,9 +92,10 @@ pages are pinned and kernel-mapped. Run `make test-io-unit`, `make
 test-posixio`, and `make test-virtio`; the guest tests use two virtual CPUs and
 remain focused regression/functional tests rather than exhaustive stress.
 Networking milestones A–C plus Berkeley sockets, SMP netstress, DHCP
-DORA+renew, and `httpd.exe`: `make test-net-unit`, `make test-net`
-(`NET_DHCP_OK`/`NET_DHCP_RENEW_OK`/`NET_HTTPD_OK`), and `make test-net-stress`
-(concurrent `user-smp` socket hammer → `NETSTRESS_PASS`).
+DORA+T1/T2 renew/rebind, `httpd.exe`, and `nc.exe`: `make test-net-unit`,
+`make test-net` (`NET_DHCP_OK`/`NET_DHCP_RENEW_OK`/`NET_DHCP_REBIND_OK`/
+`NET_HTTPD_OK`/`NET_NC_OK`), and `make test-net-stress` (concurrent
+`user-smp` socket hammer → `NETSTRESS_PASS`).
 
 POSIX fd lookup must hold the process `fd_lock` until it has acquired a typed
 reference on the VFS, block, or io_uring open description. `sys_close()` first

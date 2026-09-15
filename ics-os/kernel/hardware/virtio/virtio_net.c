@@ -697,10 +697,18 @@ static void vnet_selftest(struct vnet_dev *d)
           (cfg.gateway >> 8) & 0xFF, cfg.gateway & 0xFF, dhcp_ok);
 
    if (dhcp_ok) {
-      if (dhcp_renew(&d->nif, &cfg, 4000000) == 0)
+      /* Timer FSM: force T1 due → renew; force T2 due → rebind. */
+      dhcp_force_timer_due(1, 0);
+      if (dhcp_service(&d->nif, &cfg, 1, 4000000) == 0)
          printf("NET_DHCP_RENEW_OK\n");
       else
          printf("NET_DHCP_RENEW_FAIL\n");
+
+      dhcp_force_timer_due(1, 1);
+      if (dhcp_service(&d->nif, &cfg, 1, 4000000) == 0)
+         printf("NET_DHCP_REBIND_OK\n");
+      else
+         printf("NET_DHCP_REBIND_FAIL\n");
    }
 
    tcp_listen_echo(TCP_ECHO_PORT);
