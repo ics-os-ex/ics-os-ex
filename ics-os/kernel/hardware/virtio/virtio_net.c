@@ -16,6 +16,7 @@
 #include "../../net/inet_config.h"
 #include "../../net/icmp.h"
 #include "../../net/udp.h"
+#include "../../net/tcp.h"
 #include "../../net/arp.h"
 #include "../irq_lifecycle.h"
 
@@ -661,6 +662,9 @@ static void vnet_selftest(struct vnet_dev *d)
           (cfg.gateway >> 8) & 0xFF, cfg.gateway & 0xFF);
 
    arp_init(&d->nif);
+   tcp_init();
+   tcp_listen_echo(TCP_ECHO_PORT);
+
    if (icmp_ping(&d->nif, cfg.gateway, 300) == 0)
       printf("NET_PING_OK\n");
    else
@@ -672,6 +676,12 @@ static void vnet_selftest(struct vnet_dev *d)
       printf("NET_UDP_OK\n");
    else
       printf("NET_UDP_FAIL\n");
+
+   /* TCP echo client to host :7778. */
+   if (tcp_echo_client(&d->nif, cfg.gateway, TCP_TEST_PORT, 4000000) == 0)
+      printf("NET_TCP_OK\n");
+   else
+      printf("NET_TCP_FAIL\n");
 }
 
 void virtio_net_init(void)

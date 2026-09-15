@@ -6,6 +6,7 @@
 
 #define IPV4_HDR_MIN     20
 #define IPV4_PROTO_ICMP  1
+#define IPV4_PROTO_TCP   6
 #define IPV4_PROTO_UDP   17
 #define IPV4_VERSION_IHL 0x45
 

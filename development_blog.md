@@ -2,6 +2,13 @@
 
 ## 2026-09-15 (Manila, UTC+8)
 
+### 18:20 — Networking milestone C: minimal TCP
+
+In-tree TCP with SYN handshake, data+ACK, FIN teardown, guest echo on
+port 7, and a client selftest against host TCP echo on `:7778`
+(`NET_TCP_OK`). `make test-net` now requires ping + UDP + TCP. No
+Berkeley sockets yet.
+
 ### 18:10 — Networking milestone B: UDP echo
 
 UDP send/receive on the in-tree stack, guest echo server on port 7, and a

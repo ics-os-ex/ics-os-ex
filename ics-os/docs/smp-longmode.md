@@ -321,8 +321,9 @@ virtio-pci, RX+TX queues, MSI-X, static SLIRP addressing (`10.0.2.15` /
 `10.0.2.2`). Boot selftest ARP-resolves the gateway and ICMP-pings it.
 `IRQ_IRETQ_KTEXT_END` must stay above `textEnd` when the stack grows.
 `make test-net` greps `VIRTIO_NET_OK`, `NETIF_UP`, `VIRTIO_NET_IRQ_OK`,
-`NET_PING_OK`, and `NET_UDP_OK` (host UDP echo on `:7777`). Host TAP:
-`make test-net-unit`. Guest also echoes UDP on port 7. No TCP/sockets/DHCP yet.
+`NET_PING_OK`, `NET_UDP_OK`, and `NET_TCP_OK` (host echo on UDP `:7777` and
+TCP `:7778`). Host TAP: `make test-net-unit`. Guest also echoes UDP/TCP on
+port 7. No Berkeley sockets/DHCP yet.
 
 ## Memory map
 
