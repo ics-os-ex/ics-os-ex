@@ -75,6 +75,7 @@ Useful individual targets (from `ics-os/`):
 | `test-posixio` | POSIX fds + preadv/pwritev/fsync + io_uring; ramdisk `POSIXIO_PASS`/`URING_PASS`; virtio `/dev/vblk` `URING_VBLK_PASS` |
 | `test-virtio` | QEMU virtio-blk DMA; MSI-X completions; `VIRTIO_BLK_OK` + `VIRTIO_IRQ_OK` |
 | `test-net` | QEMU virtio-net + SLIRP; ICMP + UDP `:7777` + TCP `:7778` + userland sockets (`netecho.exe` TCP/UDP/listen); `NET_PING_OK`/`NET_UDP_OK`/`NET_TCP_OK`/`NET_SOCK_OK`/`NET_SOCK_UDP_OK`/`NET_SOCK_LISTEN_OK` |
+| `test-net-stress` | KVM `-smp 4` + `user-smp`; forked concurrent TCP/UDP socket clients (`netstress.exe`); `NETSTRESS_PASS` + `USER_RUN cpu=[1-7]`; no PF/GPF |
 | `test-net-unit` | Host TAP for checksum / ARP / ICMP / UDP / TCP / sockaddr helpers (`tests/net_*_unit.c`) |
 | `test-ext4` | ext4 virtio-blk read/create/write; guest marker plus host `e2fsck`/`debugfs` validation of the post-test image |
 | `test-spawn` | `posix_spawn` + `waitpid` of `hello.exe` (`SPAWN_PASS`); FAT `/work` on virtio (`WORK_DISK_PASS`) |

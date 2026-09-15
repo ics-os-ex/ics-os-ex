@@ -324,8 +324,10 @@ virtio-pci, RX+TX queues, MSI-X, static SLIRP addressing (`10.0.2.15` /
 `NET_PING_OK`, `NET_UDP_OK`, `NET_TCP_OK`, `NET_SOCK_OK`, `NET_SOCK_UDP_OK`,
 and `NET_SOCK_LISTEN_OK` (host echo on UDP `:7777` and TCP `:7778`; userland
 `netecho.exe` TCP client, UDP `sendto`/`recvfrom`, and TCP listen on `:7779`
-via QEMU `hostfwd`). Host TAP: `make test-net-unit`. Guest also echoes
-UDP/TCP on port 7. No DHCP yet.
+via QEMU `hostfwd`). Softnet state is serialized by a recursive `net_lock`
+(with a separate pbuf spinlock); `make test-net-stress` runs forked concurrent
+TCP/UDP clients under `user-smp` (`NETSTRESS_PASS`). Host TAP:
+`make test-net-unit`. Guest also echoes UDP/TCP on port 7. No DHCP yet.
 
 ## Memory map
 

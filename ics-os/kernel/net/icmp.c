@@ -5,6 +5,7 @@
 #include "arp.h"
 #include "ethernet.h"
 #include "net_endian.h"
+#include "net_sync.h"
 
 extern void *memcpy(void *d, const void *s, unsigned int n);
 extern int printf(const char *fmt, ...);
@@ -82,9 +83,11 @@ int icmp_ping(struct netif *nif, unsigned int dst_host, unsigned int timeout_tic
     unsigned int icmp_len;
     unsigned int start;
     unsigned int spins;
+    int ret = -1;
 
+    net_lock();
     if (!nif || !nif->configured)
-        return -1;
+        goto out;
 
     ping_id = 0x1C50;
     ping_seq++;
@@ -95,12 +98,12 @@ int icmp_ping(struct netif *nif, unsigned int dst_host, unsigned int timeout_tic
     p = pbuf_alloc((u16)icmp_len);
     if (!p) {
         ping_waiting = 0;
-        return -1;
+        goto out;
     }
     memcpy(p->data, buf, icmp_len);
     if (ipv4_output(nif, p, dst_host, IPV4_PROTO_ICMP) != 0) {
         ping_waiting = 0;
-        return -1;
+        goto out;
     }
 
     start = ticks;
@@ -115,8 +118,11 @@ int icmp_ping(struct netif *nif, unsigned int dst_host, unsigned int timeout_tic
     }
     if (ping_waiting) {
         ping_waiting = 0;
-        return -1;
+        goto out;
     }
     (void)ping_src;
-    return 0;
+    ret = 0;
+out:
+    net_unlock();
+    return ret;
 }

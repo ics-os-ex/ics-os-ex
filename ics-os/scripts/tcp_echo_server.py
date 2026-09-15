@@ -7,9 +7,9 @@ port = int(sys.argv[1]) if len(sys.argv) > 1 else 7778
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("0.0.0.0", port))
-srv.listen(1)
+srv.listen(32)
 srv.settimeout(1.0)
-rounds = 90
+rounds = 180
 for _ in range(rounds):
     try:
         conn, _addr = srv.accept()

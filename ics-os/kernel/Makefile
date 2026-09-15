@@ -94,7 +94,7 @@ endif
 
 obj: warncheck scheduler.o fat.o ext4.o iso9660.o ramdisk.o devfs.o iomgr.o blkcache.o posixfd.o devmgr_error.o kernel32.o \
 		startup.o asmlib.o irqwrap.o context.o ap_trampoline.o lapic.o smp.o kexec.o irq_lifecycle.o vtd.o virtio_blk.o virtio_net.o \
-		net_pbuf.o net_netif.o net_ethernet.o net_arp.o net_ipv4.o net_icmp.o net_udp.o net_tcp.o net_sock.o net_inet_config.o
+		net_pbuf.o net_netif.o net_ethernet.o net_arp.o net_ipv4.o net_icmp.o net_udp.o net_tcp.o net_sock.o net_sync.o net_inet_config.o
 		
 kernel32.o: kernel32.c build.h hardware/usb/uhci.c hardware/usb/xhci.c hardware/usb/xhci_policy.h hardware/usb/usb.h hardware/usb/usb_cdc_acm.h hardware/usb/usb_debug.h hardware/dma.h hardware/irq_lifecycle.h \
 		hardware/chips/serial.c hardware/ATA/ide.c hardware/ATA/ata_capacity.h \
@@ -199,8 +199,11 @@ net_udp.o: net/udp.c net/udp.h
 net_tcp.o: net/tcp.c net/tcp.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_tcp.o net/tcp.c
 
-net_sock.o: net/sock.c net/sock.h net/tcp.h
+net_sock.o: net/sock.c net/sock.h net/tcp.h net/net_sync.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_sock.o net/sock.c
+
+net_sync.o: net/net_sync.c net/net_sync.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_sync.o net/net_sync.c
 
 net_inet_config.o: net/inet_config.c net/inet_config.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_inet_config.o net/inet_config.c
@@ -220,7 +223,7 @@ smp.o: cpu/smp.c cpu/smp.h process/process.h process/irq_kstack.h
 Kernel64.bin: startup.o asmlib.o context.o ap_trampoline.o lapic.o smp.o kernel32.o \
 		scheduler.o iomgr.o blkcache.o posixfd.o fat.o ext4.o iso9660.o ramdisk.o \
 		devfs.o irqwrap.o devmgr_error.o kexec.o irq_lifecycle.o vtd.o virtio_blk.o virtio_net.o \
-		net_pbuf.o net_netif.o net_ethernet.o net_arp.o net_ipv4.o net_icmp.o net_udp.o net_tcp.o net_sock.o net_inet_config.o
+		net_pbuf.o net_netif.o net_ethernet.o net_arp.o net_ipv4.o net_icmp.o net_udp.o net_tcp.o net_sock.o net_sync.o net_inet_config.o
 	$(LD) $(LDFLAGS) $(MAPFLAGS)
 
 clean:

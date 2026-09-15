@@ -18,6 +18,7 @@
 #include "../../net/udp.h"
 #include "../../net/tcp.h"
 #include "../../net/arp.h"
+#include "../../net/net_sync.h"
 #include "../irq_lifecycle.h"
 
 extern void *malloc(unsigned int);
@@ -482,17 +483,33 @@ static void vnet_harvest_rx(struct vnet_dev *d)
    vnet_notify(d, &d->rx);
 }
 
-static void vnet_deliver_pending(struct vnet_dev *d)
+static void vnet_steal_pending(struct vnet_dev *d, struct pbuf **local,
+                               unsigned int *n_out)
 {
    unsigned int i, n;
-   struct pbuf *local[VNET_RX_PENDING_MAX];
 
    n = vnet_rx_pending_count;
    for (i = 0; i < n; i++)
       local[i] = vnet_rx_pending[i];
    vnet_rx_pending_count = 0;
+   *n_out = n;
+}
+
+static void vnet_deliver_pending(struct vnet_dev *d)
+{
+   unsigned int i, n;
+   struct pbuf *local[VNET_RX_PENDING_MAX];
+   spin_irq_flags_t flags;
+
+   flags = spin_lock_irqsave(&d->lock);
+   vnet_steal_pending(d, local, &n);
+   spin_unlock_irqrestore(&d->lock, flags);
+   if (!n)
+      return;
+   net_lock();
    for (i = 0; i < n; i++)
       netif_input(&d->nif, local[i]);
+   net_unlock();
 }
 
 static void vnet_harvest_tx(struct vnet_dev *d)

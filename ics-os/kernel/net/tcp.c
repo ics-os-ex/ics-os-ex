@@ -3,6 +3,7 @@
 #include "pbuf.h"
 #include "ipv4.h"
 #include "net_endian.h"
+#include "net_sync.h"
 
 extern void *memcpy(void *d, const void *s, unsigned int n);
 extern void *memmove(void *d, const void *s, unsigned int n);
@@ -425,24 +426,29 @@ int tcp_echo_client(struct netif *nif, unsigned int dst_host,
     unsigned char buf[16];
     struct tcp_pcb *pcb;
     int n;
+    int ret = -1;
 
+    net_lock();
     pcb = tcp_pcb_new(nif);
     if (!pcb)
-        return -1;
+        goto out;
     if (tcp_pcb_connect(pcb, dst_host, dst_port, timeout_spins) != 0) {
         tcp_pcb_free(pcb);
-        return -1;
+        goto out;
     }
     if (tcp_pcb_send(pcb, payload, sizeof(payload) - 1) < 0) {
         tcp_pcb_close(pcb);
-        return -1;
+        goto out;
     }
     n = tcp_pcb_recv(pcb, buf, sizeof(buf), timeout_spins);
     if (n != (int)(sizeof(payload) - 1) ||
         memcmp(buf, payload, sizeof(payload) - 1) != 0) {
         tcp_pcb_close(pcb);
-        return -1;
+        goto out;
     }
     tcp_pcb_close(pcb);
-    return 0;
+    ret = 0;
+out:
+    net_unlock();
+    return ret;
 }

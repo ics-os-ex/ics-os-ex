@@ -3,6 +3,7 @@
 #include "pbuf.h"
 #include "ipv4.h"
 #include "net_endian.h"
+#include "net_sync.h"
 
 extern void *memcpy(void *d, const void *s, unsigned int n);
 extern int memcmp(const void *s1, const void *s2, unsigned int n);
@@ -89,9 +90,11 @@ int udp_echo_client(struct netif *nif, unsigned int dst_host,
     static const unsigned char payload[] = "ICS-UDP!";
     unsigned short local_port = 40000;
     unsigned int spins;
+    int ret = -1;
 
+    net_lock();
     if (!nif || !nif->configured)
-        return -1;
+        goto out;
 
     udp_wait_plen = sizeof(payload) - 1;
     memcpy(udp_wait_payload, payload, udp_wait_plen);
@@ -101,7 +104,7 @@ int udp_echo_client(struct netif *nif, unsigned int dst_host,
 
     if (udp_send(nif, dst_host, local_port, dst_port, payload, udp_wait_plen) != 0) {
         udp_wait = 0;
-        return -1;
+        goto out;
     }
 
     spins = 0;
@@ -111,7 +114,10 @@ int udp_echo_client(struct netif *nif, unsigned int dst_host,
     }
     if (udp_wait) {
         udp_wait = 0;
-        return -1;
+        goto out;
     }
-    return 0;
+    ret = 0;
+out:
+    net_unlock();
+    return ret;
 }

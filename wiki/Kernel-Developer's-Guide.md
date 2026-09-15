@@ -91,9 +91,9 @@ tables. Do not move user-buffer callback drain to a generic worker until those
 pages are pinned and kernel-mapped. Run `make test-io-unit`, `make
 test-posixio`, and `make test-virtio`; the guest tests use two virtual CPUs and
 remain focused regression/functional tests rather than exhaustive stress.
-Networking milestones A–C plus Berkeley sockets: `make test-net-unit` and
-`make test-net` (virtio-net SLIRP ICMP + UDP + TCP echo + `netecho.exe`
-sockets → `NET_SOCK_OK`).
+Networking milestones A–C plus Berkeley sockets: `make test-net-unit`,
+`make test-net`, and `make test-net-stress` (virtio-net SLIRP ICMP + UDP +
+TCP + sockets, plus concurrent `user-smp` socket hammer → `NETSTRESS_PASS`).
 
 POSIX fd lookup must hold the process `fd_lock` until it has acquired a typed
 reference on the VFS, block, or io_uring open description. `sys_close()` first

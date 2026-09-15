@@ -2,6 +2,15 @@
 
 ## 2026-09-15 (Manila, UTC+8)
 
+### 19:10 — Net SMP/concurrency stress + softnet lock
+
+Current problem: socket stack shared state (pbuf freelist, TCP PCBs, UDP
+socks, pending RX) was unlocked; IRQ RX vs concurrent syscalls under
+`user-smp` was unsafe, and `test-net` only ran a sequential single client.
+Activity: recursive `net_lock` + pbuf spinlock, pending-RX steal under the
+virtio device lock, `contrib/netstress` forked TCP/UDP hammer, and
+`make test-net-stress` (KVM `-smp 4`, `user-smp`, `NETSTRESS_PASS`).
+
 ### 18:55 — Socket completion: UDP sendto/recvfrom + listen/accept
 
 Current problem: last milestone left UDP sockets half-done and never

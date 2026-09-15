@@ -37,7 +37,7 @@ vmdex:
 	make -C kernel/
 
 .PHONY: usb-uefi usb-etcher test-usb-uefi-gpt test-vbox-uefi-gpt test-vbox-uefi-gpt-bios test-bochs-uefi-gpt test-usb-cdc-pico
-.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-ttycanon-unit test-usbdbg-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-net-stress test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-ttycanon-unit test-usbdbg-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -339,6 +339,8 @@ apps:
 	-$(MAKE) -C contrib/hello install
 	-$(MAKE) -C contrib/netecho
 	-$(MAKE) -C contrib/netecho install
+	-$(MAKE) -C contrib/netstress
+	-$(MAKE) -C contrib/netstress install
 	-$(MAKE) -C contrib/posixio
 	-$(MAKE) -C contrib/posixio install
 	-$(MAKE) -C contrib/termtest
@@ -828,6 +830,47 @@ test-net: vmdex apps/netecho.exe
 	@! grep -aq "NET_SOCK_FAIL" /tmp/icsos-net.log
 	@! grep -aq "General Protection fault" /tmp/icsos-net.log
 	@echo "test-net PASS"
+
+# Concurrent socket stress under user-smp: forked TCP+UDP clients against
+# host echo helpers while virtio-net MSI-X RX runs on another CPU.
+NETSTRESS_SMP ?= 4
+NETSTRESS_TIMEOUT ?= 120
+
+apps/netstress.exe: contrib/netstress/netstress.c contrib/netstress/Makefile sdk/posix.c sdk/include/sys/socket.h
+	$(MAKE) -C contrib/netstress install
+
+test-net-stress: vmdex apps/netstress.exe
+	@echo "Building Multiboot2 ISO for netstress (user-smp)..."
+	@mkdir -p /tmp/icsos-netstress-iso/boot/grub /tmp/icsos-netstress-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-netstress-iso/vmdex
+	@cp apps/netstress.exe /tmp/icsos-netstress-iso/apps/netstress.exe
+	@printf '%s\n' 'netstress' 'reboot' > /tmp/icsos-netstress-iso/autoexec.bat
+	@printf 'set timeout=0\nmenuentry "ics" { multiboot2 /vmdex user-smp; boot }\n' \
+		> /tmp/icsos-netstress-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-netstress.iso /tmp/icsos-netstress-iso >/dev/null 2>&1
+	@echo "Starting host UDP/TCP echo for netstress..."
+	@chmod +x scripts/udp_echo_server.py scripts/tcp_echo_server.py
+	@python3 scripts/udp_echo_server.py 7777 >/tmp/icsos-netstress-udp.log 2>&1 & echo $$! > /tmp/icsos-netstress-udp.pid
+	@python3 scripts/tcp_echo_server.py 7778 >/tmp/icsos-netstress-tcp.log 2>&1 & echo $$! > /tmp/icsos-netstress-tcp.pid
+	@echo "Running netstress (KVM, smp $(NETSTRESS_SMP), user-smp)..."
+	@-timeout $(NETSTRESS_TIMEOUT) stdbuf -oL $(QEMU_X64) -enable-kvm -cpu host \
+		-smp $(NETSTRESS_SMP) -nographic -no-reboot -m 256M \
+		-cdrom /tmp/icsos-netstress.iso -boot d \
+		-netdev user,id=n0 \
+		-device virtio-net-pci,netdev=n0,disable-legacy=on \
+		< /dev/null > /tmp/icsos-netstress.log 2>&1; \
+	 status=$$?; \
+	 if [ -f /tmp/icsos-netstress-udp.pid ]; then kill $$(cat /tmp/icsos-netstress-udp.pid) 2>/dev/null || true; rm -f /tmp/icsos-netstress-udp.pid; fi; \
+	 if [ -f /tmp/icsos-netstress-tcp.pid ]; then kill $$(cat /tmp/icsos-netstress-tcp.pid) 2>/dev/null || true; rm -f /tmp/icsos-netstress-tcp.pid; fi; \
+	 exit 0
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-netstress.log
+	@grep -aq "VIRTIO_NET_OK" /tmp/icsos-netstress.log
+	@grep -aq "NETSTRESS_PASS" /tmp/icsos-netstress.log
+	@grep -aqE "USER_RUN cpu=[1-7]" /tmp/icsos-netstress.log
+	@! grep -aq "NETSTRESS_FAIL" /tmp/icsos-netstress.log
+	@! grep -aqE "PF64 |GPF64 " /tmp/icsos-netstress.log
+	@! grep -aq "General Protection fault" /tmp/icsos-netstress.log
+	@echo "test-net-stress PASS"
 
 # Boot, rebuild TinyCC with itself inside ICS-OS (Multiboot2 ISO).
 # Packs an 8.3-renamed TinyCC tree as one ustar so staging is a single CD read.
