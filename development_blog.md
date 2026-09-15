@@ -2,6 +2,13 @@
 
 ## 2026-09-15 (Manila, UTC+8)
 
+### 18:10 — Networking milestone B: UDP echo
+
+UDP send/receive on the in-tree stack, guest echo server on port 7, and a
+client selftest against a host Python echo on `:7777` via SLIRP
+(`NET_UDP_OK`). `make test-net` now requires ping + UDP; host TAP
+`test-netudp-unit` covers builders/checksum. Still no TCP/sockets.
+
 ### 17:55 — Networking milestone A: virtio-net + ICMP ping
 
 Shipped minimal in-tree IPv4 (`kernel/net/`: pbuf, netif, Ethernet, ARP,

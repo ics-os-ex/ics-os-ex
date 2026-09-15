@@ -320,8 +320,9 @@ if `pc_claim` stored it outside the 8-slot hash probe (`make test-fatwrite`).
 virtio-pci, RX+TX queues, MSI-X, static SLIRP addressing (`10.0.2.15` /
 `10.0.2.2`). Boot selftest ARP-resolves the gateway and ICMP-pings it.
 `IRQ_IRETQ_KTEXT_END` must stay above `textEnd` when the stack grows.
-`make test-net` greps `VIRTIO_NET_OK`, `NETIF_UP`, `VIRTIO_NET_IRQ_OK`, and
-`NET_PING_OK`. Host TAP: `make test-net-unit`. No UDP/TCP/sockets yet.
+`make test-net` greps `VIRTIO_NET_OK`, `NETIF_UP`, `VIRTIO_NET_IRQ_OK`,
+`NET_PING_OK`, and `NET_UDP_OK` (host UDP echo on `:7777`). Host TAP:
+`make test-net-unit`. Guest also echoes UDP on port 7. No TCP/sockets/DHCP yet.
 
 ## Memory map
 

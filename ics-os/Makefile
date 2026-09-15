@@ -147,7 +147,12 @@ test-neticmp-unit:
 	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/net_icmp_unit.c -o /tmp/icsos-tests/net_icmp_unit
 	@/tmp/icsos-tests/net_icmp_unit
 
-test-net-unit: test-netchecksum-unit test-netarp-unit test-neticmp-unit
+test-netudp-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/net_udp_unit.c -o /tmp/icsos-tests/net_udp_unit
+	@/tmp/icsos-tests/net_udp_unit
+
+test-net-unit: test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit
 	@echo "test-net-unit PASS"
 
 # Deterministic 64 MiB GPT disk (slot 0: 32 MiB FAT32, slot 1: 16 MiB ext4).
@@ -763,7 +768,7 @@ test-virtio: vmdex
 	@echo "test-virtio PASS"
 
 # Boot with virtio-net on QEMU user (SLIRP) networking; static 10.0.2.15
-# pings the SLIRP gateway 10.0.2.2 via ICMP echo.
+# pings the SLIRP gateway 10.0.2.2 via ICMP and UDP-echoes port 7777 on the host.
 test-net: vmdex
 	@echo "Building Multiboot2 ISO for virtio-net..."
 	@mkdir -p /tmp/icsos-net-iso/boot/grub
@@ -771,19 +776,27 @@ test-net: vmdex
 	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
 		> /tmp/icsos-net-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-net.iso /tmp/icsos-net-iso >/dev/null 2>&1
-	@echo "Running virtio-net ping test (TCG, 2 vCPUs)..."
+	@echo "Starting host UDP echo on :7777..."
+	@chmod +x scripts/udp_echo_server.py
+	@python3 scripts/udp_echo_server.py 7777 >/tmp/icsos-udp-echo.log 2>&1 & echo $$! > /tmp/icsos-udp-echo.pid
+	@echo "Running virtio-net ping+UDP test (TCG, 2 vCPUs)..."
 	@-timeout 60 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
 		-cdrom /tmp/icsos-net.iso -boot d \
 		-netdev user,id=n0 \
 		-device virtio-net-pci,netdev=n0,disable-legacy=on \
-		< /dev/null > /tmp/icsos-net.log 2>&1
+		< /dev/null > /tmp/icsos-net.log 2>&1; \
+	 status=$$?; \
+	 if [ -f /tmp/icsos-udp-echo.pid ]; then kill $$(cat /tmp/icsos-udp-echo.pid) 2>/dev/null || true; rm -f /tmp/icsos-udp-echo.pid; fi; \
+	 exit 0
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-net.log
 	@grep -aq "VIRTIO_NET_OK" /tmp/icsos-net.log
 	@grep -aq "NETIF_UP" /tmp/icsos-net.log
 	@grep -aq "VIRTIO_NET_IRQ_OK" /tmp/icsos-net.log
 	@grep -aq "NET_PING_OK" /tmp/icsos-net.log
+	@grep -aq "NET_UDP_OK" /tmp/icsos-net.log
 	@! grep -aq "VIRTIO_NET_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_PING_FAIL" /tmp/icsos-net.log
+	@! grep -aq "NET_UDP_FAIL" /tmp/icsos-net.log
 	@! grep -aq "General Protection fault" /tmp/icsos-net.log
 	@echo "test-net PASS"
 

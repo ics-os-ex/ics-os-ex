@@ -15,6 +15,7 @@
 #include "../../net/netdev.h"
 #include "../../net/inet_config.h"
 #include "../../net/icmp.h"
+#include "../../net/udp.h"
 #include "../../net/arp.h"
 #include "../irq_lifecycle.h"
 
@@ -664,6 +665,13 @@ static void vnet_selftest(struct vnet_dev *d)
       printf("NET_PING_OK\n");
    else
       printf("NET_PING_FAIL\n");
+
+   /* UDP echo client to host (SLIRP gateway). Host must run an echo
+      server on UDP_TEST_PORT for NET_UDP_OK; otherwise FAIL. */
+   if (udp_echo_client(&d->nif, cfg.gateway, UDP_TEST_PORT, 2000000) == 0)
+      printf("NET_UDP_OK\n");
+   else
+      printf("NET_UDP_FAIL\n");
 }
 
 void virtio_net_init(void)

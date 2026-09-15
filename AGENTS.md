@@ -74,8 +74,8 @@ Useful individual targets (from `ics-os/`):
 | `test-usb-cdc-pico` | Physical Pico 2 W (`2e8a:0005`) via QEMU `usb-host` on q35 xHCI; curls Pico Wi-Fi for `USB_CDC_CONSOLE_OK`, `ICSOS_VER`, `pico=`, `USB_CDC_RX`, and `STATUS cdc=1`/`release=`. SKIP if the gadget is not plugged into the host |
 | `test-posixio` | POSIX fds + preadv/pwritev/fsync + io_uring; ramdisk `POSIXIO_PASS`/`URING_PASS`; virtio `/dev/vblk` `URING_VBLK_PASS` |
 | `test-virtio` | QEMU virtio-blk DMA; MSI-X completions; `VIRTIO_BLK_OK` + `VIRTIO_IRQ_OK` |
-| `test-net` | QEMU virtio-net + SLIRP; static `10.0.2.15` ICMP ping of `10.0.2.2`; `VIRTIO_NET_OK` + `NET_PING_OK` |
-| `test-net-unit` | Host TAP for checksum / ARP / ICMP echo transform (`tests/net_*_unit.c`) |
+| `test-net` | QEMU virtio-net + SLIRP; ICMP ping + UDP echo to host `:7777`; `NET_PING_OK` + `NET_UDP_OK` |
+| `test-net-unit` | Host TAP for checksum / ARP / ICMP / UDP (`tests/net_*_unit.c`) |
 | `test-ext4` | ext4 virtio-blk read/create/write; guest marker plus host `e2fsck`/`debugfs` validation of the post-test image |
 | `test-spawn` | `posix_spawn` + `waitpid` of `hello.exe` (`SPAWN_PASS`); FAT `/work` on virtio (`WORK_DISK_PASS`) |
 | `test-stress` | SMP=4 spawn/exit/reap + short fork+ELF overlap (`STRESSPROC_PASS`); no GPF/PF |
@@ -100,6 +100,7 @@ Useful individual targets (from `ics-os/`):
 | `test-netchecksum-unit` | Host-native TAP for Internet checksum (`tests/net_checksum_unit.c`) |
 | `test-netarp-unit` | Host-native TAP for ARP build/parse/cache (`tests/net_arp_unit.c`) |
 | `test-neticmp-unit` | Host-native TAP for ICMP echo request→reply transform (`tests/net_icmp_unit.c`) |
+| `test-netudp-unit` | Host-native TAP for UDP build/checksum (`tests/net_udp_unit.c`) |
 | `test-usbdbg-unit` | Host-native TAP for the CDC debug RPC line parser, KEYS hex, SCREEN dump, PPM size, and ICSOS_VER bind/STATUS stamps (`tests/usb_debug_unit.c`) |
 | `test-ttycanon-unit` | Host-native TAP for canonical tty read remainder (`tests/tty_canon_unit.c`) |
 | `test-pciscan-unit` | Host-native TAP for PCI slot function-count (empty slots skip fn 1-7; `tests/pci_scan_unit.c`) |

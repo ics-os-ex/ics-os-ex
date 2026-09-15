@@ -1,5 +1,6 @@
 #include "ipv4.h"
 #include "icmp.h"
+#include "udp.h"
 #include "netif.h"
 #include "pbuf.h"
 #include "ethernet.h"
@@ -47,6 +48,8 @@ void ipv4_input(struct netif *nif, struct pbuf *p)
 
     if (ip->proto == IPV4_PROTO_ICMP)
         icmp_input(nif, p, ihl);
+    else if (ip->proto == IPV4_PROTO_UDP)
+        udp_input(nif, p, ihl);
     else
         pbuf_free(p);
 }
