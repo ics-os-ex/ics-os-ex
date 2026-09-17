@@ -93,8 +93,8 @@ warncheck:
 endif
 
 obj: warncheck scheduler.o fat.o ext4.o iso9660.o ramdisk.o devfs.o iomgr.o blkcache.o posixfd.o devmgr_error.o kernel32.o \
-		startup.o asmlib.o irqwrap.o context.o ap_trampoline.o lapic.o smp.o kexec.o irq_lifecycle.o vtd.o virtio_blk.o virtio_net.o \
-		net_pbuf.o net_netif.o net_ethernet.o net_arp.o net_ipv4.o net_icmp.o net_udp.o net_tcp.o net_sock.o net_sync.o net_dhcp.o net_inet_config.o net_dns.o net_softnet.o
+		startup.o asmlib.o irqwrap.o context.o ap_trampoline.o lapic.o smp.o kexec.o irq_lifecycle.o vtd.o virtio_blk.o virtio_net.o rtl8139.o \
+		net_pbuf.o net_netif.o net_ethernet.o net_arp.o net_ipv4.o net_icmp.o net_udp.o net_tcp.o net_sock.o net_sync.o net_dhcp.o net_inet_config.o net_dns.o net_softnet.o net_netcfg.o
 		
 kernel32.o: kernel32.c build.h hardware/usb/uhci.c hardware/usb/xhci.c hardware/usb/xhci_policy.h hardware/usb/usb.h hardware/usb/usb_cdc_acm.h hardware/usb/usb_debug.h hardware/dma.h hardware/irq_lifecycle.h \
 		hardware/chips/serial.c hardware/ATA/ide.c hardware/ATA/ata_capacity.h \
@@ -175,6 +175,9 @@ virtio_blk.o: hardware/virtio/virtio_blk.c hardware/virtio/virtio_blk.h hardware
 virtio_net.o: hardware/virtio/virtio_net.c hardware/virtio/virtio_net.h hardware/virtio/virtio.h hardware/pci_scan.h hardware/irq_lifecycle.h net/netif.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o virtio_net.o hardware/virtio/virtio_net.c
 
+rtl8139.o: hardware/rtl8139/rtl8139.c hardware/rtl8139/rtl8139.h hardware/pci_scan.h net/netif.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o rtl8139.o hardware/rtl8139/rtl8139.c
+
 net_pbuf.o: net/pbuf.c net/pbuf.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_pbuf.o net/pbuf.c
 
@@ -217,11 +220,44 @@ net_dns.o: net/dns.c net/dns.h net/udp.h
 net_softnet.o: net/softnet.c net/softnet.h net/tcp.h net/dhcp.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_softnet.o net/softnet.c
 
+net_netcfg.o: net/netcfg.c net/netcfg.h net/netif.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o net_netcfg.o net/netcfg.c
+
 irq_lifecycle.o: hardware/irq_lifecycle.c hardware/irq_lifecycle.h cpu/spinlock.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o irq_lifecycle.o hardware/irq_lifecycle.c
 
 vtd.o: hardware/vtd.c hardware/vtd.h hardware/iommu.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o vtd.o hardware/vtd.c
+
+pci_probe.o: hardware/pci_probe.c hardware/pci_probe.h hardware/pci_cfg.h hardware/pci_scan.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o pci_probe.o hardware/pci_probe.c
+
+wifi.o: net/wifi.c net/wifi.h net/ieee80211.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o wifi.o net/wifi.c
+
+rtw_io.o: hardware/wifi/rtw88/rtw_io.c hardware/wifi/rtw88/rtw_io.h hardware/wifi/rtw88/rtw_mask.h hardware/wifi/rtw88/rtw_dev.h hardware/wifi/rtw88/rtw_reg.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o rtw_io.o hardware/wifi/rtw88/rtw_io.c
+
+rtw_pwr.o: hardware/wifi/rtw88/rtw_pwr.c hardware/wifi/rtw88/rtw_pwr.h hardware/wifi/rtw88/rtw_io.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o rtw_pwr.o hardware/wifi/rtw88/rtw_pwr.c
+
+rtw_pci.o: hardware/wifi/rtw88/rtw_pci.c hardware/wifi/rtw88/rtw_pci.h hardware/pci_cfg.h hardware/pci_scan.h hardware/dma.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o rtw_pci.o hardware/wifi/rtw88/rtw_pci.c
+
+rtw_fw.o: hardware/wifi/rtw88/rtw_fw.c hardware/wifi/rtw88/rtw_fw.h hardware/wifi/rtw88/rtw_fw_hdr.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o rtw_fw.o hardware/wifi/rtw88/rtw_fw.c
+
+rtw_efuse.o: hardware/wifi/rtw88/rtw_efuse.c hardware/wifi/rtw88/rtw_efuse.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o rtw_efuse.o hardware/wifi/rtw88/rtw_efuse.c
+
+rtw_mac.o: hardware/wifi/rtw88/rtw_mac.c hardware/wifi/rtw88/rtw_mac.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o rtw_mac.o hardware/wifi/rtw88/rtw_mac.c
+
+rtw_phy.o: hardware/wifi/rtw88/rtw_phy.c hardware/wifi/rtw88/rtw_phy.h hardware/wifi/rtw88/rtw_io.h hardware/wifi/rtw88/rtw_fw_hdr.h hardware/wifi/rtw88/rtw_phy_tbl.h hardware/wifi/rtw88/rtw_mask.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o rtw_phy.o hardware/wifi/rtw88/rtw_phy.c
+
+rtw8821ce.o: hardware/wifi/rtw88/rtw8821ce.c hardware/wifi/rtw88/rtw8821ce.h hardware/wifi/rtw88/rtw_phy.h net/wifi.h
+	$(CC) $(TOOLPREFIX) $(CFLAGS) -o rtw8821ce.o hardware/wifi/rtw88/rtw8821ce.c
 
 lapic.o: cpu/lapic.c cpu/lapic.h cpu/lapic_x2.h
 	$(CC) $(TOOLPREFIX) $(CFLAGS) -o lapic.o cpu/lapic.c
@@ -231,8 +267,10 @@ smp.o: cpu/smp.c cpu/smp.h process/process.h process/irq_kstack.h
 	
 Kernel64.bin: startup.o asmlib.o context.o ap_trampoline.o lapic.o smp.o kernel32.o \
 		scheduler.o iomgr.o blkcache.o posixfd.o fat.o ext4.o iso9660.o ramdisk.o \
-		devfs.o irqwrap.o devmgr_error.o kexec.o irq_lifecycle.o vtd.o virtio_blk.o virtio_net.o \
-		net_pbuf.o net_netif.o net_ethernet.o net_arp.o net_ipv4.o net_icmp.o net_udp.o net_tcp.o net_sock.o net_sync.o net_dhcp.o net_inet_config.o net_dns.o net_softnet.o
+		devfs.o irqwrap.o devmgr_error.o kexec.o irq_lifecycle.o vtd.o pci_probe.o \
+		virtio_blk.o virtio_net.o rtl8139.o \
+		wifi.o rtw_io.o rtw_pwr.o rtw_pci.o rtw_fw.o rtw_efuse.o rtw_mac.o rtw_phy.o rtw8821ce.o \
+		net_pbuf.o net_netif.o net_ethernet.o net_arp.o net_ipv4.o net_icmp.o net_udp.o net_tcp.o net_sock.o net_sync.o net_dhcp.o net_inet_config.o net_dns.o net_softnet.o net_netcfg.o
 	$(LD) $(LDFLAGS) $(MAPFLAGS)
 
 clean:

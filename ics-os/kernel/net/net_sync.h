@@ -9,7 +9,8 @@
  * Recursive on the same CPU so tcp_input → arp_resolve → netif_poll →
  * deliver can re-enter. Outermost acquire is irqsave.
  *
- * Lock order: net_lock → virtio-net device lock (never reverse).
+ * Lock order: net_lock → NIC device lock (virtio-net / rtl8139; never reverse
+ * while both are held). Outermost acquire is irqsave.
  * pbuf uses its own spinlock and may nest inside either.
  */
 

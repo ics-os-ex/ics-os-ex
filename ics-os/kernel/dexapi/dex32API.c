@@ -220,6 +220,8 @@ void api_init(){
      api_addsystemcall(0xCC,sys_recv,0,API_REQUIRE_INTS);
      api_addsystemcall(0xCD,sys_sendto,0,API_REQUIRE_INTS);
      api_addsystemcall(0xCE,sys_recvfrom,0,API_REQUIRE_INTS);
+     api_addsystemcall(0xCF,sys_netcfg,0,API_REQUIRE_INTS);
+     api_addsystemcall(0xD0,sys_dup2,0,API_REQUIRE_INTS);
   };
 
 

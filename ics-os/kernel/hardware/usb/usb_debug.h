@@ -61,6 +61,7 @@ typedef struct {
     int verb;
     unsigned int fb_scale;
     unsigned int kexec_bytes;
+    unsigned int kexec_crc32;
     unsigned int nkeys;
     unsigned char keys[USB_DEBUG_HEX_MAX];
     char cmd[USB_DEBUG_LINE_MAX];
@@ -284,6 +285,7 @@ static inline int usb_debug_parse_line(const char *line, usb_debug_req *out)
     out->verb = USB_DEBUG_VERB_NONE;
     out->fb_scale = 8;
     out->kexec_bytes = 0;
+    out->kexec_crc32 = 0;
     out->nkeys = 0;
     out->cmd[0] = 0;
     if (!line)
@@ -331,6 +333,13 @@ static inline int usb_debug_parse_line(const char *line, usb_debug_req *out)
         out->kexec_bytes = usb_debug_parse_u32(p);
         if (!out->kexec_bytes)
             return USB_DEBUG_ERR_ARG;
+        while (*p >= '0' && *p <= '9')
+            p++;
+        while (*p == ' ')
+            p++;
+        if (!*p || *p == '\r' || *p == '\n')
+            return USB_DEBUG_ERR_ARG;
+        out->kexec_crc32 = usb_debug_parse_u32(p);
         return USB_DEBUG_OK;
     }
     return USB_DEBUG_OK;

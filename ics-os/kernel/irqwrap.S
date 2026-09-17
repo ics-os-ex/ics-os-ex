@@ -234,10 +234,10 @@ syscallwrapper:
 .Lapi_syscall:
     movq 112(%r12), %rdi        /* saved rax -> fxn */
     movq 104(%r12), %rsi        /* saved rbx -> a1 */
-    movq 96(%r12), %rdx         /* saved rcx -> a2 */
-    movq 88(%r12), %rcx         /* saved rdx -> a3 */
-    movq 80(%r12), %r8          /* saved rsi -> a4 */
-    movq 72(%r12), %r9          /* saved rdi -> a5 */
+    movq  96(%r12), %rdx        /* saved rcx -> a2 */
+    movq  88(%r12), %rcx        /* saved rdx -> a3 */
+    movq  80(%r12), %r8         /* saved rsi -> a4 */
+    movq  72(%r12), %r9         /* saved rdi -> a5 */
     call api_syscall
     movq %rax, 112(%r13)        /* return value in caller's rax */
 .Lsyscall_return:

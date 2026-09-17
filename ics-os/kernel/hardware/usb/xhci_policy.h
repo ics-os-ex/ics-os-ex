@@ -45,6 +45,23 @@ static inline unsigned int xhci_ccs_bit(unsigned int port)
     return 1u << (port - 1);
 }
 
+static inline unsigned int xhci_cdc_extra_ccs(unsigned int ccs,
+                                               unsigned int msc_port)
+{
+    return ccs & ~xhci_ccs_bit(msc_port);
+}
+
+static inline int xhci_cdc_should_drop(int cdc_ready, int cdc_connected)
+{
+    return cdc_ready && !cdc_connected;
+}
+
+static inline int xhci_cdc_should_rebind(int cdc_ready,
+                                         unsigned int extra_ccs)
+{
+    return !cdc_ready && extra_ccs != 0;
+}
+
 /*
   Control TD flags. xHCI 1.2 6.4.1.2.1: Setup Stage TRB bits 1-4 are
   RsvdZ, so Chain (bit 4) must stay clear. Linux also leaves Chain

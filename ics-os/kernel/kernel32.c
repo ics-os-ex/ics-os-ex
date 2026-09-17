@@ -133,7 +133,10 @@ extern void textcolor(unsigned char c);
 #include "iomgr/iosched.h"
 #include "hardware/virtio/virtio_blk.h"
 #include "hardware/virtio/virtio_net.h"
+#include "hardware/rtl8139/rtl8139.h"
+#include "hardware/wifi/rtw88/rtw8821ce.h"
 #include "net/sock.h"
+#include "net/netcfg.h"
 #include "kexec.h"
 
 //structure to hold the boot info
@@ -597,9 +600,6 @@ printf("Initializing ports...");
    //show_pci();
    //icsos_pci_init();
    printf("[OK]\n");
-printf("Initializing rtl8139 NIC...");
-    //rtl8139_init();
-    printf("[OK]\n");
     fbdbg_stage(10, "pci/nic");
     kbd_boot_leds_hold(KBD_LED_NUM);
    //delay(400/80);
@@ -842,6 +842,9 @@ void dex_init(){
    printf("Initializing virtio-net...\n");
    virtio_net_init();
 
+   printf("Initializing rtl8139 NIC...\n");
+   rtl8139_init();
+
    printf("Initializing USB mass-storage drivers...\n");
    usb_init();
    usb_cdc_pump();
@@ -973,6 +976,10 @@ void dex_init(){
          printf("Warning: no root filesystem mounted (continuing).\n");
       else
          printf("Root mount [OK]\n");
+
+      /* Wi-Fi after VFS root so firmware can load from /icsos/firmware. */
+      printf("Initializing RTL8821CE Wi-Fi...\n");
+      rtw8821ce_init();
 
         if (mounted &&
            (strstr(kernel_cmdline, "xhci-mounted-disconnect-test") ||

@@ -1129,6 +1129,7 @@ DWORD createprocess(
       temp->pgrp = parent->pgrp;
       temp->usercs = USER_CODE;
    }
+
    memcpy(&temp->regs2,&ps_kernelfpustate,sizeof(ps_kernelfpustate));
 
    //get the working directory of this process
@@ -2721,6 +2722,17 @@ static void zombie_reclaim(PCB386 *z)
        free(z->stdout);
        z->stdout = 0;
     }
+#ifdef __x86_64__
+    /* Free the per-process IRQ kstack.  createprocess() allocates one
+       (IRQ_KSTACK_SIZE) for every user process; kill_process() frees it, but
+       the self-exit path (self_exit_current -> pending_zombie -> here) used
+       to leak it.  Every self-host tool exits via self-exit, so each leaked
+       128 KiB of the 63 MiB kheap; after ~300 ELF loads the kheap was
+       exhausted and createprocess() failed at pcb_alloc_irq_kstack()
+       (mapfile: malloc failed knext=0x5fe4000).  No-op for threads, which
+       never allocate a kstack (kstack_base stays 0). */
+    pcb_free_irq_kstack(z);
+#endif
     free(z);
 }
 

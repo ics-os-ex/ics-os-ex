@@ -19,6 +19,12 @@ void softnet_tick(void)
     struct netif *nif;
     struct inet_config cfg;
 
+    /* Wi-Fi RX poll is independent of wired netif DHCP state. */
+    {
+        extern void rtw8821ce_poll(void);
+        rtw8821ce_poll();
+    }
+
     nif = netif_default();
     if (!nif || !nif->configured)
         return;

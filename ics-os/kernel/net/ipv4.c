@@ -35,6 +35,10 @@ void ipv4_input(struct netif *nif, struct pbuf *p)
     total = net_ntohs(ip->total_len);
     if (total < ihl || total > p->len)
         total = p->len;
+    else
+        /* Strip Ethernet minimum-frame padding so TCP does not treat
+           pad bytes as payload (rtl8139/QEMU pads short frames to 60). */
+        p->len = (u16)total;
 
     /* Accept unicast to us, limited broadcast, or subnet broadcast. */
     {

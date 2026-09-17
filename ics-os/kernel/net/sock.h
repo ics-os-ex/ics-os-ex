@@ -37,6 +37,7 @@ long sys_sendto(int fd, const void *buf, unsigned long len,
 long sys_recvfrom(int fd, void *buf, unsigned long len,
                   struct sockaddr *addr, unsigned int *addrlen);
 void sock_close(void *sock);
+int  sock_retain(void *sock);
 int  sock_read(void *sock, void *buf, long n);
 int  sock_write(void *sock, const void *buf, long n);
 int  sock_fd_alloc(void);

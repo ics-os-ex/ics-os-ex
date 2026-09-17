@@ -9,7 +9,9 @@
 #define TCP_ECHO_PORT     7
 #define TCP_TEST_PORT     7778
 #define TCP_PCB_MAX       8
-#define TCP_RX_MAX        512
+#define TCP_RX_MAX        1024
+#define TCP_UNA_MAX       2048
+#define TCP_MSS           1024
 
 #define TCP_FIN  0x01
 #define TCP_SYN  0x02
@@ -71,13 +73,16 @@ static inline unsigned short tcp_checksum(unsigned int src_ip_host,
     }
 }
 
-static inline unsigned int tcp_build(unsigned char *dst,
-                                     unsigned short sport, unsigned short dport,
-                                     unsigned int seq, unsigned int ack,
-                                     unsigned char flags,
-                                     const unsigned char *payload,
-                                     unsigned int payload_len,
-                                     unsigned int src_ip, unsigned int dst_ip)
+static inline unsigned int tcp_build_win(unsigned char *dst,
+                                         unsigned short sport,
+                                         unsigned short dport,
+                                         unsigned int seq, unsigned int ack,
+                                         unsigned char flags,
+                                         const unsigned char *payload,
+                                         unsigned int payload_len,
+                                         unsigned int src_ip,
+                                         unsigned int dst_ip,
+                                         unsigned short window)
 {
     struct tcp_hdr *h = (struct tcp_hdr *)dst;
     unsigned int i;
@@ -89,13 +94,25 @@ static inline unsigned int tcp_build(unsigned char *dst,
     h->ack = net_htonl(ack);
     h->off_res = (5 << 4);
     h->flags = flags;
-    h->window = net_htons(8192);
+    h->window = net_htons(window);
     h->checksum = 0;
     h->urg = 0;
     for (i = 0; i < payload_len; i++)
         dst[TCP_HDR_MIN + i] = payload[i];
     h->checksum = net_htons(tcp_checksum(src_ip, dst_ip, dst, tcp_len));
     return tcp_len;
+}
+
+static inline unsigned int tcp_build(unsigned char *dst,
+                                     unsigned short sport, unsigned short dport,
+                                     unsigned int seq, unsigned int ack,
+                                     unsigned char flags,
+                                     const unsigned char *payload,
+                                     unsigned int payload_len,
+                                     unsigned int src_ip, unsigned int dst_ip)
+{
+    return tcp_build_win(dst, sport, dport, seq, ack, flags, payload,
+                         payload_len, src_ip, dst_ip, 8192);
 }
 
 struct netif;

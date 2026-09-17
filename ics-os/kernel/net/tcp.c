@@ -11,7 +11,6 @@ extern void *memset(void *s, int c, unsigned int n);
 extern int memcmp(const void *s1, const void *s2, unsigned int n);
 extern unsigned int ticks;
 
-#define TCP_UNA_MAX       512
 #define TCP_RTO_TICKS     40   /* ~200ms at 200Hz */
 #define TCP_RTO_MAX_TICKS 800  /* ~4s */
 
@@ -119,6 +118,13 @@ unsigned short tcp_pcb_remote_port(struct tcp_pcb *pcb)
     return pcb ? pcb->remote_port : 0;
 }
 
+static unsigned short tcp_rcv_wnd(struct tcp_pcb *pcb)
+{
+    if (!pcb || pcb->rx_len >= TCP_RX_MAX)
+        return 0;
+    return (unsigned short)(TCP_RX_MAX - pcb->rx_len);
+}
+
 static int tcp_output(struct tcp_pcb *pcb, unsigned char flags,
                       const unsigned char *payload, unsigned int payload_len)
 {
@@ -135,9 +141,9 @@ static int tcp_output(struct tcp_pcb *pcb, unsigned char flags,
     p = pbuf_alloc((u16)(TCP_HDR_MIN + payload_len));
     if (!p)
         return -1;
-    tcp_len = tcp_build(p->data, pcb->local_port, pcb->remote_port,
-                        seq, pcb->rcv_nxt, flags, payload, payload_len,
-                        pcb->nif->ip, pcb->remote_ip);
+    tcp_len = tcp_build_win(p->data, pcb->local_port, pcb->remote_port,
+                            seq, pcb->rcv_nxt, flags, payload, payload_len,
+                            pcb->nif->ip, pcb->remote_ip, tcp_rcv_wnd(pcb));
     p->len = (u16)tcp_len;
 
     if (flags & TCP_SYN)
@@ -155,23 +161,25 @@ static int tcp_output(struct tcp_pcb *pcb, unsigned char flags,
     return ipv4_output(pcb->nif, p, pcb->remote_ip, IPV4_PROTO_TCP);
 }
 
-/* Retransmit without advancing snd_nxt. */
+/* Retransmit without advancing snd_nxt (oldest unacked MSS). */
 static int tcp_rexmit_una(struct tcp_pcb *pcb)
 {
     struct pbuf *p;
     unsigned int tcp_len;
+    unsigned int seg;
 
     if (!pcb || !pcb->una_len || !pcb->nif)
         return -1;
-    if (TCP_HDR_MIN + pcb->una_len > PBUF_SIZE)
+    seg = pcb->una_len < TCP_MSS ? pcb->una_len : TCP_MSS;
+    if (TCP_HDR_MIN + seg > PBUF_SIZE)
         return -1;
-    p = pbuf_alloc((u16)(TCP_HDR_MIN + pcb->una_len));
+    p = pbuf_alloc((u16)(TCP_HDR_MIN + seg));
     if (!p)
         return -1;
-    tcp_len = tcp_build(p->data, pcb->local_port, pcb->remote_port,
-                        pcb->una_seq, pcb->rcv_nxt, TCP_PSH | TCP_ACK,
-                        pcb->una_buf, pcb->una_len,
-                        pcb->nif->ip, pcb->remote_ip);
+    tcp_len = tcp_build_win(p->data, pcb->local_port, pcb->remote_port,
+                            pcb->una_seq, pcb->rcv_nxt, TCP_PSH | TCP_ACK,
+                            pcb->una_buf, seg,
+                            pcb->nif->ip, pcb->remote_ip, tcp_rcv_wnd(pcb));
     p->len = (u16)tcp_len;
     g_rexmit_count++;
     return ipv4_output(pcb->nif, p, pcb->remote_ip, IPV4_PROTO_TCP);
@@ -304,12 +312,18 @@ static void tcp_handle(struct netif *nif, struct tcp_pcb *pcb,
         }
 
         if (plen && seq == pcb->rcv_nxt) {
-            pcb->rcv_nxt = seq + plen;
-            tcp_rx_append(pcb, payload, plen);
-            if (pcb->echo)
-                (void)tcp_pcb_send(pcb, payload, plen);
-            else
+            unsigned int space = TCP_RX_MAX - pcb->rx_len;
+            if (plen <= space) {
+                pcb->rcv_nxt = seq + plen;
+                tcp_rx_append(pcb, payload, plen);
+                if (pcb->echo)
+                    (void)tcp_pcb_send(pcb, payload, plen);
+                else
+                    (void)tcp_output(pcb, TCP_ACK, 0, 0);
+            } else {
+                /* Do not advance rcv_nxt past what fits; advertise window. */
                 (void)tcp_output(pcb, TCP_ACK, 0, 0);
+            }
         }
 
         if (flags & TCP_FIN) {
@@ -320,8 +334,11 @@ static void tcp_handle(struct netif *nif, struct tcp_pcb *pcb,
                     pcb->state == TCP_SYN_RCVD) {
                     pcb->state = TCP_CLOSE_WAIT;
                     (void)tcp_output(pcb, TCP_ACK, 0, 0);
-                    (void)tcp_output(pcb, TCP_FIN | TCP_ACK, 0, 0);
-                    pcb->state = TCP_LAST_ACK;
+                    /* Kernel echo sockets have no userspace closer. */
+                    if (pcb->echo) {
+                        (void)tcp_output(pcb, TCP_FIN | TCP_ACK, 0, 0);
+                        pcb->state = TCP_LAST_ACK;
+                    }
                 }
             }
         }
@@ -440,7 +457,9 @@ struct tcp_pcb *tcp_pcb_accept(struct tcp_pcb *listener,
     if (!listener || listener->state != TCP_LISTEN)
         return 0;
     while (spins++ < timeout_spins) {
+        net_unlock();
         netif_poll(listener->nif ? listener->nif : netif_default());
+        net_lock();
         tcp_timer(ticks);
         for (i = 0; i < TCP_PCB_MAX; i++) {
             if (pcbs[i].in_use && pcbs[i].parent == listener &&
@@ -485,7 +504,9 @@ int tcp_pcb_connect(struct tcp_pcb *pcb, unsigned int dst_host,
     }
 
     while (pcb->state != TCP_ESTABLISHED && spins < timeout_spins) {
+        net_unlock();
         netif_poll(pcb->nif);
+        net_lock();
         tcp_timer(ticks);
         if (pcb->state == TCP_CLOSED)
             return -1;
@@ -505,31 +526,36 @@ int tcp_pcb_send(struct tcp_pcb *pcb, const void *buf, unsigned int len)
 {
     unsigned int spins = 0;
     unsigned int n;
+    unsigned int space;
 
     if (!pcb || pcb->state != TCP_ESTABLISHED || !buf || !len)
         return -1;
-    if (len > TCP_UNA_MAX)
-        len = TCP_UNA_MAX;
 
-    /* One outstanding data segment: wait for prior ACK. */
-    while (pcb->una_len && spins++ < 4000000) {
+    /* Pipeline up to TCP_UNA_MAX bytes in flight (MSS-sized segments). */
+    while (pcb->una_len >= TCP_UNA_MAX && spins++ < 4000000) {
+        net_unlock();
         netif_poll(pcb->nif);
+        net_lock();
         tcp_timer(ticks);
         tcp_maybe_rexmit_spin(pcb, spins);
         __asm__ volatile ("pause");
     }
-    if (pcb->una_len)
+    space = TCP_UNA_MAX - pcb->una_len;
+    if (!space)
         return -1;
+    n = len < space ? len : space;
+    if (n > TCP_MSS)
+        n = TCP_MSS;
 
-    n = len;
-    memcpy(pcb->una_buf, buf, n);
-    pcb->una_len = n;
-    pcb->una_seq = pcb->snd_nxt;
+    if (!pcb->una_len)
+        pcb->una_seq = pcb->snd_nxt;
+    memcpy(pcb->una_buf + pcb->una_len, buf, n);
+    pcb->una_len += n;
     pcb->rto_ticks = TCP_RTO_TICKS;
     tcp_arm_rto(pcb);
 
     if (tcp_output(pcb, TCP_PSH | TCP_ACK, (const unsigned char *)buf, n) != 0) {
-        pcb->una_len = 0;
+        pcb->una_len -= n;
         return -1;
     }
     return (int)n;
@@ -540,23 +566,35 @@ int tcp_pcb_recv(struct tcp_pcb *pcb, void *buf, unsigned int len,
 {
     unsigned int spins = 0;
     unsigned int n;
+    unsigned short old_wnd;
 
     if (!pcb || !buf || !len)
         return -1;
     while (pcb->rx_len == 0 && pcb->state == TCP_ESTABLISHED &&
            spins++ < timeout_spins) {
+        net_unlock();
         netif_poll(pcb->nif ? pcb->nif : netif_default());
+        net_lock();
         tcp_timer(ticks);
         tcp_maybe_rexmit_spin(pcb, spins);
         __asm__ volatile ("pause");
     }
-    if (pcb->rx_len == 0)
+    if (pcb->rx_len == 0) {
+        /* Peer closed and buffer drained → EOF. */
+        if (pcb->state == TCP_CLOSE_WAIT || pcb->state == TCP_CLOSED ||
+            pcb->state == TCP_LAST_ACK)
+            return 0;
         return (pcb->state == TCP_ESTABLISHED) ? 0 : -1;
+    }
+    old_wnd = tcp_rcv_wnd(pcb);
     n = pcb->rx_len < len ? pcb->rx_len : len;
     memcpy(buf, pcb->rx_buf, n);
     if (n < pcb->rx_len)
         memmove(pcb->rx_buf, pcb->rx_buf + n, pcb->rx_len - n);
     pcb->rx_len -= n;
+    /* Window opened from 0: nudge peer with an ACK. */
+    if (old_wnd == 0 && tcp_rcv_wnd(pcb) != 0)
+        (void)tcp_output(pcb, TCP_ACK, 0, 0);
     return (int)n;
 }
 
@@ -565,12 +603,23 @@ int tcp_pcb_close(struct tcp_pcb *pcb)
     unsigned int spins;
     if (!pcb)
         return -1;
+    /* Drain unacked TX before FIN so bulk send timing is honest. */
+    for (spins = 0; pcb->una_len && spins < 8000000; spins++) {
+        net_unlock();
+        netif_poll(pcb->nif);
+        net_lock();
+        tcp_timer(ticks);
+        tcp_maybe_rexmit_spin(pcb, spins);
+        __asm__ volatile ("pause");
+    }
     if (pcb->state == TCP_ESTABLISHED || pcb->state == TCP_CLOSE_WAIT) {
         (void)tcp_output(pcb, TCP_FIN | TCP_ACK, 0, 0);
         pcb->state = (pcb->state == TCP_CLOSE_WAIT) ? TCP_LAST_ACK
                                                     : TCP_FIN_WAIT_1;
         for (spins = 0; spins < 200000 && pcb->state != TCP_CLOSED; spins++) {
+            net_unlock();
             netif_poll(pcb->nif);
+            net_lock();
             tcp_timer(ticks);
             __asm__ volatile ("pause");
         }

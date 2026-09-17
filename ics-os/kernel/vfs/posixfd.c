@@ -179,6 +179,32 @@ static int fd_alloc_slot(void)
          fd=i;
          break;
       }
+   if (fd < 0) {
+      /* Defensive recovery: if the table is full of leaked FD_RESERVED slots
+         (a race between fd_alloc_slot and a concurrent modifier), reset them
+         and retry once. This is a workaround for a known race; the proper fix
+         is to identify and eliminate the concurrent modifier. */
+      int any=0;
+      for (i = 3; i < FD_MAX; i++)
+         if (current_process->fds[i].type == FD_RESERVED) {
+            any=1;
+            break;
+         }
+      if (any) {
+         for (i = 3; i < FD_MAX; i++)
+            if (current_process->fds[i].type == FD_RESERVED) {
+               current_process->fds[i].type=FD_NONE;
+               current_process->fds[i].ptr=0;
+            }
+         for (i = 3; i < FD_MAX; i++)
+            if (current_process->fds[i].type == FD_NONE) {
+               current_process->fds[i].type=FD_RESERVED;
+               current_process->fds[i].ptr=0;
+               fd=i;
+               break;
+            }
+      }
+   }
    spin_unlock(&current_process->fd_lock);
    return fd;
 }
@@ -247,10 +273,22 @@ static file_PCB *fd_file_get(int fd)
 
 static tty_t *fd_istty(int fd)
 {
+   int type;
    if (!current_process || fd < 0 || fd >= FD_MAX)
       return 0;
-   if (current_process->fds[fd].type == FD_TTY)
-      return (tty_t *)current_process->fds[fd].ptr;
+   spin_lock(&current_process->fd_lock);
+   type = current_process->fds[fd].type;
+   if (type == FD_TTY) {
+      tty_t *t = (tty_t *)current_process->fds[fd].ptr;
+      spin_unlock(&current_process->fd_lock);
+      return t;
+   }
+   /* An installed non-tty (socket/file) on 0-2 wins over the ctty fallback. */
+   if (type != FD_NONE && type != FD_RESERVED) {
+      spin_unlock(&current_process->fd_lock);
+      return 0;
+   }
+   spin_unlock(&current_process->fd_lock);
    if (current_process->ctty && fd >= 0 && fd < 3)
       return current_process->ctty;
    return 0;
@@ -399,10 +437,10 @@ long sys_open(const char *path, int flags, int mode)
    file_PCB *fcb;
    (void)mode;
    if (!path || !current_process)
-      return -EINVAL;
+     return -EINVAL;
    if (path_is_vblk(path)) {
-      fd_blk_t *b;
-      if (!virtio_blk_present())
+     fd_blk_t *b;
+     if (!virtio_blk_present())
          return -ENOENT;
       if ((flags & ICSOS_O_ACCMODE) != ICSOS_O_RDONLY &&
           virtio_blk_readonly())
@@ -425,8 +463,9 @@ long sys_open(const char *path, int flags, int mode)
       return fd;
    }
    fd = fd_alloc_slot();
-   if (fd < 0)
+   if (fd < 0) {
       return fd;
+   }
    vmode = posix_to_vfs_mode(flags);
    fcb = openfilex((char *)path, vmode);
    if (!fcb) {
@@ -547,34 +586,37 @@ long sys_close(int fd)
    void *ptr;
    if (!current_process || fd < 0 || fd >= FD_MAX)
       return -EBADF;
-   if (fd < 3)
-      return 0;
    spin_lock(&current_process->fd_lock);
    type=current_process->fds[fd].type;
-    ptr=current_process->fds[fd].ptr;
-    if (type==FD_NONE || type==FD_RESERVED) {
-       spin_unlock(&current_process->fd_lock);
-       return -EBADF;
-    }
-    current_process->fds[fd].type=FD_NONE;
-    current_process->fds[fd].ptr=0;
-    spin_unlock(&current_process->fd_lock);
-    if (type==FD_VFS)
-       return vfs_file_fdclose((file_PCB *)ptr);
-    if (type==FD_URING)
-       return uring_close((ics_uring *)ptr);
-    if (type==FD_BLK) {
-        fd_blk_close((fd_blk_t *)ptr);
-        return 0;
-     }
-    if (type==FD_SOCK) {
-       sock_close(ptr);
+   ptr=current_process->fds[fd].ptr;
+   /* Stdio slots stay as ctty fallback unless a real object is installed. */
+   if (fd < 3 && (type == FD_NONE || type == FD_RESERVED)) {
+      spin_unlock(&current_process->fd_lock);
+      return 0;
+   }
+   if (type==FD_NONE || type==FD_RESERVED) {
+      spin_unlock(&current_process->fd_lock);
+      return -EBADF;
+   }
+   current_process->fds[fd].type=FD_NONE;
+   current_process->fds[fd].ptr=0;
+   spin_unlock(&current_process->fd_lock);
+   if (type==FD_VFS)
+      return vfs_file_fdclose((file_PCB *)ptr);
+   if (type==FD_URING)
+      return uring_close((ics_uring *)ptr);
+   if (type==FD_BLK) {
+       fd_blk_close((fd_blk_t *)ptr);
        return 0;
     }
-    /* FD_TTY: the tty is a shared, never-destroyed resource (see sys_dup);
-       closing a dup'd tty descriptor only releases the fd slot. */
-    return 0;
- }
+   if (type==FD_SOCK) {
+      sock_close(ptr);
+      return 0;
+   }
+   /* FD_TTY: the tty is a shared, never-destroyed resource (see sys_dup);
+      closing a dup'd tty descriptor only releases the fd slot. */
+   return 0;
+}
 
 long sys_dup(int oldfd)
 {
@@ -621,7 +663,76 @@ long sys_dup(int oldfd)
        fd_install(nf,FD_BLK,b);
        return nf;
     }
+    if (type==FD_SOCK && ptr) {
+       nf = fd_alloc_slot();
+       if (nf < 0)
+          return nf;
+       if (!sock_retain(ptr)) {
+          fd_release_slot(nf);
+          return -EBADF;
+       }
+       fd_install(nf, FD_SOCK, ptr);
+       return nf;
+    }
     return -EBADF;
+}
+
+/* Install an existing object into an arbitrary slot (including 0-2). */
+static void fd_force_install(int fd, int type, void *ptr)
+{
+   spin_lock(&current_process->fd_lock);
+   if (fd >= 0 && fd < FD_MAX) {
+      current_process->fds[fd].ptr = ptr;
+      current_process->fds[fd].type = type;
+   }
+   spin_unlock(&current_process->fd_lock);
+}
+
+long sys_dup2(int oldfd, int newfd)
+{
+   int type;
+   void *ptr;
+   tty_t *t;
+
+   if (!current_process || oldfd < 0 || oldfd >= FD_MAX ||
+       newfd < 0 || newfd >= FD_MAX)
+      return -EBADF;
+   if (oldfd == newfd)
+      return newfd;
+
+   spin_lock(&current_process->fd_lock);
+   type = current_process->fds[oldfd].type;
+   ptr = current_process->fds[oldfd].ptr;
+   spin_unlock(&current_process->fd_lock);
+
+   t = fd_istty(oldfd);
+   if (t) {
+      (void)sys_close(newfd);
+      fd_force_install(newfd, FD_TTY, t);
+      return newfd;
+   }
+   if (type == FD_SOCK && ptr) {
+      if (!sock_retain(ptr))
+         return -EBADF;
+      (void)sys_close(newfd);
+      fd_force_install(newfd, FD_SOCK, ptr);
+      return newfd;
+   }
+   if (type == FD_VFS && ptr) {
+      if (!vfs_file_inherit((file_PCB *)ptr))
+         return -EBADF;
+      (void)sys_close(newfd);
+      fd_force_install(newfd, FD_VFS, ptr);
+      return newfd;
+   }
+   if (type == FD_BLK && ptr) {
+      if (!fd_blk_inherit((fd_blk_t *)ptr))
+         return -EBADF;
+      (void)sys_close(newfd);
+      fd_force_install(newfd, FD_BLK, ptr);
+      return newfd;
+   }
+   return -EBADF;
 }
 
 long sys_read(int fd, void *buf, long n)
@@ -671,8 +782,6 @@ long sys_write(int fd, const void *buf, long n)
    t = fd_istty(fd);
    if (t)
       return tty_write(t, (const char *)buf, (int)n);
-   if (current_process && current_process->ctty && (fd == 1 || fd == 2))
-      return tty_write(current_process->ctty, (const char *)buf, (int)n);
    {
       struct sock *sk = sock_from_fd(fd);
       if (sk)
@@ -1258,6 +1367,7 @@ static int posix_fd_clone_mode(struct _PCB386 *dst, struct _PCB386 *src,
                                int for_fork)
 {
    int fd,type,result=0;
+   int hi=-1,nf=0;
    void *ptr;
    if (!dst || !src)
       return -EINVAL;
@@ -1279,8 +1389,14 @@ static int posix_fd_clone_mode(struct _PCB386 *dst, struct _PCB386 *src,
          result=-EAGAIN;
          break;
       }
+      if (type==FD_SOCK && !sock_retain(ptr)) {
+         result=-EAGAIN;
+         break;
+      }
       dst->fds[fd].type=type;
       dst->fds[fd].ptr=ptr;
+      if (hi < fd) hi=fd;
+      nf++;
    }
    spin_unlock(&src->fd_lock);
    if (result)

@@ -376,8 +376,8 @@ void irq_activate(int irqnum){
       ptr = ptr->next;
    };
 
-   //EOI for slave 
-   if (irqnum > 0x27){
+   //EOI for slave (PIC lines 8-15)
+   if (irqnum >= 8){
       outportb(0xA0, 0x20);
    }
  

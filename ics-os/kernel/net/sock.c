@@ -33,6 +33,7 @@ struct sock {
     int type;
     int listening;
     int bound;
+    int refs; /* shared across dup2 / fork clones */
     unsigned short local_port;
     unsigned int local_ip;
     unsigned int peer_ip;
@@ -165,6 +166,7 @@ long sys_socket(int domain, int type, int protocol)
     }
     memset(s, 0, sizeof(*s));
     s->nif = netif_default();
+    s->refs = 1;
     s->type = (type == SOCK_STREAM) ? SOCK_TCP : SOCK_UDP;
     if (s->type == SOCK_TCP) {
         s->pcb = tcp_pcb_new(s->nif);
@@ -285,6 +287,7 @@ long sys_accept(int fd, struct sockaddr *addr, unsigned int *addrlen)
     }
     memset(ns, 0, sizeof(*ns));
     ns->type = SOCK_TCP;
+    ns->refs = 1;
     ns->pcb = child;
     ns->nif = s->nif;
     nfd = sock_fd_alloc();
@@ -366,8 +369,11 @@ static long sock_udp_recv(struct sock *s, void *buf, unsigned long len,
 
     (void)udp_ensure_local(s);
     while (s->rx_len == 0 && spins++ < timeout_spins) {
+        /* Drop softnet lock so other CPUs can TX/RX under stress. */
+        net_unlock();
         netif_poll(s->nif ? s->nif : netif_default());
         __asm__ volatile ("pause");
+        net_lock();
     }
     if (s->rx_len == 0)
         return 0;
@@ -492,12 +498,29 @@ void sock_close(void *sock)
     if (!s)
         return;
     net_lock();
+    if (s->refs > 1) {
+        s->refs--;
+        net_unlock();
+        return;
+    }
+    s->refs = 0;
     if (s->type == SOCK_UDP)
         udp_unregister(s);
     if (s->pcb)
         tcp_pcb_close(s->pcb);
     net_unlock();
     free(s);
+}
+
+int sock_retain(void *sock)
+{
+    struct sock *s = (struct sock *)sock;
+    if (!s)
+        return 0;
+    net_lock();
+    s->refs++;
+    net_unlock();
+    return 1;
 }
 
 int sock_read(void *sock, void *buf, long n)

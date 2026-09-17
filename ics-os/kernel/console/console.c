@@ -28,6 +28,7 @@
 #include "console.h"
 #include "klog.h"
 #include "../process/sync.h"
+#include "../net/wifi.h"
 
 /* COM2 shell (shell2) line-discipline echo flag. Telnet clients typically
    perform local echo themselves, so echo defaults ON but can be disabled with
@@ -1058,7 +1059,32 @@ int console_execute(const char *str){
       hardware_cpuinfo mycpu;
       hardware_getcpuinfo(&mycpu);
       hardware_printinfo(&mycpu);
-   }else            
+   }else
+   if (strcmp(u,"pciwifi") == 0 || strcmp(u,"wifi") == 0){ //-- Dump PCI network/wireless devices.
+      /* N150 bring-up: dump PCI network/wireless for driver work. */
+      extern void pci_dump_network(void);
+      pci_dump_network();
+   }else
+   if (strcmp(u,"wifistat") == 0){     //-- Dump RTL8821CE / wlan0 status (FW, MAC, RX).
+      extern void rtw8821ce_status(void);
+      rtw8821ce_status();
+   }else
+   if (strcmp(u,"wifidbg") == 0){      //-- RTL8821CE RX-path diagnostic (HW write-pointer dwell).
+      extern void rtw8821ce_wifidbg(void);
+      rtw8821ce_wifidbg();
+   }else
+   if (strcmp(u,"wifiscan") == 0){     //-- Poll RX for beacons; print SSIDs.
+      struct wifi_dev *w = wifi_default();
+      if (!w || !w->ops || !w->ops->scan) {
+         printf("wifiscan: no wifi device\n");
+      } else {
+         (void)w->ops->scan(w);
+      }
+   }else
+   if (strcmp(u,"pci") == 0){          //-- Dump all PCI devices.
+      extern void pci_dump_all(void);
+      pci_dump_all();
+   }else
    if (strcmp(u,"exit") == 0){         //-- Exits a console session.
       fg_exit();
       exit(0);              
