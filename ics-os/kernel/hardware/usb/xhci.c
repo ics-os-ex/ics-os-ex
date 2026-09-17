@@ -4,6 +4,8 @@
 #include "xhci_policy.h"
 #include "cpu/lapic.h"
 
+extern void taskswitch(void);
+
 #define XHCI_TRBS             256
 #define XHCI_EVENT_TRBS       256
 #define XHCI_MAX_SLOTS        8
@@ -261,6 +263,8 @@ static int xhci_wait32(volatile BYTE *base, DWORD off, DWORD mask,
     for (spins = 0; spins < XHCI_TIMEOUT; spins++) {
         if ((xhci_r32(base, off) & mask) == expected)
             return 1;
+        if ((spins & 0x7F) == 0x7F)
+            taskswitch();
         usb_io_delay();
     }
     return 0;
@@ -688,9 +692,12 @@ static int xhci_next_event(xhci_hcd *hcd, DWORD wanted_type, u64 wanted_ptr,
         if (wanted_ring && xhci_ring_is_cdc(hcd, wanted_ring) &&
             usb_cdc_bulk_io_quiesced)
             return 0;
-        /* Yield so a same-CPU waiter on usb_io_lock can run. */
-        if (wanted_ring && xhci_ring_is_cdc(hcd, wanted_ring) &&
-            (spins & 0x3F) == 0x3F)
+        /* Yield periodically. The CDC-ring wait needs it so a same-CPU
+           waiter on usb_io_lock can run; the command-ring and MSC waits
+           need it for the same reason during an xHCI rebind (hotplug
+           reconnect), otherwise the console thread is wedged for the
+           whole rebind duration and an ELF stream load reads garbage. */
+        if ((spins & 0x7F) == 0x7F)
             taskswitch();
         if (wanted_ring) {
             if (hcd->usbdev_count &&

@@ -1873,6 +1873,14 @@ static void usb_cdc_feed_in(unsigned char *p, int n)
     usb_cdc_feed(p, n);
 }
 
+/* 1 while an ELF stream load / MSC bulk I/O is in flight (console active).
+   The hotplug monitor uses this to defer controller rebinds that would
+   otherwise reset the xHCI controller mid-load and wedge the console. */
+int usb_cdc_bulk_io_active(void)
+{
+    return usb_cdc_bulk_io_quiesced != 0;
+}
+
 int usb_cdc_pump(void)
 {
     int sent = 0;
@@ -2226,6 +2234,13 @@ static void usb_xhci_hotplug_monitor(void)
             reconnect_blocked = 0;
             continue;
         }
+        /* Defer a full MSC reconnect (xhci_stop_hcd + xhci_init_hcd +
+           re-enumeration) while the console is mid-ELF-load / MSC bulk I/O:
+           the rebind resets the controller the load is reading through and
+           wedges the console thread (xhci command-ring/MSC waits). Re-tried
+           once the load finishes and quiesce clears. */
+        if (usb_cdc_bulk_io_active())
+            continue;
         if (reconnect_blocked || ++attach_samples < 3)
             continue;
         attach_samples = 0;

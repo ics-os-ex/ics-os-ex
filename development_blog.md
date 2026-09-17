@@ -1,6 +1,296 @@
 # Development blog
 
+## 2026-09-17 (Manila, UTC+8)
+
+### 09:59 — N150 "cannot run any app": root cause + fix (xHCI rebind wedges console)
+
+Current problem: user reports the N150 laptop will not run *any* app — both
+`nasm.exe` and `vim.exe` fail with `dex23_loader: unidentified executable format`
++ `execp: failed to start`. This is the continuation of the 07:35 xhci-hang work.
+
+Two separate bugs, one per binary:
+- **nasm.exe is a PE32 (Intel 386) binary** (`file` says "PE32 ... for MS
+  Windows, 7 sections"; DOS e_magic is the odd `MZP\0` 0x504D). The x86_64 PE
+  loader **hard-rejects 32-bit PE** (`pe_module.c:729-744`: `Magic==0x10b` →
+  "pe: 32-bit PE is not supported; use ELF64"). So nasm.exe can never load on
+  this kernel regardless of USB state — it is the wrong binary, not a USB bug.
+  Fix = ship an ELF64 nasm (out of scope for this change).
+- **vim.exe is a valid ELF64** (7f454c46, 4 PT_LOAD, all inside the 20 MiB
+  window) and *should* load via `elf64_stream_load`. The N150-specific failure
+  is the one fixed below.
+
+Root cause (the 07:35 diagnosis, now confirmed by reading the wait paths):
+`xhci_next_event` (xhci.c) yielded via `taskswitch()` **only** for a CDC-ring
+wait; the command-ring waits, the control-EP (ep0) waits, and the `xhci_wait32`
+register waits all spun `XHCI_TIMEOUT` (4,000,000) iterations with no yield. On
+the N150 the Pico CDC-ACM console flaps (disconnect→re-enumerate) in-session;
+the `usb_xhci_hotplug_monitor` kthread then fires a full controller reset
+(`usb_xhci_reconnect` → `xhci_stop_hcd` + `xhci_init_hcd` + re-enumeration).
+While that rebind is in flight, the console thread — which services the prompt
+and the `vim.exe` ELF stream load — is wedged for the whole rebind, so the ELF
+stream read fails/truncates → falls to the `vfs_mapfile`+`dex32_loader` mmap
+fallback → "unidentified executable format." Same message for every app.
+
+Fix (committed, 2 files):
+1. `xhci.c` — yield (`taskswitch()`) in `xhci_next_event` for **all** ring
+   waits (was CDC-only), and in `xhci_wait32` register waits. Period is 0x7F
+   (was 0x3F for CDC) to bound scheduler overhead on the hot bulk-transfer path.
+   This lets the console thread run (and drop `usb_io_lock`) while a rebind's
+   command-ring/MSC waits spin, so an ELF load can no longer be wedged.
+2. `uhci.c` — new `usb_cdc_bulk_io_active()` (returns
+   `usb_cdc_bulk_io_quiesced != 0`). The hotplug monitor's full MSC reconnect
+   now `continue`s (defers) while the console is mid-ELF-load / MSC bulk I/O,
+   so the controller is not reset under a live load; the reconnect is retried
+   on the next sample once quiesce clears. (The CDC rebind path added in the
+   07:35 WIP is not in the committed tree; it is gated by the same helper once
+   re-introduced.)
+
+Verification (QEMU, this host):
+- `make test-vim` **PASS** — the full 2.2 MiB vim.exe ELF64 stream-loads and
+  runs (`vim --version` prints "VIM - Vi IMproved" + 9.2) with the new yield.
+- `make test-usb-cdc-console` **PASS** — MSC root intact + CDC console wrote
+  `USB_CDC_CONSOLE_OK` + `ICSOS_VER` (exercises the gated hotplug monitor).
+- `make test-usb-storage-xhci` and `-recovery`: **no NEW failures** from this
+  change. They fail on a pre-existing `cp: open source failed: /icsos/work/
+  UHCISRC.TXT errno=24` (autoexec `cp-posix` runs before `XHCI_HOTPLUG_MONITOR_
+  READY`; `errno=24` is the OS "file not found" value). Confirmed identical on
+  the unmodified baseline (reverted xhci.c/uhci.c, rebuilt, same `errno=24`).
+  That is a separate, older test-timing bug — tracked next.
+
+Remaining: (a) fix the `errno=24` cp timing in the usb-storage test harness /
+autoexec (the `cp-posix` guest app runs before the `/icsos/work/UHCISRC.TXT`
+payload is visible to the guest VFS); (b) rebuild nasm as ELF64; (c) confirm on
+the physical N150 + Pico bridge when it is powered up (currently offline).
+
+### 07:35 — N150: xHCI CDC re-enumeration blocks console; `vim` wedges until xHCI timeout
+
+Current problem: with N150 + Pico bridge live, `vim` typed at the `/icsos/apps/`
+prompt "won't complete until the xhci process times out and completes." Snapshot
+taken first (per user): `ics-os/snapshots/xhci-hang.log` (4530 B ring) +
+`xhci-hang.README`. `/screen`, `/dmesg`, `/status` (kernel RPCs) all 504 at the
+8 s RPC timeout while the block persists — direct confirmation the kernel console
+thread is stalled.
+
+What the log shows (running kernel = OLD build, `CR=0x40f`, compiled 02:49:38 —
+the 8-bit MAC fix is NOT loaded yet):
+- `USB_CDC_CONSOLE_OK` appears **twice** (line 1 boot bind, and again at the tail
+  = line 85) — the Pico CDC console (xHCI device 1) **disconnected and re-enumerated
+  while the user was at the prompt**. That rebind is the "usb enumeration / xhci
+  initialization ongoing" the user sees.
+- Rebind path: `usb_xhci_hotplug_monitor` (uhci.c:2212, kthread) polls port status
+  every 100 ms; on a device change it calls `usb_xhci_reconnect()` → full
+  `xhci_stop_hcd` + `xhci_init_hcd` + re-enumeration, holding
+  `usb_hotplug_transition` the whole time.
+- `xhci_next_event` (xhci.c:678) yields via `taskswitch()` **only** for a CDC-ring
+  wait; command-ring and MSC waits spin `XHCI_TIMEOUT` (250k) × up to 4M inner
+  spins with no yield → the console thread that services the prompt / `vim` ELF
+  load is blocked for the whole rebind duration (the "xhci process times out").
+
+Diagnosis (needs the full 193 KB flash log to confirm, which the bridge does not
+serve over HTTP — only the 4.5 KB in-RAM ring):
+1. Primary: the Pico CDC console is flapping (disconnect→rebind in-session). Likely
+   cause is the Pico-side USB power/reset, or an xHCI port-status polling race that
+   sees a spurious disconnect. Each rebind re-runs the full controller reset and
+   re-enumeration, which stalls the console thread.
+2. Secondary: even a *legit* MSC (thumbdrive) operation can stall the console if
+   the command-ring/MSC path spins without yielding (only CDC-ring yields).
+
+Next: (a) pull the full flash log to see the exact port-status sequence around the
+second `USB_CDC_CONSOLE_OK`; (b) load the NEW kernel (8-bit MAC fix) via
+`scripts/remote-kexec.sh` and re-run `wifiscan`; (c) decide fix — make
+command-ring/MSC waits yield (taskswitch) so a rebind can't wedge the console, and/or
+gate the hotplug rebind so it can't fire while the console is active.
+
+### 04:30 — RTL8821CE bss=0: RX datapath verified, added wifidbg HW-write-pointer probe
+
+Current problem: after the PHY-table fix, `wifiscan` sweeps all 14 channels
+(per-channel `rtw88: channel N RF18=0x...` lines present) and finishes
+`WIFI_SCAN_DONE bss=0 rx_ok=0` — the radio receives **zero** frames.
+Activity: diffed the entire RX datapath against the local Linux rtw88
+reference and confirmed it is byte-correct, so the bug is not the port:
+- RX ring bring-up matches `rtw_pci_rx_ring_init/enable` (RTK_PCI_RXBD_NUM/
+  DESA, RTX_RWPTR_CLR, RTK_PCI_CTRL |= BIT_RST_TRXDMA_INTF|BIT_RX_TAG_EN;
+  HW write-pointer math `(idx & 0x0FFF0000) >> 16`).
+- MAC filters match reference: RXFLTMAP0=0x0FFFFFFF, RXFLTMAP2=0xFFFF,
+  RCR=0xf400220e (= WLAN_RCR_CFG|BIT_APP_PHYSTS, CBSSID_BCN cleared for scan).
+- CR=0x40f confirms all four MAC_TRX_ENABLE (HCI TX/RX + TX/RX DMA) bits set.
+Conclusion: a single post-scan `RXBD_IDX` read is useless (rtw_pci_rx_poll
+writes the read pointer back into the low bits after consuming), so the
+decisive split needs a **live sample of the HW write pointer during a dwell**.
+Added read-only console `wifidbg` (rtw8821ce.c: rtw8821ce_wifidbg): dumps the
+full RX-path register set, then dwells on the current channel 40x50 ms sampling
+`RTK_PCI_RXBD_IDX_MPDUQ[27:16]` **without consuming**. `delta>0` => frames are
+arriving (then suspect RXBD consumption/parse); `delta==0` => nothing arriving
+(analog/RF/RX-DMA/channel path). Kernel builds clean (Kernel64.bin 883424 B,
+`rtw8821ce_wifidbg` @ 0x19dd0a). Next: push via scripts/remote-kexec.sh and run
+`wifidbg`; Pico bridge (192.168.0.176) went offline after the scan (ARP FAILED) —
+needs a physical N150+Pico power-up to continue.
+
+## 2026-09-17 (Manila, UTC+8)
+
+### 06:55 — RTL8821CE bss=0 root cause: MAC_TRX_ENABLE was 4 bits, not 8
+
+Current problem: `wifiscan` returns `WIFI_SCAN_DONE bss=0 rx_ok=0` even though PHY tables are applied,
+the 14-channel sweep runs with per-channel RF tuning, and `MAC_OK CR=0x40f`. RX ring, filters, RCR,
+and the RX descriptor parser all diffed byte-correct against the Linux rtw88 reference.
+
+Root cause (found by diffing `rtw_reg.h` against `references/rtw88/reg.h`): our `MAC_TRX_ENABLE`
+defined only 4 bits (0-3, value `0x0f`). The reference defines **8 bits (0-7)**:
+`HCI_TXDMA(0) | HCI_RXDMA(1) | TXDMA(2) | RXDMA(3) | PROTOCOL_EN(4) | SCHEDULE_EN(5) | MACTXEN(6) |
+MACRXEN(7)`. Our on-device `CR=0x40f` is the fingerprint: the low byte was `0x0f`, i.e. bits
+4,5,6,7 — including **MACRXEN (bit 7), the MAC receive enable** — were never set. With MACRXEN
+clear, the MAC won't process received frames even with the RX DMA engine on, so the HW write pointer
+in `RTK_PCI_RXBD_IDX_MPDUQ` never advances and `rx_ok=0`. This was NOT a PHY-table, DMA-enable, or
+filter problem.
+
+Fix: `kernel/hardware/wifi/rtw88/rtw_reg.h` now defines the full 8-bit `MAC_TRX_ENABLE` (adds
+`BIT_PROTOCOL_EN BIT(4)`, `BIT_SCHEDULE_EN BIT(5)`, `BIT_MACTXEN BIT(6)`, `BIT_MACRXEN BIT(7)`),
+matching `references/rtw88/reg.h:185`. Verified: `rtw_mac.c:57` is the last writer of the REG_CR
+low byte and runs after `FW_OK`; no later path resets bits 4-7.
+
+Also added (this session): a read-only `wifidbg` console command (`rtw8821ce.c` / `console.c`)
+that samples the HW RXBD write pointer `[27:16]` across a 2 s per-channel dwell without consuming the
+RX ring. Post-scan `RXBD_IDX` reads are useless (the poll writes the read pointer back into the low
+bits), so `wifidbg` is the tool to distinguish "radio not receiving" (dwell delta 0) from "frames
+arriving but filtered" (dwell delta > 0).
+
+Verification done: `make -C kernel bzImage` clean (forced recompile of all 9 wifi objects against the
+changed header), `Kernel64.bin` = 883424 bytes (well under the 4 MiB ceiling). `test-rtwphy-unit`
+20/20, `test-rtwfw-unit` 5/5. The earlier skill pitfall ("CR=0x40f proves the RX DMA engine is fine")
+is corrected — `CR=0x40f` is the fingerprint of the missing MACRXEN bit.
+
+Next (hardware needed): the Pico/N150 bridge at `192.168.0.176` is offline (needs a physical power-up);
+once live, `./scripts/remote-kexec.sh <pico-ip>` to load the new kernel, then `/cmd wifiscan` and expect
+`bss>0`. If `bss` is still 0, run `/cmd wifidbg` and read the `WIFI_DBG ... delta=` line to split
+"radio not receiving" from "frames filtered".
+
+### 01:05 — Pico DHCP discovery, hostname, and verified OTA updates
+
+Current problem: the Pico's DHCP address moved from `.174` to `.176`, breaking
+fixed-IP remote scripts; updating firmware also required reconnecting USB.
+Activity: added `scripts/discover-pico.py`, which scans local IPv4 /24 links and
+accepts only the bridge's `/health` signature; `capture-wifi-hw.sh` now uses it
+by default. Pico firmware 0.8 requests DHCP hostname `icsos-pico` and reports it
+in `/health` (router DNS support is optional). Added `POST /update`: SHA-256
+validation, on-device compile check, `/main.py.new` staging, `/main.py.bak`
+rollback, atomic rename, and reset. `scripts/update-pico.py` performs discovery,
+upload, restart, and rediscovery. USB upload wrote 34668 bytes; wrong-digest OTA
+returned HTTP 400; two same-image OTA updates returned the exact SHA-256 and the
+Pico restarted/discovered at `192.168.0.176`. Laptop Wi-Fi testing remains
+paused while the Pico is attached to the build host rather than the N150.
+
+## 2026-09-17 (Manila, UTC+8)
+
+### 10:00 — RTL8821CE PHY parser gate + correct masked writes/RF18 tuning
+
+Current problem: the N150 reached firmware/MAC/RX-ring setup but passive scan
+still returned `bss=0`; the checked-in PHY unit test still assumed a fabricated
+16-byte header/command format and no longer compiled. Investigation against the
+local Linux rtw88 reference found two air-RX blockers: `rtw_write32_mask` treated
+field values as pre-shifted (so crystal/RF fields were programmed incorrectly),
+and channel sweep wrote invented PSEMI/ RF 0x26 values instead of the RTL8821C
+RF18 path.
+
+Activity: replaced the stale test with TAP coverage of the shared flat-pair
+parser against all four real blobs (138/1200/1680/2712 pairs), branch selection,
+SIPI encoding, RF18 composition, RFE BTG selection, and Linux mask semantics.
+Restored shift-to-mask-LSB writes and ported the reference 2.4 GHz RF switch,
+RF18 20 MHz update, LUTDBG/0x64 setup, and XTALX2 toggle. `test-rtwphy-unit`
+(19/19) and `test-rtwfw-unit` (5/5) pass. A clean kernel compile reaches the
+linker but the existing tree exceeds the 4 MiB user-ELF BSS ceiling. Pico/N150
+HTTP is offline, so `WIFI_SCAN_DONE bss=>0` hardware qualification is blocked.
+
 ## 2026-09-15 (Manila, UTC+8)
+
+### 21:50 — N150 remote verify after reboot: EFUSE/MAC/RX_RING OK
+
+Laptop + Pico up (`compiled=21:45:45`, `cdc=1`, `pico=0.7`). Boot log:
+
+- `RTL8821CE_PROBE_OK` @ `1:0.0`, `POWER_OK`, `EFUSE_OK`
+  mac=`3c:3b:ad:9f:b1:36` xtal=`0x27` rfe=`6`
+- `FW_OK`, `MAC_OK` CR=`0x40f` RCR=`0xf400220e`, `RX_RING_OK`
+- `WIFI_REGISTER wlan0`
+- `wifistat`: fw=1 mac=1 rx=1 MCUFW=`0x60c078` RXBD_IDX=`0`
+- `wifiscan`: `WIFI_SCAN_DONE bss=0 rx_ok=0` (expected until BB/RF tables)
+
+Next: file-backed `rtw8821c` PHY tables for air RX / beacons.
+
+### 22:00 — RTL8821CE next steps: efuse + MAC + RX ring + wifiscan
+
+Current problem: FW_OK only; no station MAC, no RX datapath, no scan UI.
+
+Activity: Ported efuse logical dump (PCIE MAC @ 0xd0), post-FW
+`rtw_mac_init_post_fw` (TRX enable, RQPN/pages, AUTO_LLT, RCR promiscuous
+beacons), 32-entry RXBD poll + beacon SSID parse, console `wifiscan`,
+softnet poll hook. Markers: `RTL8821CE_EFUSE_OK`, `MAC_OK`, `RX_RING_OK`,
+`RX_OK`, `WIFI_BEACON`, `PHY_TABLES_TODO`. Kernel builds. Pico HTTP at
+192.168.0.174 is down — remote verify blocked until Pico/N150 are up;
+`make usb-etcher` then remote-kexec or flash.
+
+### 21:30 — RTL8821CE driver + wifi_dev framework
+
+Ported Dual-BSD/GPL rtw88 subset: PCI BAR2 map, 8821C power seq,
+reserved-page+DDMA firmware download, `wifi_dev` registration as
+`wlan0`. Firmware blob staged at `base/firmware/rtw88/rtw8821c_fw.bin`.
+Boot after root mount prints `RTL8821CE_PROBE_OK` / `POWER_OK` /
+`FW_OK|MISSING|FAIL`. Console `wifistat`. Host TAP `test-rtwfw-unit`.
+Raised BSS ceiling to `0x3F8000`. Scan/assoc/TX/RX still TODO.
+Etcher image rebuilt for N150 flash / remote-kexec.
+
+### 20:40 — N150 remote Wi-Fi capture: RTL8821CE
+
+Laptop up (`compiled=20:32:41`, `cdc=1`). `capture-wifi-hw.sh` → one
+network device: `PCI 1:0.0 10ec:c821` (Realtek RTL8821CE), BAR2
+`0x80500000`, MSI+PCIe. Saved under `ics-os/wifi-hw-capture-n150/`.
+Also confirmed xHCI `8086:54ed` at `0:20.0`.
+
+### 20:35 — Wi-Fi hardware capture path + Etcher image
+
+Added `pciwifi`/`wifi` and `pci` console dumps (safe empty-slot walk,
+BARs + caps + subsystem IDs), `scripts/capture-wifi-hw.sh` over Pico
+`/cmd`→`/log`, host TAP extensions for class helpers, and N150 doc
+recipe. Etcher: `ics-os-uefi.img` (`compiled=` ~20:32). After flash and
+CONSOLE_READY, run `./scripts/capture-wifi-hw.sh`.
+
+### 22:15 — TCP windowing + netbench throughput gate
+
+Current problem: measure stack performance and keep it in the expected QEMU
+SLIRP band after RTL8139/netcfg/telnetd work.
+Activity: TCP pipelines 2 KiB UNA / 1 KiB RX (BSS-capped), advertises real
+`rcv_wnd`, does not advance `rcv_nxt` past buffer space, passive CLOSE_WAIT,
+UNA drain before FIN. `contrib/netbench` + `scripts/netbench_host.py`;
+`test-netbench` / `test-netbench-rtl8139`. Measured host sink ~50 Mbit/s
+(virtio and rtl8139); gate requires host ≥20 Mbit/s + guest `NETBENCH_PASS`.
+`test-net` still PASS.
+
+### 21:55 — ifconfig/route + telnetd remote shell
+
+Current problem: no userspace net configuration, and no remote login path.
+Activity: `sys_netcfg` (0xCF) get/set addr/gw/up/down; `ifconfig.exe` /
+`route.exe`; `sys_dup2` (0xD0) with sock refcounts so stdio can be a TCP
+socket; `printf` routes via `write(1)`; `telnetd.exe` on `:23` (NVT, refuse
+options) runs a line REPL (`echo`/`ifconfig`/`route`/execp). Gates:
+`NET_IFCONFIG_OK`/`NET_ROUTE_OK`/`NET_TELNETD_OK` in `test-net`.
+
+### 21:15 — RTL8139 NIC + TCP pad trim + SMP netstress
+
+Current problem: bring up a real PCI NIC (RTL8139) to full stack parity with
+virtio-net, including concurrent user-smp stress.
+Activity: C-mode driver (`rtl8139.c`) on I/O BAR0 + INTx; QEMU gates
+`test-net-rtl8139` / `test-net-stress-rtl8139`. TCP failed until IPv4 trimmed
+frames to `total_len` (QEMU pads short frames to 60B; pad was advancing
+`rcv_nxt`). Stress needed device-locked RX harvest, bounded PCI scan, host
+echo servers that stay up under concurrency, and dropping `net_lock` during
+socket recv poll waits. Virtio `test-net` / `test-net-stress` still PASS.
+
+### 20:10 — Softnet timer, TCP RTO retransmit, DNS A
+
+Current problem: production gaps after httpd/nc were lossy TCP (no data
+retransmit), unattended DHCP timers, and no name resolution.
+Activity: `softnet` kthread drives `tcp_timer` + `dhcp_service`; TCP keeps
+one unacked segment with RTO/backoff and drop-inject selftest
+(`NET_TCP_REXMIT_OK`); `dns.c` A queries against host stub `:5353`
+(`NET_DNS_OK`); `tcp_pcb_bind` honored on connect.
 
 ### 19:55 — Follow-ons: nc + DHCP T1/T2 timer FSM
 
