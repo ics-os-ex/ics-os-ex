@@ -112,7 +112,7 @@ For an Intel N150 laptop (64-bit UEFI, typically no CSM), build a GPT EFI System
 $ make usb-etcher
 ```
 
-Then open `ics-os/ics-os-uefi.img` or `ics-os/ics-os-uefi.img.zip` in Etcher and flash the whole thumb drive. Disable Secure Boot. `make test-usb-uefi-gpt` is the OVMF q35 xHCI gate. `make test-vbox-uefi-gpt` / `make test-vbox-uefi-gpt-bios` and `make test-bochs-uefi-gpt` boot the same image in VirtualBox (EFI and BIOS) and Bochs (BIOS).
+Then open `ics-os/ics-os-uefi.img` or `ics-os/ics-os-uefi.img.zip` in Etcher and flash the whole thumb drive. Disable Secure Boot. The image includes the in-OS GCC toolchain (`gcc`, `cc1`, `as`, `ld`, `ar`, `objcopy`, `make`, `tcc`) plus SDK runtime objects. `make test-usb-uefi-gpt` is the OVMF q35 xHCI gate. `make test-vbox-uefi-gpt` / `make test-vbox-uefi-gpt-bios` and `make test-bochs-uefi-gpt` boot the same image in VirtualBox (EFI and BIOS) and Bochs (BIOS).
 
 For Intel N150 hardware, capacity sizing, safe flashing, emulator evidence, and
 the remaining xHCI blockers, see [Intel N150 USB boot and working-storage readiness](ics-os/docs/intel-n150-usb-readiness.md).

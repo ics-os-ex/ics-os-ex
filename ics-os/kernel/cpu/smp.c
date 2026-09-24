@@ -320,6 +320,7 @@ void smp_repair_stale_current(void)
     /* Never clear a FOREIGN on_cpu; that claim belongs to the owner. */
     if (cur->on_cpu == me)
         cur->on_cpu = -1;
+    ps_current_anom_log("repair", me, idle);
     cpus[me].current = idle;
     {
         static volatile unsigned long repair_n;
@@ -333,24 +334,29 @@ void smp_repair_stale_current(void)
 
 /* Drop a leftover advertisement without saving that PCB from this RSP.
    FOREIGN on_cpu is left alone (the owner still has the claim).
-   Cert 248136: leftover make on CPU 0 while disk_mgr.on_cpu==0. */
-void smp_abandon_leftover_current(void)
+   Cert 248136: leftover make on CPU 0 while disk_mgr.on_cpu==0.
+   A claim this CPU still holds is NOT cleared here.  The timer is still
+   on that task's stack; clearing on_cpu let another CPU context_load it
+   (fatwrite-coop torn slot 0x100000003, UD64 at context_switch).  The
+   caller passes the returned PCB to context_load_release. */
+PCB386 *smp_abandon_leftover_current(void)
 {
     int me = smp_cpu_id();
-    PCB386 *idle, *cur;
+    PCB386 *idle, *cur, *held;
 
     if (me < 0 || me >= MAX_CPUS)
-        return;
+        return 0;
     idle = (PCB386 *)cpus[me].idle;
     cur = (PCB386 *)cpus[me].current;
     if (!idle || !cur || cur == idle)
-        return;
-    if (cur->on_cpu == me)
-        cur->on_cpu = -1;
+        return 0;
+    held = (cur->on_cpu == me) ? cur : 0;
+    ps_current_anom_log("abandon", me, idle);
     cpus[me].current = idle;
     if (idle->on_cpu < 0)
         idle->on_cpu = me;
     __sync_synchronize();
+    return held;
 }
 
 void smp_cpu_idle(void) {
@@ -374,13 +380,14 @@ void smp_cpu_idle(void) {
     }
     if (idle && cur && cur != idle &&
         !ctx_load_in_progress[me] && !ps_switchto_in_progress[me]) {
-        if (cur->on_cpu == me)
+       if (cur->on_cpu == me)
             cur->on_cpu = -1;
-        cpus[me].current = idle;
-        if (idle->on_cpu < 0)
-            idle->on_cpu = me;
-        __sync_synchronize();
-    }
+         ps_current_anom_log("idle", me, idle);
+         cpus[me].current = idle;
+         if (idle->on_cpu < 0)
+             idle->on_cpu = me;
+         __sync_synchronize();
+     }
 idle_loop:
     for (;;) {
         __asm__ __volatile__("sti; hlt");

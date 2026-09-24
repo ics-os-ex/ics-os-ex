@@ -45,7 +45,7 @@ int main(void)
    int i;
 
    printf("TAP version 13\n");
-   printf("1..103\n");
+   printf("1..107\n");
 
    on_cpu = -1;
    for (i = 0; i < 8; i++)
@@ -315,6 +315,17 @@ int main(void)
    check("dest'd claimed idle on CPUIRQ is not leftover_load_only",
          !leftover_idle_claimed_user_cr3_load_only(
             1, 0, 0, 0x7E22000UL, MEM_CPUIRQ_BASE + 0x1000UL));
+
+   /* Idle PCBs are 0xFFFF0000|cpu.  Publishing CPU 3's idle on CPU 0 is
+      the CUR-ANOM / FORK-FAIL parent=-65533 exit migration. */
+   check("idle owner of 0xFFFF0003 is cpu 3",
+         idle_pcb_owner(0xFFFF0003ul) == 3);
+   check("cpu 0 must not adopt cpu 3 idle",
+         foreign_idle_pid(0, 0xFFFF0003ul));
+   check("cpu 3 may adopt its own idle",
+         !foreign_idle_pid(3, 0xFFFF0003ul));
+   check("a user pid is not a foreign idle",
+         idle_pcb_owner(35) < 0 && !foreign_idle_pid(0, 35));
 
    return g_ok ? 0 : 1;
 }

@@ -1,26 +1,26 @@
 @echo off
-rem msvcrt.dll + ramdisk.dll are obsolete/legacy: the kernel now provides
-rem /ramdisk natively and the in-OS toolchain is ELF64 (no PE runtime).
-copy /icsos/apps/crt1.o /ramdisk/crt1.o
-copy /icsos/apps/tccsdk.o /ramdisk/tccsdk.o
-copy /icsos/apps/libtcc1.o /ramdisk/libtcc1.o
-copy /icsos/apps/posix.o /ramdisk/posix.o
-copy /icsos/apps/setjmp.o /ramdisk/setjmp.o
-pcut rd: /ramdisk/
-cls
-cd icsos
-set PATH=/icsos/apps
-set SDK_HOME=/icsos/tcc1
+' Dist/etcher autoexec: no USB file copies at boot. On Intel ADL-N, MSC
+' reads race the CDC hotplug pump and hang forever in fcopy. SDK .o files
+' stay on /icsos/apps; gcc.exe links them from there.
 @echo
 @echo  ICS-OS Distribution
 @echo    Compilers : gcc  cc1  as  ld  ar  objcopy  make  tcc  nasm
 @echo    Editors   : vim  ed
 @echo    Tools     : cp  rm  mkdir  pak  lzozip  hxdmp  sh
 @echo    SDK       : /icsos/tcc1 (headers+libc)   /icsos/include (POSIX)
+@echo    Runtime   : /icsos/apps/*.o (no boot-time ramdisk seed)
 @echo
 @echo  Try:  cd apps
 @echo        gcc hello.c -o hello
 @echo        hello
 @echo
-@echo  Type "help" for the command list.
+@echo  Type "help" for the command list.  Type "sh" for the POSIX shell.
+@echo  Large apps (vim ~2MiB) load from USB; Ctrl-C aborts a hung exec,
+@echo  F4 force-kills the foreground, C-b c opens a fresh kernel prompt.
+@echo
+pcut rd: /ramdisk/
+cd icsos
+set PATH=/icsos/apps
+set SDK_HOME=/icsos/tcc1
+@echo PATH=/icsos/apps  SDK_HOME=/icsos/tcc1
 @echo

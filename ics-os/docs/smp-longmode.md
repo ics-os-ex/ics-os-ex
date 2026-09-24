@@ -89,7 +89,17 @@ Default scheduler is **priority round-robin** (`process/scheduler.c`):
   when this invariant breaks — that line is the fastest way to identify the
   class of "random" kernel corruption on APs. `make test-stress-user-smp` is
   the gate. The last-resort successor in `self_exit_current()` must be this
-  CPU's own idle task, force-claimed. `&sPCB` is a *single global* `PCB386`
+  CPU's own idle task, force-claimed. `on_cpu` is cleared only after RSP
+  has moved to the successor (`context_load_release`). Clearing it while
+  the timer is still on that task's stack lets another CPU enter the same
+  stack (fatwrite-coop torn slot `0x100000003`, `UD64` at `context_switch`).
+  Exit closes files and takes
+  `processmgr_busy` with interrupts enabled, so a timer can migrate the
+  exit onto another CPU before a successor is chosen. The cpu id used to
+  claim the parent and to publish `current` is sampled only after that
+  window, with interrupts off. A foreign idle (`processid 0xFFFF0000|cpu`,
+  printed as a negative pid such as -65533) must not be published or
+  loaded: that is `CUR-ANOM` / `FORK-FAIL parent=-65533`. `&sPCB` is a *single global* `PCB386`
   with one `ctx.rsp`, so two CPUs falling back to it resume one context on one
   stack. The signature of any shared-stack bug is a 64-bit stack slot whose
   high half holds another CPU's 32-bit `smp_cpu_id()` result: a return address

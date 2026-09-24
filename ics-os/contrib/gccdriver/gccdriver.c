@@ -40,8 +40,8 @@
  * Driver-only:       -c  -o<n>  -nostdlib
  * Tool selection:    -B<prefix>  (cc1.exe/as.exe/ld.exe under prefix)
  * When linking (no -c), the SDK runtime -- the ICS-OS "libc"
- * (crt1/tccsdk/libtcc1/posix/setjmp .o's in RTDIR) -- is linked in
- * automatically unless -nostdlib is given.
+ * (crt1/tccsdk/libtcc1/posix/setjmp .o's under /ramdisk or /icsos/apps) --
+ * is linked in automatically unless -nostdlib is given.
  */
 #include <stdio.h>
 #include <string.h>
@@ -54,7 +54,8 @@
 
 #define TOOLDIR_WORK "/work/apps"  /* cert / SMP make -jN */
 #define TOOLDIR_CD   "/icsos/apps" /* gccdrv smoke (no /work) */
-#define RTDIR        "/ramdisk"    /* SDK runtime .o's for gccdrv smokes */
+#define RTDIR_RAM    "/ramdisk"    /* SDK runtime .o's when seeded */
+#define RTDIR_APPS   "/icsos/apps" /* default on etcher (no boot-time seed) */
 /* Intermediate temps are named per-process: the driver is invoked concurrently
    by `make -jN`, so a fixed shared path would let parallel jobs clobber each
    other's cc1/as scratch files. The concrete names are built in main() from
@@ -87,15 +88,44 @@ static const char *gccdrv_tmpdir(void)
    return have_work_cc1() ? "/work" : "/ramdisk";
 }
 
-/* The SDK runtime ("libc") linked in automatically when linking (no -c). */
-static const char *sdkrt[] = {
-   RTDIR "/crt1.o",
-   RTDIR "/tccsdk.o",
-   RTDIR "/libtcc1.o",
-   RTDIR "/posix.o",
-   RTDIR "/setjmp.o",
-   0
-};
+/* Prefer /ramdisk when autoexec/gccdrv seeded it; else link from /icsos/apps
+   so etcher boots need no MSC copy into ramdisk. */
+static const char *gccdrv_rtdir(void)
+{
+   static const char *dir;
+   static int cached = 0;
+   int fd;
+   if (cached)
+      return dir;
+   fd = open(RTDIR_RAM "/crt1.o", O_RDONLY);
+   if (fd >= 0) {
+      close(fd);
+      dir = RTDIR_RAM;
+   } else
+      dir = RTDIR_APPS;
+   cached = 1;
+   return dir;
+}
+
+/* Filled once in main() from gccdrv_rtdir(). */
+static char sdk_crt1[64], sdk_tccsdk[64], sdk_libtcc1[64], sdk_posix[64], sdk_setjmp[64];
+static const char *sdkrt[6];
+
+static void gccdrv_init_sdkrt(void)
+{
+   const char *r = gccdrv_rtdir();
+   sprintf(sdk_crt1, "%s/crt1.o", r);
+   sprintf(sdk_tccsdk, "%s/tccsdk.o", r);
+   sprintf(sdk_libtcc1, "%s/libtcc1.o", r);
+   sprintf(sdk_posix, "%s/posix.o", r);
+   sprintf(sdk_setjmp, "%s/setjmp.o", r);
+   sdkrt[0] = sdk_crt1;
+   sdkrt[1] = sdk_tccsdk;
+   sdkrt[2] = sdk_libtcc1;
+   sdkrt[3] = sdk_posix;
+   sdkrt[4] = sdk_setjmp;
+   sdkrt[5] = 0;
+}
 
 #define MAXOPTS 128
 static char *cc1optargv[MAXOPTS]; static int cc1nopts = 0;
@@ -203,9 +233,174 @@ static int check_out(const char *path, int wantelf)
       }
       for (i = 0; i < 20000; i++) { }
    }
-   printf("gccdriver: output unavailable after retries: %s\n", path);
-   return -1;
+  printf("gccdriver: output unavailable after retries: %s\n", path);
+    return -1;
 }
+
+/* On `as` failure, save the assembly that was fed to it under a fixed clean
+   8.3 name.  The per-pid .s LFN is subject to the FAT LFN-padding name
+   corruption, so it cannot be retrieved reliably by its original name; a
+   simple name lets the host pull the file and run its own `as` to read the
+   real errors (the guest's `as` stderr is lost to serial corruption). */
+static void keep_asm(const char *src)
+{
+   const char *dst = "/work/KEEP.S";
+   int in, out, n, w, k;
+   long sz, off;
+   char buf[4096];
+   in = open(src, O_RDONLY);
+   if (in < 0) { printf("gccdriver: keep_asm open %s failed\n", src); return; }
+   sz = lseek(in, 0, SEEK_END);
+   lseek(in, 0, SEEK_SET);
+   out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0);
+   if (out < 0) { printf("gccdriver: keep_asm create %s failed\n", dst); close(in); return; }
+   off = 0;
+    {
+       long rfirst = -1;
+       char buf2[4096];
+       while (off < sz) {
+          n = read(in, buf, sizeof(buf));
+          if (n <= 0) break;
+          /* Read-determinism on the source: re-read the same [off,off+n)
+             range and compare. If the two reads of the SAME on-disk bytes
+             disagree, the read path is non-deterministic (the as failure and
+             the keep divergence are a read bug, not a write bug). */
+          if (rfirst < 0) {
+             lseek(in, off, SEEK_SET);
+             {
+                int r2 = (int)read(in, buf2, (size_t)n);
+                if (r2 < 0) r2 = 0;
+                for (k = 0; k < n && k < r2; k++)
+                   if (buf[k] != buf2[k]) { rfirst = off + k; break; }
+             }
+             lseek(in, off + n, SEEK_SET);
+          }
+          w = 0;
+          while (w < n) { k = write(out, buf + w, (size_t)(n - w)); if (k <= 0) break; w += k; }
+          off += n;
+       }
+       if (rfirst >= 0)
+          printf("GCC_DRV_RDDET src read NON-DETERMINISTIC at %ld\n", rfirst);
+       else
+          printf("GCC_DRV_RDDET src read deterministic (keep_asm path, %ld bytes)\n", off);
+    }
+    close(in);
+      fsync(out);
+      close(out);
+      printf("gccdriver: saved asm %s -> %s (%ld bytes)\n", src, dst, sz);
+
+    /* Read-path determinism probe: re-read the ORIGINAL and the saved copy
+       and compare. If the two independent guest reads disagree, the read path
+       is corrupting data (non-deterministic); if they agree, the on-disk .s is
+       exactly what the guest reads and the `as` failure is not a read race. */
+    {
+       int a = open(src, O_RDONLY);
+       int b = open(dst, O_RDONLY);
+       long lo, lb, first = -1;
+       int ba = 0, bb = 0;
+       char ca[4096], cb[4096];
+       if (a >= 0 && b >= 0) {
+          lo = lseek(a, 0, SEEK_END); lseek(a, 0, SEEK_SET);
+          lb = lseek(b, 0, SEEK_END); lseek(b, 0, SEEK_SET);
+          {
+             long off = 0;
+             while (off < lo && first < 0) {
+                int na = (int)read(a, ca, sizeof(ca));
+                int nb = (int)read(b, cb, sizeof(cb));
+                int nn = na < nb ? na : nb;
+                int i;
+                if (na <= 0 || nb <= 0) break;
+                for (i = 0; i < nn; i++) {
+                   if (ca[i] != cb[i]) { first = off + i; ba = ca[i]; bb = cb[i]; break; }
+                }
+                off += nn;
+             }
+          }
+          close(a); close(b);
+          if (lo != lb)
+             printf("GCC_DRV_PROBE len mismatch src=%ld keep=%ld\n", lo, lb);
+          if (first < 0)
+              printf("GCC_DRV_PROBE read deterministic (%ld bytes match)\n", lo);
+           else {
+              int da, db;
+              long lo2;
+              printf("GCC_DRV_PROBE read CORRUPT at offset %ld: src=0x%x keep=0x%x\n",
+                     first, (unsigned)(ba & 0xff), (unsigned)(bb & 0xff));
+              lo2 = first > 48 ? first - 48 : 0;
+              da = open(src, O_RDONLY); db = open(dst, O_RDONLY);
+              if (da >= 0 && db >= 0) {
+                 char la[129], lb2[129];
+                 lseek(da, lo2, SEEK_SET); lseek(db, lo2, SEEK_SET);
+                 int nla = (int)read(da, la, 128); int nlb = (int)read(db, lb2, 128);
+                 if (nla < 0) nla = 0; if (nlb < 0) nlb = 0;
+                 la[nla < 128 ? nla : 128] = 0; lb2[nlb < 128 ? nlb : 128] = 0;
+                 printf("GCC_DRV_PROBE src@%ld: %s\n", lo2, la);
+                 printf("GCC_DRV_PROBE keep@%ld: %s\n", lo2, lb2);
+              }
+              if (da >= 0) close(da);
+              if (db >= 0) close(db);
+           }
+          }
+       }
+
+     /* 32KB-vs-4096 read-path differential. GAS reads the .s in 32768-byte
+        chunks (input-file.c BUFFER_SIZE), which on this FAT16 work volume is
+        exactly two 16KB clusters -- a multi-cluster loadfile12EX2 path the
+        4096-byte probe above (<=1 cluster) never exercises. Read the SAME saved
+        file two ways: 32768-byte chunks (GAS's path) and 4096-byte chunks
+        (known-good single-cluster path). A mismatch isolates a multi-cluster
+        kernel FAT/iomgr read bug; a match means the read path is clean and the
+        as failure is in GAS line parsing. */
+     {
+        int r32 = open(dst, O_RDONLY);
+        int r4  = open(dst, O_RDONLY);
+        long rl;
+        if (r32 >= 0 && r4 >= 0) {
+           rl = lseek(r32, 0, SEEK_END);
+           if (rl > 0 && rl < (1<<24)) {
+              char *b32 = (char*)malloc((size_t)rl);
+              char *b4  = (char*)malloc((size_t)rl);
+              if (b32 && b4) {
+                 long o32 = 0, o4 = 0, first = -1;
+                 lseek(r32, 0, SEEK_SET);
+                 while (o32 < rl) {
+                    int n = (int)read(r32, b32 + o32, 32768);
+                    if (n <= 0) break;
+                    o32 += n;
+                 }
+                 lseek(r4, 0, SEEK_SET);
+                 while (o4 < rl) {
+                    int n = (int)read(r4, b4 + o4, 4096);
+                    if (n <= 0) break;
+                    o4 += n;
+                 }
+                 printf("GCC_DRV_RDIFF len 32KB=%ld 4096=%ld\n", o32, o4);
+                 if (o32 == o4 && o32 > 0) {
+                    for (; o4 < rl && first < 0; o4++)
+                       if (b32[o4] != b4[o4]) first = o4;
+                    if (first < 0)
+                       printf("GCC_DRV_RDIFF 32KB==4096 (%ld bytes; read path clean)\n", o4);
+                    else
+                       printf("GCC_DRV_RDIFF MISMATCH at %ld: 32KB=0x%x 4096=0x%x\n",
+                              first, (unsigned)(b32[first]&0xff), (unsigned)(b4[first]&0xff));
+                 }
+                 free(b32); free(b4);
+              } else printf("GCC_DRV_RDIFF malloc failed\n");
+           }
+           close(r32); close(r4);
+        }
+     }
+
+      /* The `as` child wrote its real diagnostics to /work/ASERR.txt (its fd1/fd2
+        were dup2'd onto that file). It has exited by now, so flush the file to
+        the block device: the autoexec `reboot` is a hard QEMU reset that never
+        syncs, and without this the FAT dir entry + iomgr tail are lost and the
+        host sees a 0-byte ASERR.txt. */
+     {
+        int ef = open("/work/ASERR.txt", O_RDONLY);
+        if (ef >= 0) { fsync(ef); close(ef); printf("gccdriver: ASERR.txt fsync done\n"); }
+     }
+ }
 
 /* Child status is checked by run_tool(). Keep an additional non-empty output
    check for frontends terminated before they can flush an assembly file. Empty
@@ -244,6 +439,7 @@ int main(int argc, char **argv)
    int have_out = 0;
    int is_s = 0;
 
+   gccdrv_init_sdkrt();
    sprintf(cc1path, "%s/cc1.exe", gccdrv_tooldir());
    sprintf(aspath, "%s/as.exe", gccdrv_tooldir());
    sprintf(ldpath, "%s/ld.exe", gccdrv_tooldir());
@@ -370,15 +566,31 @@ int main(int argc, char **argv)
    }
 
    /* ---- phase 2: as (GAS) assembles into an ELF64 object ---- */
-   unlink(objsrc);
-   asargv[0] = aspath;
-   asargv[1] = "--64";
-   asargv[2] = is_s ? inc : ts_name;
-   asargv[3] = "-o";
-   asargv[4] = objsrc;
-   asargv[5] = 0;
-   if (run_tool(aspath, asargv)) die("as spawn");
-   if (check_out(objsrc, 1) < 0) die("as: no object");
+    unlink(objsrc);
+    asargv[0] = aspath;
+    asargv[1] = "--64";
+    asargv[2] = is_s ? inc : ts_name;
+    asargv[3] = "-o";
+    asargv[4] = objsrc;
+    asargv[5] = 0;
+    {
+       /* Redirect the `as` stdout+stderr to a file so its real diagnostics
+          survive. The child shares the serial console and the SDK printf is
+          char-at-a-time, so the `as` error lines are otherwise mangled by
+          serial batching (the message text after "Error:" is lost). dup2 the
+          file onto fd 1 and fd 2; the spawned child inherits both. The
+          driver's own printf happens outside this window, so it still reaches
+          the serial console. */
+       int errfd = open("/work/ASERR.txt", O_WRONLY|O_CREAT|O_TRUNC, 0);
+       int saved_out = (errfd >= 0) ? dup(1) : -1;
+       int saved_err = (errfd >= 0) ? dup(2) : -1;
+       if (errfd >= 0) { dup2(errfd, 1); dup2(errfd, 2); close(errfd); }
+       int asrc = run_tool(aspath, asargv);
+       if (saved_out >= 0) { dup2(saved_out, 1); close(saved_out); }
+       if (saved_err >= 0) { dup2(saved_err, 2); close(saved_err); }
+       if (asrc) { keep_asm(is_s ? inc : ts_name); die("as spawn"); }
+    }
+     if (check_out(objsrc, 1) < 0) { keep_asm(is_s ? inc : ts_name); die("as: no object"); }
    if (!is_s)
       unlink(ts_name);
    printf("gccdriver: as ok\n");

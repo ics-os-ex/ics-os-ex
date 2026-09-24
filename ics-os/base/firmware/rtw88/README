@@ -1,0 +1,10 @@
+# Realtek rtw88 firmware for ICS-OS
+
+File: `rtw8821c_fw.bin` (RTL8821CE / 8821C)
+
+Source: linux-firmware `rtw88/rtw8821c_fw.bin`
+Licence: Redistributable. See linux-firmware WHENCE entry for rtw88 and
+`LICENCE.rtlwifi_firmware.txt` in the linux-firmware project.
+
+Placed on the boot ESP as `/icsos/firmware/rtw88/rtw8821c_fw.bin` when
+`base/` is staged into the image (`make usb-etcher`).

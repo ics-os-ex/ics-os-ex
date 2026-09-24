@@ -750,10 +750,30 @@ static void work_mount_vblk(void)
        return;
     }
     if (vfs_mount_device("fat", "vblk", "work") == -1)
-       printf("work: mount failed\n");
-    else
-       printf("work: mounted\n");
- }
+        printf("work: mount failed\n");
+     else
+        printf("work: mounted\n");
+    }
+
+    /* Mount the USB mass-storage build partition (usb0p1) at /work when a
+    partitioned USB MSC disk is present. The xHCI selfhost-cert attaches a
+    two-partition USB stick: usb0p0 is the OS root (mounted /icsos above) and
+    usb0p1 is the writable GCC build tree (gccsrc/, seed/, apps/) that the
+    in-OS compiler closure reads and writes. The whole disk is USB, so the
+    GCC build compiles off xHCI USB storage instead of virtio-blk. Skips
+    cleanly (prints a note) when the build partition is absent, so the
+    virtio-blk and single-partition USB-root tests are unaffected. */
+    static void work_mount_usb(void)
+    {
+     if (!usb_storage_available())
+        return;
+     if (devmgr_finddevice("usb0p1") == -1)
+        return;
+     if (vfs_mount_device("fat", "usb0p1", "work") == -1)
+        printf("work: USB build partition (usb0p1) mount failed\n");
+     else
+        printf("work: mounted USB build partition (usb0p1)\n");
+    }
 
 /*This function is the first function that is called by the taskswitcher
  see process/process.c
@@ -975,9 +995,9 @@ void dex_init(){
       if (!mounted)
          printf("Warning: no root filesystem mounted (continuing).\n");
       else
-         printf("Root mount [OK]\n");
+          printf("Root mount [OK]\n");
 
-      /* Wi-Fi after VFS root so firmware can load from /icsos/firmware. */
+       /* Wi-Fi after VFS root so firmware can load from /icsos/firmware. */
       printf("Initializing RTL8821CE Wi-Fi...\n");
       rtw8821ce_init();
 
@@ -1012,8 +1032,9 @@ void dex_init(){
          block forever in usb_cdc_pump after Root mount, which used to
          leave GOP stuck there with no prompt. */
       if (mounted)
-         ramdisk_mount();
-      work_mount_vblk();
+          ramdisk_mount();
+       work_mount_vblk();
+       work_mount_usb();
 
       /* Unpark APs after root mount; console remains BSP-pinned. */
       if (mounted && cpu_count > 1) {
@@ -1048,6 +1069,7 @@ void dex_init(){
        select the right terminfo and emit the CSI sequences the kernel VT
        interpreter understands. */
     env_setenv("TERM", "xterm", 1);
+    env_setenv("TERMCAP", "/icsos/etc/termcap", 1);
     env_setenv("COLUMNS", "80", 1);
     env_setenv("LINES", "25", 1);
 

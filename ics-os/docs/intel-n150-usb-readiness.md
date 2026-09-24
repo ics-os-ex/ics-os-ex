@@ -16,7 +16,9 @@ For Intel N150-class laptops (64-bit UEFI, typically no CSM) flash
 `ics-os-uefi.img` instead. That image is a GPT disk with a protective MBR and
 one FAT32 EFI System Partition that holds `EFI/BOOT/BOOTX64.EFI`. Build it
 with `make usb-etcher` (also writes `ics-os-uefi.img.zip` for Balena Etcher).
-`make test-usb-uefi-gpt` boots that image under OVMF on q35 xHCI.
+That image includes the dist toolchain (`gcc`/`cc1`, `as`/`ld`/`ar`/`objcopy`,
+`make`, `tcc`, SDK runtime objects, ldscripts). `make test-usb-uefi-gpt`
+boots that image under OVMF on q35 xHCI.
 
 On the physical N150, GRUB may print `error: serial port 'com0' isn't found`.
 That is expected (no COM0). After `Loading ICS-OS (multiboot2)...` the kernel
@@ -49,11 +51,130 @@ the panel). 1920x1080 is 3x2 (full width, letterbox top/bottom).
 
 This image skips AP bring-up without COM1 (BSP only), skips the extra CPUID
 in `smp_rdtscp_available`, and programs the LAPIC timer via x2APIC MSRs
-(`lapic_present()`). Pico/ESP32 serial bridges need a real 16550 COM1 header;
-a USB plug is not COM1.
+(`lapic_present()`). virtio-blk probe on this laptop is bus 0 only and
+skips empty/non-MF PCI functions. On no-COM1 laptops the virtio PCI scan
+is skipped entirely (`virtio-blk: skip pci scan`) — even bus 0 alone could
+freeze ~half the boots at `virtio-blk: pci bus 0`. Pico UART bridges still need a 16550 COM1 header; a USB
+plug is not COM1. ICS-OS xHCI CDC-ACM host can take the console from a Pico
+plugged in as a USB serial gadget (`USB_CDC_CONSOLE_OK`). The Pico Wi-Fi
+HTTP API (`GET /v1`, `/health`, `/version`, `/status`, `/screen`, `/fb.ppm`, `POST /cmd`,
+`/keys`, `/kexec`, `/reboot`) is the agent remote-debug path; telnet :23
+forwards keystrokes over USB as well as UART.
+
+`GET /health` does not need kernel RPC. It reports `pico=` (bridge firmware)
+and `kernel=` (the `ICSOS_VER` bind stamp scraped from `/log`, or `none` if
+the laptop booted an image older than that stamp). `compiled=` on that line
+is `__DATE__`/`__TIME__` of the kernel object, so two dirty-tree etcher
+builds are distinguishable even when git hash is unchanged.
+
+```bash
+curl http://192.168.0.174/health
+curl http://192.168.0.174/version
+```
+
+### Remote kernel update (skip thumb-drive reflash)
+
+Once the Pico bridge is up and CDC RPC answers `/status`, push a new
+kernel over Wi-Fi instead of rebuilding `ics-os-uefi.img` and re-etching:
+
+```bash
+cd ics-os
+make -C kernel bzImage
+./scripts/remote-kexec.sh    # or curl --data-binary @kernel/Kernel64.bin http://PICO/kexec
+```
+
+Flow: Pico `POST /kexec` → CDC `KEXEC` → `kexec_load_mem` → ACK →
+`kexec_reboot`. The image runs from RAM; `/vmdex` on the USB ESP is
+**not** rewritten during this path (MSC persist wedged N150 mid-reboot).
+Cold boot still needs `make usb-etcher` (or a future quiet file-PUT)
+until persist is restored. Cap 8 MiB; allow a few minutes for transfer.
+Verify with `/status` (`kexeced=1`, `compiled=`) after the target comes
+back.
+
+### Capture laptop Wi-Fi / NIC PCI IDs
+
+There is still no Wi-Fi driver. To collect the exact PCI IDs, BARs, and
+capability list for eventual support, flash an image that includes the
+`pciwifi` / `pci` console commands, then dump over the Pico bridge:
+
+```bash
+cd ics-os
+make usb-etcher          # flash ics-os-uefi.img
+# after CONSOLE_READY + CDC STATUS ok:
+./scripts/capture-wifi-hw.sh 192.168.0.174
+# or interactively:  pciwifi   then   pci
+```
+
+`pciwifi` (alias `wifi`) prints only PCI class `0x02` (network) and
+`0x0D` (wireless) with `WIFI_HW_BEGIN`/`END` markers. `pci` dumps every
+present function (empty slots skipped — same N150-safe policy as xHCI).
+The capture script saves `wifi-hw.txt`, `pci-hw.txt`, `/health`, and
+`/status` under `wifi-hw-capture-<UTC>/`. Do not auto-run this from
+`autoexec.bat` on ADL-N.
+
+**Captured on this N150 (2026-09-15):** one Wi-Fi NIC at `PCI 1:0.0`
+`10ec:c821` — Realtek **RTL8821CE** 802.11ac (`class=0280`, BAR2
+`0x80500000`, MSI+PCIe caps). Linux reference driver: `rtw88_8821ce`.
+Artifacts: `ics-os/wifi-hw-capture-n150/`. No ethernet-class NIC on PCI.
+
+### RTL8821CE driver (bring-up)
+
+ICS-OS includes a Dual-BSD/GPL-derived rtw88 subset under
+`kernel/hardware/wifi/rtw88/` plus a thin `wifi_dev` framework
+(`kernel/net/wifi.c`). After root mount the kernel probes the card,
+powers the MAC, and loads `/icsos/firmware/rtw88/rtw8821c_fw.bin`
+(linux-firmware redistributable blob staged from `base/firmware/`).
+
+Boot markers to look for (serial / Pico `/log`):
+
+| Marker | Meaning |
+|--------|---------|
+| `RTL8821CE_PROBE_OK` | PCI found, BAR2 MMIO live (`SYS_CFG1` readable) |
+| `RTL8821CE_POWER_OK` | `card_enable_flow_8821c` power-on succeeded |
+| `RTL8821CE_FW_OK` | Firmware downloaded; `REG_MCUFW_CTRL` matches `FW_READY` |
+| `RTL8821CE_FW_MISSING` | Firmware file not on ESP |
+| `RTL8821CE_FW_FAIL` | Download / checksum / ready poll failed |
+| `RTL8821CE_PHY_OK` | MAC/AGC/BB/RF tables loaded and applied |
+| `WIFI_REGISTER wlan0` | `wifi_dev` registered |
+
+Console: `wifistat` (driver state), `wifiscan` (2.4 GHz passive scan), and
+`pciwifi` (PCI dump). Firmware, efuse, RX descriptors, file-backed PHY tables,
+and reference RF18 20 MHz channel tuning are implemented. Association, secured
+station operation, TX, and Wi-Fi/netif integration remain incomplete. A scan is
+qualified only when N150 serial reports `WIFI_SCAN_DONE bss=>0`; QEMU cannot
+model this device.
+
+**Console after Root mount:** older etcher images could leave GOP stuck on
+`Root mount [OK]` because `usb_cdc_pump` ran on the init thread before the
+console existed (with or without the Pico). Current images print
+`CONSOLE_READY` after a light autoexec (PATH/SDK only — **no** boot-time
+`copy` into `/ramdisk`, which hung on ADL-N MSC while CDC was pumping),
+start xHCI hotplug only after that, leave Caps Lock off for tmux keys, and
+drop to a kernel prompt (type `sh` for the POSIX shell). Dist/etcher
+`gcc.exe` links SDK `.o` files from `/icsos/apps` when `/ramdisk` has none.
+Large apps (`vim.exe` ~2 MiB) stream from USB; if the console freezes,
+**Ctrl-C** aborts the wait, **F4** force-kills the foreground, **C-b c**
+opens a fresh kernel prompt. Pico `/status` must stay up across repeated
+`ls` / MSC: do **not** Stop-EP the posted CDC IN at each BOT (Intel
+ADL-N wedges CDC RX after a few cancel cycles). Event-ring stash keeps
+MSC waits from stealing CDC completions. After each MSC sector, only
+**arm/take** CDC IN (`usb_cdc_after_msc`) — a full 40k-spin
+`usb_cdc_pump` per block hung `hello.exe` stream loads. ELF stream
+loads call `usb_cdc_bulk_io_begin/end` (quiesce CDC; take completed IN
+only — do not abandon a live TRB). After each MSC sector unlock,
+`usb_cdc_after_msc` re-arms IN so Pico `/status` survives repeated `ls`.
 
 **Next on this laptop:** qualify physical xHCI USB root and writable `/icsos`.
-Do not re-enable APs until MADT is parsed.
+Intel ADL-N xHCI is `8086:54ed` at `PCI 0:20.0`, BAR `0x6001100000` (64 KiB,
+above 4 GiB), 34 scratchpads, 16 ports. A previous flash mapped it and saw
+CCS on ports 4/5/8, then `control timeout request=6` on the first bound
+device (GET_DESCRIPTOR) and hotplug `device reconnect failed`. This image restores the PORTSC reset that enabled ports 4/5 (no PRC-clear),
+posts control TDs the way Intel xHCI requires (Setup Chain clear; first TRB
+cycle inverted until Data/Status are written), and tries every CCS port.
+Look for `usb: vid=` / `MSC on port` / `[OK]`. `ccs=0x99` is ports 1, 4, 5, 8.
+
+Num Lock during USB probe; Caps+Num returns after it finishes. Do not
+re-enable APs until MADT is parsed.
 
 `make test-vbox-uefi-gpt` and `make test-vbox-uefi-gpt-bios` boot it in
 VirtualBox EFI and BIOS. `make test-bochs-uefi-gpt` boots it under Bochs
@@ -310,7 +431,7 @@ production-grade N150 laptop experience:
 | Graphics | GOP handoff via GRUB `gfxterm` + `gfxpayload=keep`; kernel late-maps write-combining GOP after the scheduler on no-COM1; QEMU still maps early for `FBCONSOLE_PASS` | Physical N150 1920x1200 panel must show a centered `ICS-OS` bar after Caps+Num; `test-usb-uefi-gpt` still only proves OVMF GOP |
 | Input | Legacy keyboard/mouse assumptions | xHCI HID keyboard/touchpad support or laptop-specific PS/2 validation |
 | Internal storage | IDE and virtio paths do not cover typical NVMe hardware | NVMe queues, DMA, MSI-X, flush/FUA, timeout/reset, and power-loss tests |
-| Networking | RTL8139 does not match typical N150 laptop Ethernet/Wi-Fi | Driver for the exact PCI/USB NIC; Wi-Fi also needs firmware, regulatory, authentication, and crypto support |
+| Networking | N150 has Realtek RTL8821CE (`10ec:c821` at `1:0.0`); bring-up driver in-tree | Prove `RTL8821CE_FW_OK` on hardware; then TX/RX + 802.11 assoc/regdb |
 | Audio | No modern laptop audio stack | PCI/HDA or SoundWire support for the exact hardware |
 | Reliability | FAT has no journal and current recovery coverage is limited | Clean shutdown, durable metadata ordering, corruption detection/repair, removal and power-loss testing |
 | Security | No production Secure Boot/IOMMU posture | IOMMU-backed DMA isolation, least-privilege drivers, signed updates, and threat-model validation |

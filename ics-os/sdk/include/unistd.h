@@ -47,10 +47,10 @@ int dup(int oldfd);
 int dup2(int oldfd, int newfd);
 int pipe(int fd[2]);
 int umask(int mask);
-int getuid(void);
-int geteuid(void);
-int getgid(void);
-int getegid(void);
+uid_t getuid(void);
+uid_t geteuid(void);
+gid_t getgid(void);
+gid_t getegid(void);
 int mkstemp(char *template);
 int ftruncate(int fd, off_t length);
 

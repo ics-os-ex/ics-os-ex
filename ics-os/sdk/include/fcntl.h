@@ -1,6 +1,11 @@
 #ifndef _FCNTL_H
 #define _FCNTL_H
 
+#include <sys/types.h>   /* off_t, pid_t (used by struct flock) */
+
+/* struct flock below uses off_t/pid_t. */
+#include <sys/types.h>
+
 #define O_RDONLY        0x0000
 #define O_WRONLY        0x0001
 #define O_RDWR          0x0002
@@ -29,6 +34,22 @@
 #define F_SETLKW        7
 
 #define FD_CLOEXEC      1
+
+/* POSIX record locking (flock(2)-style struct for fcntl F_SETLK/F_SETLKW).
+   The ICS-OS fcntl stubs treat locks as advisory no-ops (single-user OS), so
+   these constants/struct exist for API compatibility (e.g. NetHack's
+   USE_FCNTL lock_file()). */
+#define F_RDLCK 0
+#define F_WRLCK 1
+#define F_UNLCK 2
+
+struct flock {
+   short l_type;
+   short l_whence;
+   off_t l_start;
+   off_t l_len;
+   pid_t l_pid;
+};
 
 int open(const char *path, int flags, ...);
 int creat(const char *path, int mode);

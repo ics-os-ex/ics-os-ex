@@ -1132,17 +1132,17 @@ char *fgets(char *s,int n,file_PCB *fhandle)
         for (i=0;i<n-1;i++)
         {
 
-            if (fread(&c,1,1,fhandle)!=0)
+           if (fread(&c,1,1,fhandle)!=0)
             {
                 s[i]=c;
                 if (c=='\n')
-                break;
+                    break;
             }
-            else 
+            else
             /*EOF reached?*/
             {
-                s[i+1]=0;  
-                return  0;      
+                s[i]=0;
+                return i ? s : 0;
                 break;
             };
         };

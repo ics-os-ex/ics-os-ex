@@ -1,0 +1,37 @@
+# ICS-OS termcap for the built-in 80x25 VT100/xterm console.
+#
+# The kernel sets TERM=xterm at boot (kernel/kernel32.c) and the console is a
+# fixed 80x25 DDL-backed VT100/xterm interpreter (kernel/console/tty_vt.c) that
+# supports CUP/CUU/ED/EL/SGR (colors 30-37/40-47/90-97, bold, underline,
+# reverse), DSR-6, and the ?1049 alternate screen. NetHack's built-in termcap
+# library (sys/share/tclib.c) reads this file at startup; the capabilities
+# below are a standard xterm entry trimmed to what the VT actually renders.
+#
+# co/li are also obtained at runtime via TIOCGWINSZ (sys_ttyioctl returns 80x25);
+# they are listed here as a fallback.
+xterm|ICS-OS 80x25 VT100/xterm console:\
+	:am:bs:eo:km:xn:xn:\
+	:co#80:li#25:\
+	:cl=\E[2J:\
+	:cm=\E[%i%d;%dH:\
+	:cr=\r:\
+	:le=\b:\
+	:nd=\E[C:\
+	:up=\E[A:\
+	:do=\E[B:\
+	:ce=\E[K:\
+	:cd=\E[J:\
+	:ho=\E[H:\
+	:vi=\E[?25l:\
+	:ve=\E[?25h:\
+	:me=\E[0m:\
+	:so=\E[1m:se=\E[0m:\
+	:us=\E[4m:ue=\E[0m:\
+	:md=\E[1m:\
+	:mr=\E[7m:\
+	:mb=\E[5m:\
+	:mh=\E[2m:\
+	:as=\016:ae=\017:\
+	:cs=\E[%i%d;%dr:\
+	:ti=\E[?1049h:te=\E[?1049l:\
+	:ks=\E[?1h\E>:ke=\E[?1l\E<:

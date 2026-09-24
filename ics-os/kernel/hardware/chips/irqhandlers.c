@@ -232,7 +232,7 @@ static void exc_noerr_report(const char *tag, unsigned long *frame)
       owner = ps_find_by_cr3(cr3);
       if (owner && owner->accesslevel == ACCESS_USER) {
          int me = smp_cpu_id();
-         if (me >= 0 && me < MAX_CPUS)
+         if (me >= 0 && me < MAX_CPUS && owner->on_cpu == me)
             cpus[me].current = owner;
          user_fault = 1;
       }
@@ -552,7 +552,7 @@ void setdefaulthandlers(){
    setinterruptvector(3,dex_idtbase,0x8E,
                         breakpoint,SYS_CODE_SEL);
 
-   setinterruptvector(1,dex_idtbase,0x8E,
+  setinterruptvector(1,dex_idtbase,0x8E,
                         debug_error,SYS_CODE_SEL);
 
    setinterruptvector(0x30,dex_idtbase,0xEE,

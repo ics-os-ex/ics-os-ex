@@ -82,6 +82,13 @@ context_switch:
 /* Ring-3 note: CTX_CS/SS are saved for a future iretq path. Today we
    ret to kernel CS; user processes record USER_CODE in PCB.usercs. */
 /* Ring-3: CTX_CS/SS saved for a future iretq. Today we `ret` in kernel CS. */
+.globl context_load_release
+context_load_release:
+    /* rdi=ctx, rsi=cpu_id, rdx=&on_cpu.  Release only after RSP switches,
+       same as context_switch.  Clearing on_cpu in C before this call let
+       another CPU enter the stack this CPU was still using. */
+    jmp context_load_from_switch
+
 .globl context_load
 context_load:
     /* rdi=ctx, rsi=cpu_id.  C callers have a garbage rdx; do not release. */

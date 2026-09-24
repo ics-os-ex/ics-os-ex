@@ -579,4 +579,24 @@ static inline int leftover_sys_ud_retarget(int is_idle_pcb,
    return idle_on_user_cr3(0, hw_cr3);
 }
 
+/* Per-CPU idle PCBs are tagged processid 0xFFFF0000|cpu
+   (ap_prepare_idle).  -65533 in a serial log is 0xFFFF0003. */
+static inline int idle_pcb_owner(unsigned long pid)
+{
+   if ((pid & 0xFFFF0000ul) != 0xFFFF0000ul)
+      return -1;
+   return (int)(pid & 0xFFFFul);
+}
+
+/* True when pid names an idle PCB owned by a CPU other than me.
+   Publishing it as cpus[me].current makes the next syscall on me
+   read that idle as current_process (FORK-FAIL parent=-65533). */
+static inline int foreign_idle_pid(int me, unsigned long pid)
+{
+   int own = idle_pcb_owner(pid);
+   if (own < 0)
+      return 0;
+   return own != me;
+}
+
 #endif

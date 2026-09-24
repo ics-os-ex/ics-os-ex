@@ -92,10 +92,23 @@ pages are pinned and kernel-mapped. Run `make test-io-unit`, `make
 test-posixio`, and `make test-virtio`; the guest tests use two virtual CPUs and
 remain focused regression/functional tests rather than exhaustive stress.
 Networking milestones A–C plus Berkeley sockets, SMP netstress, DHCP
-DORA+T1/T2 renew/rebind, `httpd.exe`, and `nc.exe`: `make test-net-unit`,
-`make test-net` (`NET_DHCP_OK`/`NET_DHCP_RENEW_OK`/`NET_DHCP_REBIND_OK`/
-`NET_HTTPD_OK`/`NET_NC_OK`), and `make test-net-stress` (concurrent
-`user-smp` socket hammer → `NETSTRESS_PASS`).
+DORA+T1/T2, TCP RTO retransmit, DNS A, softnet kthread, `httpd.exe`,
+`nc.exe`, userspace `ifconfig`/`route` (`sys_netcfg` 0xCF), and
+`telnetd` (NVT remote shell on `:23` via `dup2` onto sockets):
+`make test-net-unit`, `make test-net` (`NET_DHCP_*`/
+`NET_TCP_REXMIT_OK`/`NET_DNS_OK`/`NET_SOFTNET_OK`/`NET_HTTPD_OK`/`NET_NC_OK`/
+`NET_IFCONFIG_OK`/`NET_ROUTE_OK`/`NET_TELNETD_OK`),
+and `make test-net-stress` (concurrent `user-smp` → `NETSTRESS_PASS`).
+Throughput gate: `make test-netbench` / `test-netbench-rtl8139` runs
+`netbench.exe` (2 MiB TCP TX/RX, UDP echo, RTT) against
+`scripts/netbench_host.py`; guest prints `NETBENCH_PASS`, and the host sink
+wall-clock must stay ≥20 Mbit/s (QEMU SLIRP typically ~30–80 Mbit/s). TCP PCBs
+pipeline up to 2 KiB unacked, advertise a real receive window, and drain UNA
+before FIN.
+Hardware NIC parity: Realtek RTL8139C C-mode (`kernel/hardware/rtl8139`) on
+QEMU `-device rtl8139` with the same stack markers via `make test-net-rtl8139`
+and `make test-net-stress-rtl8139`. IPv4 input trims to `total_len` so
+Ethernet minimum-frame padding is not treated as TCP payload.
 
 POSIX fd lookup must hold the process `fd_lock` until it has acquired a typed
 reference on the VFS, block, or io_uring open description. `sys_close()` first
@@ -304,6 +317,13 @@ After a successful `KEXEC`, the target rewrites `/icsos/vmdex` (else
 `/vmdex`) on the USB ESP before `kexec_reboot`, so cold boot matches the
 live image without re-etching. Host helper: `scripts/remote-kexec.sh`
 (see `docs/intel-n150-usb-readiness.md` and the Pico bridge README).
+For eventual laptop Wi-Fi support, dump PCI network/wireless IDs with
+console `pciwifi` (or `pci` for a full safe walk) and
+`scripts/capture-wifi-hw.sh` over Pico `/cmd`→`/log`.
+RTL8821CE bring-up lives in `kernel/hardware/wifi/rtw88/` (probe/power/efuse/FW/MAC/RX);
+look for `RTL8821CE_PROBE_OK` / `POWER_OK` / `EFUSE_OK` / `FW_OK` / `MAC_OK` /
+`RX_RING_OK` after root mount. Console: `wifistat`, `wifiscan`. Air RX needs
+file-backed BB/RF tables (`RTL8821CE_PHY_TABLES_TODO`).
 `make test-cdcacm-unit`, `make test-usbdbg-unit`,
 `make test-xhcipolicy-unit`, `make test-ttycanon-unit`,
 `make test-usb-cdc-console` (both attach orders), and

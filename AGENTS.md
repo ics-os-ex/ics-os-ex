@@ -74,8 +74,12 @@ Useful individual targets (from `ics-os/`):
 | `test-usb-cdc-pico` | Physical Pico 2 W (`2e8a:0005`) via QEMU `usb-host` on q35 xHCI; curls Pico Wi-Fi for `USB_CDC_CONSOLE_OK`, `ICSOS_VER`, `pico=`, `USB_CDC_RX`, and `STATUS cdc=1`/`release=`. SKIP if the gadget is not plugged into the host |
 | `test-posixio` | POSIX fds + preadv/pwritev/fsync + io_uring; ramdisk `POSIXIO_PASS`/`URING_PASS`; virtio `/dev/vblk` `URING_VBLK_PASS` |
 | `test-virtio` | QEMU virtio-blk DMA; MSI-X completions; `VIRTIO_BLK_OK` + `VIRTIO_IRQ_OK` |
-| `test-net` | QEMU virtio-net + SLIRP; DHCP DORA+T1/T2 + TCP RTO rexmit + DNS A + softnet kthread + ICMP/UDP/TCP + sockets (`netecho`/`httpd`/`nc`); `NET_DHCP_*`/`NET_TCP_REXMIT_OK`/`NET_DNS_OK`/`NET_SOFTNET_OK`/`NET_SOCK_*`/`NET_HTTPD_OK`/`NET_NC_OK` |
+| `test-net` | QEMU virtio-net + SLIRP; DHCP DORA+T1/T2 + TCP RTO rexmit + DNS A + softnet kthread + ICMP/UDP/TCP + sockets (`netecho`/`httpd`/`nc`) + `ifconfig`/`route` + `telnetd`; `NET_DHCP_*`/`NET_TCP_REXMIT_OK`/`NET_DNS_OK`/`NET_SOFTNET_OK`/`NET_SOCK_*`/`NET_HTTPD_OK`/`NET_NC_OK`/`NET_IFCONFIG_OK`/`NET_ROUTE_OK`/`NET_TELNETD_OK` |
+| `test-net-rtl8139` | Same stack gate on QEMU `-device rtl8139` (C-mode I/O BAR + INTx); `RTL8139_OK`/`RTL8139_IRQ_OK` plus full `NET_*`/`NET_SOCK_*`/`NET_HTTPD_OK`/`NET_NC_OK`/`NET_IFCONFIG_OK`/`NET_ROUTE_OK`/`NET_TELNETD_OK` |
 | `test-net-stress` | KVM `-smp 4` + `user-smp`; forked concurrent TCP/UDP socket clients (`netstress.exe`); `NETSTRESS_PASS` + `USER_RUN cpu=[1-7]`; no PF/GPF |
+| `test-net-stress-rtl8139` | Same netstress gate on rtl8139; `RTL8139_OK` + `NETSTRESS_PASS` + `USER_RUN cpu=[1-7]` |
+| `test-netbench` | Virtio-net 2 MiB TCP TX/RX + UDP echo + RTT microbench (`netbench.exe`); guest `NETBENCH_PASS` (≥10 Mbit/s floors) and host sink wall-clock ≥20 Mbit/s (expected SLIRP band) |
+| `test-netbench-rtl8139` | Same netbench gate on rtl8139; `RTL8139_OK` + `NETBENCH_PASS` + host sink ≥20 Mbit/s |
 | `test-net-unit` | Host TAP for checksum / ARP / ICMP / UDP / TCP / sockaddr / DHCP / DNS helpers (`tests/net_*_unit.c`) |
 | `test-ext4` | ext4 virtio-blk read/create/write; guest marker plus host `e2fsck`/`debugfs` validation of the post-test image |
 | `test-spawn` | `posix_spawn` + `waitpid` of `hello.exe` (`SPAWN_PASS`); FAT `/work` on virtio (`WORK_DISK_PASS`) |
@@ -90,6 +94,7 @@ Useful individual targets (from `ics-os/`):
 | `test-bintools` | In-OS GNU binutils: `as` assembles, `ar` archives, `ld` links a default-script ELF64, then it execs (`AS_PASS`/`AR_PASS`/`LD_PASS`/`BINTOOLS_PASS`) |
 | `test-vim` | FEAT_TINY vim ELF64 TUI; non-interactive `vim --version` prints the real banner + exits cleanly |
 | `test-dup` | Runtime `dup(2)` (`0xC5`) self-test: dup'd tty fd allocable+closable; dup'd file fd write read back through the original (`DUPT_PASS`) |
+| `test-nethack` | NetHack 3.6.7 TTY smoke test: loads `nethack.exe` from the CD, finds `termcap`, reaches the copyright banner and `Who are you?` prompt, and exits cleanly; no GPF/PF |
 | `test-partition-unit` | Host-native TAP unit tests for partition-layer logic: IEEE CRC-32 vectors/chunking and ATA LBA28/LBA48 capacity decode (`tests/partition_unit.c`) |
 | `test-fbconsole-unit` | Host-native TAP for GOP/VBE pitch, late map, PAT-WC, 80x25 origin, and per-axis zoom (`tests/fbconsole_geom_unit.c`) |
 | `test-kbdleds-unit` | Host-native TAP for i8042 boot-stage Caps/Num/Scroll encoding (`tests/kbd_boot_leds_unit.c`) |
@@ -108,7 +113,8 @@ Useful individual targets (from `ics-os/`):
 | `test-netdns-unit` | Host-native TAP for DNS query build / A-record parse (`tests/net_dns_unit.c`) |
 | `test-usbdbg-unit` | Host-native TAP for the CDC debug RPC line parser, KEYS hex, SCREEN dump, PPM size, and ICSOS_VER bind/STATUS stamps (`tests/usb_debug_unit.c`) |
 | `test-ttycanon-unit` | Host-native TAP for canonical tty read remainder (`tests/tty_canon_unit.c`) |
-| `test-pciscan-unit` | Host-native TAP for PCI slot function-count (empty slots skip fn 1-7; `tests/pci_scan_unit.c`) |
+| `test-pciscan-unit` | Host-native TAP for PCI slot function-count (empty slots skip fn 1-7) and Wi-Fi/network class helpers (`tests/pci_scan_unit.c`) |
+| `test-rtwfw-unit` | Host-native TAP for RTL8821C firmware header validation (`tests/rtw_fw_hdr_unit.c`) |
 | `test-bridge-console-unit` | Host-native TAP for the ESP32 debug-bridge LCD line buffer (`tests/bridge_console_unit.c`) |
 | `test-vfsgrow-unit` | Host-native TAP for VFS `vfs_units_covering` (exact cluster-size grow; `tests/vfs_grow_unit.c`) |
 | `test-smpclaim-unit` | Host-native TAP for the one-PCB-one-CPU claim/publish protocol, crit nest tokens, and `irq_kstack_dest` (process kstack top only from the user stack; `tests/smp_claim_unit.c`) |

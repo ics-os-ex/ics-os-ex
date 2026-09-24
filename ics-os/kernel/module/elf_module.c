@@ -932,9 +932,10 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
                mapok = 0;
                break;
             }
-            if (fread(pagebuf, (int)len, 1, f) != (int)len) {
+            /* One fseek+fread per page: len <= 4096 covers the whole page. */
+            if (fread(pagebuf, (size_t)len, 1, f) != (int)len) {
                printf("elf64-stream: fread fail %s off=%llu len=%llu\n",
-                      module_name, fileoff, len);
+                      module_name, fileoff, (unsigned long long)len);
                mapok = 0;
                break;
             }

@@ -50,6 +50,7 @@ int putchar(int c);
 int puts(const char *s);
 int getchar(void);
 char *gets(char *buf);
+int fscanf(FILE *f, const char *fmt, ...);
 int remove(const char *path);
 int rename(const char *oldpath, const char *newpath);
 void perror(const char *s);

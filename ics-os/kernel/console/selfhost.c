@@ -844,10 +844,10 @@ static int gmake_self_rebuild(void)
 static int gccselfhost_run(void)
 {
    file_PCB *f;
-   extern volatile int selfhost_cooperative_ready;
-   selfhost_cooperative_ready = 1;
-   gkb_tinit();
-   printf("gccself: rebuilding GCC with GNU Make inside ICS-OS\n");
+    extern volatile int selfhost_cooperative_ready;
+    selfhost_cooperative_ready = 1;
+    gkb_tinit();
+    printf("gccself: rebuilding GCC with GNU Make inside ICS-OS\n");
    printf("GCC_SELF_BEGIN\n");
    printf("GCC_SELF_ORCHESTRATOR GNU_MAKE_3_82\n");
   /* Parallel self-host: fan the 349 cc1 objects out across the online CPUs.

@@ -20,6 +20,10 @@ typedef struct __attribute__((aligned(16))) _fpu_state {
 void context_switch(cpu_context *old, cpu_context *newctx,
                     volatile int *release_on_cpu, int cpu_id);
 void context_load(cpu_context *ctx, int cpu_id);
+/* Like context_load, then stores -1 through release_on_cpu after RSP
+   has moved to the successor.  release_on_cpu may be NULL. */
+void context_load_release(cpu_context *ctx, int cpu_id,
+                          volatile int *release_on_cpu);
 void ctx_load_check(cpu_context *ctx);
 void fpu_save(fpu_state *s);
 void fpu_restore(fpu_state *s);

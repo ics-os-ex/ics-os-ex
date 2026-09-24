@@ -26,6 +26,8 @@
 #include <sys/select.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <net/if.h>
+#include <regex.h>
 
 extern unsigned long dexsdk_systemcall(int function_number,long p1,long p2,
                   long p3,long p4,long p5);
@@ -80,6 +82,8 @@ extern void exit(int status);
 #define FXN_RECV    0xCC
 #define FXN_SENDTO  0xCD
 #define FXN_RECVFROM 0xCE
+#define FXN_NETCFG   0xCF
+#define FXN_DUP2     0xD0
 #define FXN_DELAY 0x9B
 #define FXN_PRECISTIME 0x96
 
@@ -465,23 +469,181 @@ unsigned long long strtoull(const char *nptr, char **endptr, int base)
    return (unsigned long long)strtoul(nptr, endptr, base);
 }
 
+static long long parse_int(const char **pp, int base)
+{
+   const char *p = *pp;
+   long long v = 0;
+   int neg = 0;
+   while (isspace((unsigned char)*p)) p++;
+   if (*p == '-') { neg = 1; p++; }
+   else if (*p == '+') p++;
+   if (base == 16 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+      p += 2;
+   while (isxdigit((unsigned char)*p)) {
+      int d;
+      char c = *p;
+      if (c >= '0' && c <= '9') d = c - '0';
+      else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+      else d = c - 'A' + 10;
+      v = v * base + d;
+      p++;
+   }
+   *pp = p;
+   return neg ? -v : v;
+}
+
+static unsigned long long parse_uint(const char **pp, int base)
+{
+   const char *p = *pp;
+   unsigned long long v = 0;
+   while (isspace((unsigned char)*p)) p++;
+   if (*p == '+') p++;
+   if (base == 16 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+      p += 2;
+   while (isxdigit((unsigned char)*p)) {
+      int d;
+      char c = *p;
+      if (c >= '0' && c <= '9') d = c - '0';
+      else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+      else d = c - 'A' + 10;
+      v = v * base + d;
+      p++;
+   }
+   *pp = p;
+   return v;
+}
+
+static int match_ws(const char **pp)
+{
+   const char *p = *pp;
+   while (isspace((unsigned char)*p)) p++;
+   *pp = p;
+   return 1;
+}
+
+static int parse_str(const char **pp, char *dst, int max)
+{
+   const char *p = *pp;
+   int n = 0;
+   while (isspace((unsigned char)*p)) p++;
+   while (*p && !isspace((unsigned char)*p) && n < max - 1)
+      dst[n++] = *p++;
+   dst[n] = 0;
+   *pp = p;
+   return n;
+}
+
 int sscanf(const char *str, const char *fmt, ...)
 {
-   /* Minimal: "%d.%d" used by tcc_new() for TCC_VERSION. */
    va_list ap;
-   int *a, *b;
-   (void)fmt;
+   int count = 0;
+   const char *p, *f;
+   int consumed = 0;
+
+   if (!str || !fmt) return -1;
+   p = str;
+   f = fmt;
    va_start(ap, fmt);
-   a = va_arg(ap, int *);
-   b = va_arg(ap, int *);
-   va_end(ap);
-   *a = 0; *b = 0;
-   if (str) {
-      *a = atoi(str);
-      while (*str && *str != '.') str++;
-      if (*str == '.') *b = atoi(str + 1);
+
+   while (*f && *p) {
+      if (isspace((unsigned char)*f)) {
+         match_ws(&p);
+         f++;
+         continue;
+      }
+      if (*f != '%') {
+         if (*p == *f) { p++; f++; consumed++; }
+         else break;
+         continue;
+      }
+      f++;
+      if (*f == '%') {
+         if (*p == '%') { p++; f++; consumed++; }
+         else break;
+         continue;
+      }
+      /* Parse conversion specifier */
+      {
+         int longcnt = 0, base = 10, is_uint = 0, is_hex = 0;
+         char conv = 0;
+         while (*f == 'l') { longcnt++; f++; }
+         if (*f == 'x' || *f == 'X') { is_hex = 1; base = 16; conv = *f; f++; }
+         else if (*f == 'd' || *f == 'i') { conv = *f; f++; }
+         else if (*f == 'u') { is_uint = 1; conv = *f; f++; }
+         else if (*f == 's') { conv = *f; f++; }
+         else if (*f == 'c') { conv = *f; f++; }
+         else if (*f == 'n') { conv = *f; f++; break; }
+         else if (*f == '*') { f++; /* skip: consume but don't assign */
+            /* re-detect after * */
+            while (*f == 'l') { longcnt++; f++; }
+            if (*f == 'x' || *f == 'X') { is_hex = 1; base = 16; conv = *f; f++; }
+            else if (*f == 'd' || *f == 'i') { conv = *f; f++; }
+            else if (*f == 'u') { is_uint = 1; conv = *f; f++; }
+            else if (*f == 's') { conv = *f; f++; }
+            else if (*f == 'c') { conv = *f; f++; }
+            else break;
+         }
+         else break;
+
+        if (conv == 'n') {
+            int *np = va_arg(ap, int *);
+            *np = consumed;
+            continue;
+         }
+         if (conv == 's') {
+            char *sp = va_arg(ap, char *);
+            if (parse_str(&p, sp, 256) > 0) count++;
+            consumed++;
+            continue;
+         }
+         if (conv == 'c') {
+            char *cp = va_arg(ap, char *);
+            *cp = *p;
+            p++;
+            count++;
+            consumed++;
+            continue;
+         }
+         if (is_hex || conv == 'x' || conv == 'X') base = 16;
+
+         {
+            void *arg = va_arg(ap, void *);
+            if (is_uint) {
+               unsigned long long val;
+               const char *tmp = p;
+               val = (unsigned long long)parse_uint(&tmp, base);
+               if (tmp != p) {
+                  if (longcnt >= 2)
+                     *(unsigned long long *)arg = val;
+                  else if (longcnt == 1)
+                     *(unsigned long *)arg = (unsigned long)val;
+                  else
+                     *(unsigned int *)arg = (unsigned int)val;
+                  p = tmp;
+                  count++;
+                  consumed++;
+               }
+            } else {
+               long long val;
+               const char *tmp = p;
+               val = parse_int(&tmp, base);
+               if (tmp != p) {
+                  if (longcnt >= 2)
+                     *(long long *)arg = val;
+                  else if (longcnt == 1)
+                     *(long *)arg = (long)val;
+                  else
+                     *(int *)arg = (int)val;
+                  p = tmp;
+                  count++;
+                  consumed++;
+               }
+            }
+         }
+      }
    }
-   return 2;
+   va_end(ap);
+   return count;
 }
 
 int execvp(const char *file, char *const argv[])
@@ -734,6 +896,38 @@ int tcsetattr(int fd, int optional_actions, const struct termios *termios_p)
 int tcflush(int fd, int queue_selector)
 {
     return (int)ics_sys(FXN_TCFUSH, fd, queue_selector, 0, 0, 0);
+}
+
+/*
+ * POSIX speed accessors.  ICS-OS has no real serial line, so the baud field
+ * in c_cflag is always 0; these simply read/write that field so that
+ * termios-based applications (e.g. NetHack's speednum()) work correctly.
+ * c_cflag is the 3rd unsigned int in struct termios (offset 16).
+ */
+speed_t cfgetospeed(const struct termios *termios_p)
+{
+    if (!termios_p) return (speed_t)0;
+    return (speed_t)(termios_p->c_cflag & 0x01f);
+}
+
+speed_t cfgetispeed(const struct termios *termios_p)
+{
+    if (!termios_p) return (speed_t)0;
+    return (speed_t)(termios_p->c_cflag & 0x01f00);
+}
+
+int cfsetospeed(struct termios *termios_p, speed_t speed)
+{
+    if (!termios_p) { errno = 22; return -1; }
+    termios_p->c_cflag = (termios_p->c_cflag & ~0x01f) | ((unsigned int)speed & 0x01f);
+    return 0;
+}
+
+int cfsetispeed(struct termios *termios_p, speed_t speed)
+{
+    if (!termios_p) { errno = 22; return -1; }
+    termios_p->c_cflag = (termios_p->c_cflag & ~0x01f00) | (((unsigned int)speed & 0x01f) << 8);
+    return 0;
 }
 
 /*
@@ -1185,12 +1379,93 @@ int fseek(FILE *f, long off, int whence)
    return 0;
 }
 
+#define SDK_ENV_CACHE_SLOTS 32
+#define SDK_ENV_NAME_MAX 64
+#define SDK_ENV_VALUE_MAX 512
+
+struct sdk_env_cache_entry {
+    int used;
+    char name[SDK_ENV_NAME_MAX];
+    char value[SDK_ENV_VALUE_MAX];
+};
+
+static struct sdk_env_cache_entry sdk_env_cache[SDK_ENV_CACHE_SLOTS];
+static int sdk_env_cache_rr;
+
+static int sdk_env_cache_find(const char *name)
+{
+    int i;
+    for (i = 0; i < SDK_ENV_CACHE_SLOTS; i++)
+        if (sdk_env_cache[i].used && !strcmp(sdk_env_cache[i].name, name))
+            return i;
+    return -1;
+}
+
+static int sdk_env_cache_alloc(const char *name)
+{
+    int i;
+    for (i = 0; i < SDK_ENV_CACHE_SLOTS; i++)
+        if (!sdk_env_cache[i].used)
+            return i;
+    i = sdk_env_cache_rr % SDK_ENV_CACHE_SLOTS;
+    sdk_env_cache_rr++;
+    return i;
+}
+
+void sdk_env_cache_set(const char *name, const char *value)
+{
+    int i;
+    size_t len;
+    if (!name || strlen(name) >= SDK_ENV_NAME_MAX)
+        return;
+    if (!value) {
+        i = sdk_env_cache_find(name);
+        if (i >= 0)
+            sdk_env_cache[i].used = 0;
+        return;
+    }
+    i = sdk_env_cache_find(name);
+    if (i < 0)
+        i = sdk_env_cache_alloc(name);
+    strcpy(sdk_env_cache[i].name, name);
+    len = strlen(value);
+    if (len >= SDK_ENV_VALUE_MAX)
+        len = SDK_ENV_VALUE_MAX - 1;
+    memcpy(sdk_env_cache[i].value, value, len);
+    sdk_env_cache[i].value[len] = 0;
+    sdk_env_cache[i].used = 1;
+}
+
 char *getenv(const char *name)
 {
-   static char buf[512];
-   if (!dexsdk_systemcall(0x9F, (long)name, (long)buf, 0, 0, 0))
-      return 0;
-   return buf;
+    static char fallback[SDK_ENV_VALUE_MAX];
+    char tmp[SDK_ENV_VALUE_MAX];
+    int i;
+    size_t len;
+    if (!name)
+        return 0;
+    i = sdk_env_cache_find(name);
+    if (i >= 0)
+        return sdk_env_cache[i].value;
+    if (!dexsdk_systemcall(0x9F, (long)name, (long)tmp, 0, 0, 0))
+        return 0;
+    if (strlen(name) >= SDK_ENV_NAME_MAX) {
+        len = strlen(tmp);
+        if (len >= SDK_ENV_VALUE_MAX)
+            len = SDK_ENV_VALUE_MAX - 1;
+        memcpy(fallback, tmp, len);
+        fallback[len] = 0;
+        return fallback;
+    }
+    i = sdk_env_cache_alloc(name);
+    strcpy(sdk_env_cache[i].name, name);
+    len = strlen(tmp);
+    if (len >= SDK_ENV_VALUE_MAX)
+        len = SDK_ENV_VALUE_MAX - 1;
+    memcpy(sdk_env_cache[i].value, tmp, len);
+    sdk_env_cache[i].value[len] = 0;
+    sdk_env_cache[i].used = 1;
+    return sdk_env_cache[i].value;
 }
 
 int machine_reboot(void)
@@ -1391,10 +1666,10 @@ int umask(int mask)
    return 022;
 }
 
-int getuid(void) { return 0; }
-int geteuid(void) { return 0; }
-int getgid(void) { return 0; }
-int getegid(void) { return 0; }
+uid_t getuid(void) { return 0; }
+uid_t geteuid(void) { return 0; }
+gid_t getgid(void) { return 0; }
+gid_t getegid(void) { return 0; }
 
 /*
  * No uname/hostname facility in the kernel; report a fixed identity. The name
@@ -1416,10 +1691,7 @@ int gethostname(char *name, size_t len)
 
 int dup2(int oldfd, int newfd)
 {
-   (void)oldfd;
-   (void)newfd;
-   errno = ENOSYS;
-   return -1;
+   return (int)ics_sys(FXN_DUP2, oldfd, newfd, 0, 0, 0);
 }
 
 void perror(const char *s)
@@ -1463,16 +1735,32 @@ int mkstemp(char *template)
    return fd;
 }
 
+static struct passwd sdk_passwd;
+static const char sdk_pw_name[] = "icsos";
+static const char sdk_pw_dir[] = "/icsos";
+
+static struct passwd *
+sdk_passwd_entry(void)
+{
+    sdk_passwd.pw_name = (char *)sdk_pw_name;
+    sdk_passwd.pw_dir = (char *)sdk_pw_dir;
+    sdk_passwd.pw_uid = 0;
+    sdk_passwd.pw_gid = 0;
+    return &sdk_passwd;
+}
+
 struct passwd *getpwnam(const char *name)
 {
-   (void)name;
-   return 0;
+    if (!name || strcmp(name, sdk_pw_name) != 0)
+        return 0;
+    return sdk_passwd_entry();
 }
 
 struct passwd *getpwuid(uid_t uid)
 {
-   (void)uid;
-   return 0;
+    if ((uid_t)uid != 0)
+        return 0;
+    return sdk_passwd_entry();
 }
 
 int atexit(void (*fn)(void))
@@ -1979,4 +2267,587 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
    (void)flags;
    return (ssize_t)ics_sys(FXN_RECVFROM, fd, (long)buf, (long)len,
                            (long)addr, (long)addrlen);
+}
+
+int netcfg_get(struct netcfg_info *info)
+{
+   return (int)ics_sys(FXN_NETCFG, NETCFG_GET, (long)info, 0, 0, 0);
+}
+
+int netcfg_set_addr(unsigned int ip, unsigned int mask, unsigned int gw)
+{
+   return (int)ics_sys(FXN_NETCFG, NETCFG_SET_ADDR, (long)ip, (long)mask,
+                       (long)gw, 0);
+}
+
+int netcfg_set_up(void)
+{
+   return (int)ics_sys(FXN_NETCFG, NETCFG_SET_UP, 0, 0, 0, 0);
+}
+
+int netcfg_set_down(void)
+{
+   return (int)ics_sys(FXN_NETCFG, NETCFG_SET_DOWN, 0, 0, 0, 0);
+}
+
+int netcfg_set_gw(unsigned int gw)
+{
+   return (int)ics_sys(FXN_NETCFG, NETCFG_SET_GW, (long)gw, 0, 0, 0);
+}
+
+/* =========================================================================
+ * Minimal POSIX extended-regex (ERE) engine for the SDK regex.h API.
+ *
+ * Encoded as a list of instruction words executed by an NFA simulation.
+ * Supports: literals, \-escapes, ., [..] classes (ranges/negation), * + ?,
+ * grouping ( ) and alternation |, and ^ $ anchors.  regexec reports a leftmost
+ * substring match (nmatch=0 semantics), which is what NetHack uses.
+ * ========================================================================= */
+
+enum {
+  OPI_END = 0,
+  OPI_MATCH = 1,
+  OPI_CHAR = 2,
+  OPI_ANY = 3,
+  OPI_CLASS = 4,
+  OPI_JMP = 5,
+  OPI_SPL = 6,   /* word[1] = index of other branch */
+  OPI_STAR = 7,  /* word[1] = index of body, word[2] = index after body */
+  OPI_ATB = 8,   /* anchor begin: matches only at pos 0 */
+  OPI_ATE = 9,   /* anchor end:   matches only at pos == strlen */
+  OPI_NCLASS = 10
+};
+
+static int nh_re_icase = 0;
+static int nh_re_nospec = 0;
+
+static int nh_re_tolower(int c) {
+  if (nh_re_icase) return (unsigned char)tolower(c);
+  return c;
+}
+
+static int nh_re_emit(regex_t *re, int word)
+{
+  struct { int *code; int code_len; int code_cap; int nerr; char errmsg[64]; } *d = &re->d;
+  if (d->code_len + 1 > d->code_cap) {
+    int nc = d->code_cap ? d->code_cap * 2 : 32;
+    int *p = (int *)realloc(d->code, nc * sizeof(int));
+    if (!p) return -1;
+    d->code = p;
+    d->code_cap = nc;
+  }
+  d->code[d->code_len++] = word;
+  return d->code_len - 1;
+}
+
+static int nh_re_set(regex_t *re, int idx, int val)
+{
+  if (idx < 0 || idx >= re->d.code_len) return -1;
+  re->d.code[idx] = val;
+  return 0;
+}
+
+/* parse a [class] starting at p[0]=='['; returns new p or NULL on error */
+static const char *nh_re_parse_class(regex_t *re, const char *p, int *cls)
+{
+  const char *s = p + 1;
+  int neg = 0, i = 0;
+  if (*s == '^') { neg = 1; s++; }
+  if (*s == ']') s++;               /* leading ] is literal */
+  for (; *s && *s != ']'; ) {
+    int lo;
+    if (s[0] == '\\' && s[1]) {
+      switch (s[1]) {
+      case 'n': lo = '\n'; s += 2; break;
+      case 't': lo = '\t'; s += 2; break;
+      case 'r': lo = '\r'; s += 2; break;
+      case '0': lo = 0;    s += 2; break;
+      default:  lo = (unsigned char)s[1]; s += 2; break;
+      }
+    } else {
+      lo = (unsigned char)*s++;
+    }
+    int hi = lo;
+    if (s[0] == '-' && s[1] && s[1] != ']') {
+      s++;
+      if (s[0] == '\\' && s[1]) hi = (unsigned char)s[1], s += 2;
+      else hi = (unsigned char)*s++;
+    }
+    if (i + 4 > 64) return NULL;    /* cap class size */
+    cls[i++] = lo;
+    cls[i++] = hi;
+  }
+  if (*s != ']') return NULL;
+  s++;                              /* past ] */
+  /* store class: first word = (neg?OPI_NCLASS:OPI_CLASS) | (count<<2) */
+  int cidx = nh_re_emit(re, (neg ? OPI_NCLASS : OPI_CLASS) | (i / 2 << 2));
+  if (cidx < 0) return NULL;
+  for (i = 0; i < 64 && i / 2 < 32; i++) {
+    if (nh_re_emit(re, (i / 2 < 32) ? cls[i] : 0) < 0) return NULL;
+    (void)cidx;
+  }
+  return s;
+}
+
+static const char *nh_re_parse_alt(regex_t *re, const char *p, int *altjmp, int *terminator);
+static const char *nh_re_parse(regex_t *re, const char *p, int *altjmp, int *terminator);
+
+static const char *
+nh_re_parse(regex_t *re, const char *p, int *altjmp, int *terminator)
+{
+  while (*p) {
+    switch (*p) {
+    case '(': {
+      int open = nh_re_emit(re, OPI_SPL);   /* placeholder, fixed below */
+      (void)open;
+      const char *q;
+      int term;
+      q = nh_re_parse_alt(re, p + 1, altjmp, &term);
+      if (!q) return NULL;
+      if (*q != ')') return NULL;
+      /* turn the SPL placeholder into a plain forward into this branch */
+      /* (alternation is handled by parse_alt; here just continue) */
+      p = q + 1;
+      continue;
+    }
+    case ')':
+      *terminator = 1;
+      return p;
+    case '|':
+      return p;
+    case '^':
+      nh_re_emit(re, OPI_ATB); p++; continue;
+    case '$':
+      nh_re_emit(re, OPI_ATE); p++; continue;
+    case '.':
+      nh_re_emit(re, OPI_ANY); p++; continue;
+    case '[': {
+      int cls[64];
+      const char *q = nh_re_parse_class(re, p, cls);
+      if (!q) return NULL;
+      p = q;
+      continue;
+    }
+    case '\\':
+      if (!p[1]) return NULL;
+      {
+        int c;
+        switch (p[1]) {
+        case 'n': c = '\n'; break;
+        case 't': c = '\t'; break;
+        case 'r': c = '\r'; break;
+        case '0': c = 0; break;
+        default:  c = (unsigned char)p[1]; break;
+        }
+        if (nh_re_emit(re, OPI_CHAR | (c & 0xff)) < 0) return NULL;
+        p += 2;
+      }
+      continue;
+    default: {
+      char c = *p++;
+      int idx = nh_re_emit(re, OPI_CHAR | ((unsigned char)c));
+      if (idx < 0) return NULL;
+      /* post-fix quantifier */
+      if (*p == '*') {
+        int star = nh_re_emit(re, OPI_STAR);
+        nh_re_set(re, star, idx);
+        nh_re_emit(re, 0);              /* after = here, patched below */
+        int after = re->d.code_len - 1;
+        (void)after;
+        /* OPI_STAR layout: [STAR, body, after]. we emitted STAR, then 'after'
+           placeholder; set body=idx (done), after=next instruction */
+        nh_re_set(re, star + 2, 0);     /* will be patched: see below */
+        p++;
+        /* repatch: STAR word stores body; use word[1]=body,word[2]=after */
+        nh_re_set(re, star + 1, idx);
+        nh_re_set(re, star + 2, re->d.code_len);
+      } else if (*p == '+') {
+        /* + == (x)(x)* : emit star over idx, but require at least one by
+           relying on the already-emitted idx as the first occurrence */
+        int star = nh_re_emit(re, OPI_STAR);
+        nh_re_set(re, star + 1, idx);
+        nh_re_set(re, star + 2, re->d.code_len);
+        p++;
+      } else if (*p == '?') {
+        /* ? == optional: spl to idx or skip past idx */
+        int spl = nh_re_emit(re, OPI_SPL);
+        nh_re_set(re, spl + 1, idx);    /* other = idx (take char) */
+        /* forward of spl = next instr (skip); other = idx */
+        /* layout: SPL word[1]=other. take=forward. */
+        p++;
+      }
+      continue;
+    }
+    }
+  }
+  *terminator = 1;
+  return p;
+}
+
+/* parse an alternation; emits SPLs linking each alternative */
+static const char *
+nh_re_parse_alt(regex_t *re, const char *p, int *altjmp, int *terminator)
+{
+  int first = -1, prev = -1;
+  int cur;
+  *terminator = 0;
+  cur = re->d.code_len;
+  int splidx = nh_re_emit(re, OPI_SPL);
+  nh_re_set(re, splidx + 1, cur);        /* other = first branch */
+  first = cur;
+  prev = splidx;
+  p = nh_re_parse(re, p, altjmp, terminator);
+  if (!p) return NULL;
+  if (*p == '|') {
+    while (*p == '|') {
+      p++;
+      cur = re->d.code_len;
+      int s = nh_re_emit(re, OPI_SPL);
+      nh_re_set(re, s + 1, cur);
+      prev = s;
+      p = nh_re_parse(re, p, altjmp, terminator);
+      if (!p) return NULL;
+    }
+  }
+  (void)first; (void)prev;
+  return p;
+}
+
+static int
+nh_re_classmatch(const int *code, int base, int count, int neg, int c)
+{
+  int i;
+  c = nh_re_tolower(c);
+  for (i = 0; i < count; i++) {
+    int lo = code[base + i * 2];
+    int hi = code[base + i * 2 + 1];
+    if (lo > hi) continue;
+    if (c >= lo && c <= hi) return !neg;
+  }
+  return neg;
+}
+
+static int
+nh_re_match_at(const regex_t *re, const char *s, int len, int pos)
+{
+  /* NFA over code words; state set = list of code indices */
+  int st[256], ns[256], n, i, j;
+  int matched = 0;
+  n = 0;
+  st[n++] = 0;
+  while (n > 0) {
+    /* expand epsilon (SPL, STAR) */
+    for (i = 0; i < n; i++) {
+      int pc = re->d.code[st[i]];
+      if (pc == OPI_SPL) {
+        if (n < 256) st[n++] = re->d.code[st[i] + 1];
+      } else if (pc == OPI_STAR) {
+        if (n < 256) st[n++] = re->d.code[st[i] + 1];   /* enter body */
+        if (n < 256) st[n++] = re->d.code[st[i] + 2];   /* or skip */
+      }
+    }
+    /* collect states that can consume a char */
+    ns[0] = 0; n = 0;
+    for (i = 0; i < 256; i++) {
+      int pc = re->d.code[st[i]];
+      if (pc == OPI_END) break;
+      if (pc == OPI_MATCH) { matched = 1; continue; }
+      if (pc == OPI_SPL || pc == OPI_STAR) continue;    /* epsilons handled */
+      if (pos >= len) {
+        if (pc == OPI_ATE) { if (n < 256) ns[n++] = st[i] + 1; }
+        continue;
+      }
+      int c = (unsigned char)s[pos];
+      int ok = 0;
+      if (pc == OPI_ATB) { if (pos == 0) ok = 1; }
+      else if (pc == OPI_ATE) { if (pos == len) ok = 1; }
+      else if (pc == OPI_ANY) { if (c != 0) ok = 1; }
+      else if (pc == OPI_CHAR) { if (nh_re_tolower(c) == (pc & 0xff)) ok = 1; }
+      else if (pc == OPI_CLASS || pc == OPI_NCLASS) {
+        int cnt = (pc >> 2) & 0x3f;
+        ok = nh_re_classmatch(re->d.code, st[i] + 1, cnt, pc == OPI_NCLASS, c);
+      }
+      if (ok && n < 256) ns[n++] = st[i] + 1;
+    }
+    if (matched) return 1;
+    /* advance */
+    for (i = 0; i < n; i++) { /* no-op; ns holds next states */ (void)i; }
+    /* swap */
+    for (i = 0; i < n; i++) st[i] = ns[i];
+    pos++;
+    if (pos > len) { n = 0; }
+  }
+  return matched;
+}
+
+int
+regcomp(regex_t *preg, const char *pattern, int cflags)
+{
+  if (!preg || !pattern) return REG_BADPAT;
+  memset(preg, 0, sizeof(*preg));
+  preg->re_magic = 0x52454731;
+  preg->re_nsub = 0;
+  nh_re_icase = (cflags & REG_ICASE) != 0;
+  nh_re_nospec = (cflags & REG_NOSPEC) != 0;
+
+  if (nh_re_nospec) {
+    /* literal pattern */
+    const char *p = pattern;
+    for (; *p; p++) {
+      if (nh_re_emit(preg, OPI_CHAR | ((unsigned char)*p)) < 0) { free(preg->d.code); return REG_ESPACE; }
+    }
+  } else {
+    int altjmp = 0, term = 0;
+    if (nh_re_parse(preg, pattern, &altjmp, &term) == NULL) {
+      free(preg->d.code);
+      return REG_BADPAT;
+    }
+  }
+  if (nh_re_emit(preg, OPI_MATCH) < 0) { free(preg->d.code); return REG_ESPACE; }
+  if (nh_re_emit(preg, OPI_END) < 0) { free(preg->d.code); return REG_ESPACE; }
+  preg->re_nerr = REG_NOERROR;
+  return REG_NOERROR;
+}
+
+int
+regexec(const regex_t *preg, const char *string, size_t nmatch,
+        void *pmatch, int eflags)
+{
+  (void)nmatch; (void)pmatch; (void)eflags;
+  if (!preg || preg->re_magic != 0x52454731) return REG_BADPAT;
+  if (!string) return REG_NOMATCH;
+  int len = (int)strlen(string);
+  int i;
+  for (i = 0; i <= len; i++) {
+    if (nh_re_match_at(preg, string, len, i)) return REG_NOERROR;
+  }
+  return REG_NOMATCH;
+}
+
+void
+regfree(regex_t *preg)
+{
+  if (!preg) return;
+  free(preg->d.code);
+  preg->d.code = 0;
+  preg->re_magic = 0;
+}
+
+static const char *nh_re_errmsg(int e)
+{
+  switch (e) {
+  case REG_BADPAT: return "Invalid regular expression";
+  case REG_EBRACK: return "Invalid bracket expression";
+  case REG_EBRACE: return "Invalid brace expression";
+  case REG_ESPACE: return "Memory allocation failed";
+  case REG_NOMATCH: return "No match";
+  case REG_NOERROR: return "No error";
+  default: return "Unknown error";
+  }
+}
+
+size_t
+regerror(int errcode, const regex_t *preg, char *buf, size_t buflen)
+{
+  (void)preg;
+  const char *m = nh_re_errmsg(errcode);
+  size_t n = strlen(m);
+  if (buf && buflen > 0) {
+    if (n >= buflen) n = buflen - 1;
+    memcpy(buf, m, n);
+    buf[n] = '\0';
+  }
+  return n;
+}
+
+/*
+ * glibc/ISO-compatible 48-bit linear congruential generator.
+ *
+ * NetHack (SYSV configuration) drives its entire game RNG through
+ * lrand48()/srand48() and depends on the standard recurrence and its
+ * ~2^48 period, so the state update must match glibc exactly:
+ *
+ *     X(n+1) = (a * X(n) + c) mod 2^48,   a = 0x5DEECE66D, c = 0xB
+ *
+ * lrand48() returns the top 31 bits of the next state (the high 31 bits of
+ * the low 48-bit word), matching glibc's output so save/restore and
+ * deterministic seeding behave like a stock build.
+ */
+static unsigned long long nh_rand48_state;
+static int nh_rand48_seeded;
+
+void
+srand48(long seed)
+{
+    nh_rand48_state = 0x25310100L;        /* high 24 bits (glibc default) */
+    nh_rand48_state |= ((unsigned long long)(unsigned long)seed) & 0x0000FFFFFLL;
+    nh_rand48_seeded = 1;
+}
+
+long
+lrand48(void)
+{
+    if (!nh_rand48_seeded) {
+        srand48(1L);
+    }
+    nh_rand48_state = nh_rand48_state * 0x5DEECE66DULL + 0xBULL;
+    return (long)((nh_rand48_state >> 16) & 0x7FFFFFFFLL);
+}
+
+/* =========================================================================
+ * POSIX compatibility shims required by the NetHack port.  ICS-OS is a
+ * single-user, no-real-signals OS, so privilege and signal APIs are inert
+ * (they exist so applications link and run; they cannot do what they would
+ * on a multi-user Unix).
+ * ========================================================================= */
+
+/* setuid/setgid: no privilege separation on ICS-OS; no-op, always succeed.
+   NetHack calls these before forking shells / helpers (dosh, docompress,
+   pager, mail).  The subsequent execv/child proceeds as the same user. */
+int setuid(uid_t uid)  { (void)uid; return 0; }
+int setgid(gid_t gid)  { (void)gid; return 0; }
+
+/* sigaction: ICS-OS has no signal delivery; record nothing, pretend to
+   succeed so installers of handlers (sethanguphandler) link and run. */
+int sigaction(int sig, const struct sigaction *act, struct sigaction *oldact)
+{
+    (void)sig; (void)act;
+    if (oldact) { oldact->sa_handler = SIG_DFL; oldact->sa_flags = 0; oldact->sa_restorer = 0; }
+    return 0;
+}
+
+/* freopen: ICS-OS FILE objects wrap raw fds.  For the std streams we simply
+   re-attach the fd; for any other stream we close it and re-open from the
+   fd.  NetHack uses freopen() on stdin/stdout for the save-file pager. */
+FILE *freopen(const char *path, const char *mode, FILE *stream)
+{
+    if (!stream || !path || !mode) { errno = 22; return 0; }
+    int fd = fileno(stream);
+    if (fd < 0) { errno = 22; return 0; }
+    int oflag = O_RDWR;
+    if (mode[0] == 'r') oflag = O_RDONLY;
+    else if (mode[0] == 'w') oflag = O_WRONLY | O_CREAT | O_TRUNC;
+    else if (mode[0] == 'a') oflag = O_WRONLY | O_CREAT | O_APPEND;
+    int nfd = open(path, oflag, 0666);
+    if (nfd < 0) return 0;
+    if (fd == 0 || fd == 1 || fd == 2) {
+        if (nfd != fd) dup2(nfd, fd);
+        if (nfd != fd) close(nfd);
+        return stream;
+    }
+    close(stream);
+    close(nfd);
+    return 0;
+}
+
+/* fscanf: minimal scanf for the file/line reading NetHack's topten readentry()
+   performs.  Supports %s (whitespace-delimited token), %d (signed int) and
+   %c (single char) with width, and literal characters in the format.
+   Returns the number of conversions (EOF => EOF). */
+int fscanf(FILE *f, const char *fmt, ...)
+{
+    va_list ap;
+    int matched = 0;
+    int c;
+    if (!f || !fmt) return -1;
+    va_start(ap, fmt);
+    while (*fmt) {
+        if (*fmt != '%') {
+            /* literal: skip leading whitespace in input, then match char */
+            do { c = fgetc(f); if (c == EOF) { va_end(ap); return matched; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+            if (c != *fmt) { va_end(ap); return matched; }
+            fmt++;
+            continue;
+        }
+        fmt++;
+        /* optional width */
+        int width = 0;
+        while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+        switch (*fmt) {
+        case 's': {
+            int n = 0;
+            char *dst = va_arg(ap, char *);
+            /* skip whitespace */
+            do { c = fgetc(f); if (c == EOF) { va_end(ap); return matched; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+            while (c != EOF && c != ' ' && c != '\t' && c != '\n' && c != '\r' && (width == 0 || n < width)) {
+                if (dst && (n < 255)) dst[n] = (char)c;
+                n++;
+                c = fgetc(f);
+            }
+            if (dst) dst[n > 255 ? 255 : n] = 0;
+            matched++;
+            break;
+        }
+        case 'd': {
+            int sign = 1, v = 0, got = 0;
+            int *dst = va_arg(ap, int *);
+            do { c = fgetc(f); if (c == EOF) { va_end(ap); return matched; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+            if (c == '-') { sign = -1; c = fgetc(f); }
+            else if (c == '+') c = fgetc(f);
+            while (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); got++; c = fgetc(f); }
+            if (!got) { va_end(ap); return matched; }
+            if (dst) *dst = sign * v;
+            matched++;
+            break;
+        }
+        case 'c': {
+            char *dst = va_arg(ap, char *);
+            c = fgetc(f);
+            if (c == EOF) { va_end(ap); return matched; }
+            if (dst) *dst = (char)c;
+            matched++;
+            break;
+        }
+        default:
+            /* unsupported conversion: skip one char, count as matched */
+            if (fgetc(f) == EOF) { va_end(ap); return matched; }
+            matched++;
+            break;
+        }
+        fmt++;
+    }
+    va_end(ap);
+    return matched;
+}
+
+/* mktime: convert struct tm to time_t (seconds since epoch, UTC).  Used by
+   NetHack's time_from_yyyymmddhhmmss().  Uses a civil-from-days algorithm
+   (Howard Hinnant); no leap-year table needed. */
+time_t mktime(struct tm *tm)
+{
+    static const int mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    long y = tm->tm_year + 1900;
+    long m = tm->tm_mon;              /* 0-based */
+    long d = tm->tm_mday;
+    /* days from 1970-01-01 to y-m-d (proleptic Gregorian) */
+    if (m <= 1) { y--; m += 12; }
+    long era = (y >= 0 ? y : y - 399) / 400;
+    long yoe = y - era * 400;                  /* [0,399] */
+    long doy = (153 * (m - 2) + 2) / 5 + d - 1; /* [0,365] */
+    long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; /* [0,146096] */
+    long days = era * 146097 + doe - 719468;    /* 1970-01-01 epoch */
+    long secs = days * 86400L
+        + (long)tm->tm_hour * 3600L
+        + (long)tm->tm_min * 60L
+        + (long)tm->tm_sec;
+    return (time_t)secs;
+}
+
+/* execl: exec a command with an explicit argv list, then NULL.  ICS-OS
+   execv/execvp are provided by the SDK; build the argv array here. */
+int execl(const char *path, const char *arg0, ...)
+{
+    char *args[32];
+    int n = 0;
+    va_list ap;
+    args[n++] = (char *)arg0;
+    va_start(ap, arg0);
+    while (n < 32) {
+        char *a = va_arg(ap, char *);
+        if (!a) break;
+        args[n++] = a;
+    }
+    va_end(ap);
+    args[n] = 0;
+    return execv(path, args);
 }

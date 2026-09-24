@@ -36,8 +36,8 @@ HOSTG_RTFLAGS := -m64 -std=gnu89 -w -nostdlib -fno-builtin -static -ffreestandin
 vmdex:
 	make -C kernel/
 
-.PHONY: usb-uefi usb-etcher test-usb-uefi-gpt test-vbox-uefi-gpt test-vbox-uefi-gpt-bios test-bochs-uefi-gpt test-usb-cdc-pico
-.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-netdhcp-unit test-net-stress test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-ttycanon-unit test-usbdbg-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
+.PHONY: usb-uefi usb-etcher test-usb-uefi-gpt test-vbox-uefi-gpt test-vbox-uefi-gpt-bios test-bochs-uefi-gpt test-usb-cdc-pico test-nethack
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-netdhcp-unit test-net-stress test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-memcorrupt test-asloop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-selfhost-cert-usb test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-ttycanon-unit test-usbdbg-unit test-rtwfw-unit test-rtwphy-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -121,6 +121,16 @@ test-pciscan-unit:
 	@mkdir -p /tmp/icsos-tests
 	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/pci_scan_unit.c -o /tmp/icsos-tests/pci_scan_unit
 	@/tmp/icsos-tests/pci_scan_unit
+
+test-rtwfw-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/rtw_fw_hdr_unit.c -o /tmp/icsos-tests/rtw_fw_hdr_unit
+	@/tmp/icsos-tests/rtw_fw_hdr_unit
+
+test-rtwphy-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/rtw_phy_unit.c -o /tmp/icsos-tests/rtw_phy_unit
+	@/tmp/icsos-tests/rtw_phy_unit
 
 test-ttycanon-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -230,7 +240,8 @@ prep_image: vmdex
 	mkdir -p tmp/apps tmp/tcc1 tmp/lib1
 	cp -r vmdex tmp
 	scripts/gen-help.sh
-	cp base/* tmp
+	# Copy base files and directories (firmware/rtw88, help, autoexec, …).
+	cp -a base/. tmp/
 	if [ -d apps ] && ls apps/* >/dev/null 2>&1; then cp -r apps/* tmp/apps/; fi
 	find sdk -maxdepth 1 -type f -exec cp {} tmp/tcc1/ \;
 	# msvcrt.dll + ramdisk.dll are obsolete/legacy: the kernel now provides
@@ -351,10 +362,18 @@ apps:
 	-$(MAKE) -C contrib/netecho install
 	-$(MAKE) -C contrib/httpd
 	-$(MAKE) -C contrib/httpd install
+	-$(MAKE) -C contrib/ifconfig
+	-$(MAKE) -C contrib/ifconfig install
+	-$(MAKE) -C contrib/route
+	-$(MAKE) -C contrib/route install
+	-$(MAKE) -C contrib/telnetd
+	-$(MAKE) -C contrib/telnetd install
 	-$(MAKE) -C contrib/nc
 	-$(MAKE) -C contrib/nc install
 	-$(MAKE) -C contrib/netstress
 	-$(MAKE) -C contrib/netstress install
+	-$(MAKE) -C contrib/netbench
+	-$(MAKE) -C contrib/netbench install
 	-$(MAKE) -C contrib/posixio
 	-$(MAKE) -C contrib/posixio install
 	-$(MAKE) -C contrib/termtest
@@ -681,6 +700,11 @@ test-usb-cdc-pico: vmdex ics-os-usb.img
 	@chmod +x scripts/test-qemu-xhci-cdc-pico.sh
 	@QEMU_X64=$(QEMU_X64) scripts/test-qemu-xhci-cdc-pico.sh ics-os-usb.img
 
+test-usb-cdc-hotplug: vmdex ics-os-usb.img
+	@chmod +x scripts/test-qemu-xhci-cdc-coexist.sh
+	@QEMU_X64=$(QEMU_X64) CDC_HOTPLUG=1 PORT_ORDER=msc_first \
+		scripts/test-qemu-xhci-cdc-coexist.sh ics-os-usb.img
+
 test-usb-storage-xhci-late-attach: vmdex ics-os-usb.img
 	@chmod +x scripts/test-qemu-xhci-no-device.sh
 	@QEMU_X64=$(QEMU_X64) QEMU_MACHINE=q35 QEMU_XHCI_LATE_ATTACH=1 \
@@ -797,8 +821,8 @@ test-virtio: vmdex
 
 # Boot with virtio-net on QEMU user (SLIRP) networking; static 10.0.2.15
 # pings 10.0.2.2, UDP-echoes :7777, TCP-echoes :7778 on the host, then
-# userland netecho.exe + httpd.exe + nc.exe exercise sockets/HTTP/netcat
-# via hostfwd :17779→:7779 and :18080→:8080.
+# userland netecho + httpd + nc + ifconfig/route + telnetd
+# via hostfwd :17779→:7779, :18080→:8080, :10023→:23.
 apps/netecho.exe: contrib/netecho/netecho.c contrib/netecho/Makefile sdk/posix.c sdk/include/sys/socket.h
 	$(MAKE) -C contrib/netecho install
 
@@ -808,29 +832,48 @@ apps/httpd.exe: contrib/httpd/httpd.c contrib/httpd/Makefile sdk/posix.c sdk/inc
 apps/nc.exe: contrib/nc/nc.c contrib/nc/Makefile sdk/posix.c sdk/include/sys/socket.h
 	$(MAKE) -C contrib/nc install
 
-test-net: vmdex apps/netecho.exe apps/httpd.exe apps/nc.exe
-	@echo "Building Multiboot2 ISO for virtio-net + sockets + httpd + nc..."
+apps/ifconfig.exe: contrib/ifconfig/ifconfig.c contrib/ifconfig/Makefile sdk/posix.c sdk/include/net/if.h
+	$(MAKE) -C contrib/ifconfig install
+
+apps/route.exe: contrib/route/route.c contrib/route/Makefile sdk/posix.c sdk/include/net/if.h
+	$(MAKE) -C contrib/route install
+
+apps/telnetd.exe: contrib/telnetd/telnetd.c contrib/telnetd/Makefile sdk/posix.c sdk/include/sys/socket.h
+	$(MAKE) -C contrib/telnetd install
+
+apps/sh.exe: contrib/sh/sh.c contrib/sh/Makefile
+	$(MAKE) -C contrib/sh install
+
+test-net: vmdex apps/netecho.exe apps/httpd.exe apps/nc.exe apps/ifconfig.exe apps/route.exe apps/telnetd.exe apps/sh.exe
+	@echo "Building Multiboot2 ISO for virtio-net + sockets + httpd + nc + netcfg + telnetd..."
 	@mkdir -p /tmp/icsos-net-iso/boot/grub /tmp/icsos-net-iso/apps
 	@cp kernel/Kernel64.bin /tmp/icsos-net-iso/vmdex
 	@cp apps/netecho.exe /tmp/icsos-net-iso/apps/netecho.exe
 	@cp apps/httpd.exe /tmp/icsos-net-iso/apps/httpd.exe
 	@cp apps/nc.exe /tmp/icsos-net-iso/apps/nc.exe
-	@printf '%s\n' 'netecho' 'httpd' 'nc' 'reboot' > /tmp/icsos-net-iso/autoexec.bat
+	@cp apps/ifconfig.exe /tmp/icsos-net-iso/apps/ifconfig.exe
+	@cp apps/route.exe /tmp/icsos-net-iso/apps/route.exe
+	@cp apps/telnetd.exe /tmp/icsos-net-iso/apps/telnetd.exe
+	@cp apps/sh.exe /tmp/icsos-net-iso/apps/sh.exe
+	@printf '%s\n' 'netecho' 'httpd' 'nc' 'ifconfig' 'route' 'telnetd' 'reboot' \
+		> /tmp/icsos-net-iso/autoexec.bat
 	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
 		> /tmp/icsos-net-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-net.iso /tmp/icsos-net-iso >/dev/null 2>&1
-	@echo "Starting host UDP/TCP echo + listen/HTTP/DNS probes..."
+	@echo "Starting host UDP/TCP echo + listen/HTTP/DNS/telnet probes..."
 	@chmod +x scripts/udp_echo_server.py scripts/tcp_echo_server.py \
-		scripts/tcp_connect_probe.py scripts/http_get_probe.py scripts/dns_stub.py
+		scripts/tcp_connect_probe.py scripts/http_get_probe.py scripts/dns_stub.py \
+		scripts/telnet_probe.py
 	@python3 scripts/udp_echo_server.py 7777 >/tmp/icsos-udp-echo.log 2>&1 & echo $$! > /tmp/icsos-udp-echo.pid
 	@python3 scripts/tcp_echo_server.py 7778 >/tmp/icsos-tcp-echo.log 2>&1 & echo $$! > /tmp/icsos-tcp-echo.pid
 	@python3 scripts/tcp_connect_probe.py 17779 >/tmp/icsos-tcp-probe.log 2>&1 & echo $$! > /tmp/icsos-tcp-probe.pid
 	@python3 scripts/http_get_probe.py 18080 >/tmp/icsos-http-probe.log 2>&1 & echo $$! > /tmp/icsos-http-probe.pid
 	@python3 scripts/dns_stub.py 5353 >/tmp/icsos-dns-stub.log 2>&1 & echo $$! > /tmp/icsos-dns-stub.pid
-	@echo "Running virtio-net ping+UDP+TCP+socket+httpd+nc test (TCG, 2 vCPUs)..."
-	@-timeout 120 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
+	@python3 scripts/telnet_probe.py 10023 >/tmp/icsos-telnet-probe.log 2>&1 & echo $$! > /tmp/icsos-telnet-probe.pid
+	@echo "Running virtio-net ping+UDP+TCP+socket+httpd+nc+netcfg+telnetd test (TCG, 2 vCPUs)..."
+	@-timeout 180 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
 		-cdrom /tmp/icsos-net.iso -boot d \
-		-netdev user,id=n0,hostfwd=tcp::17779-:7779,hostfwd=tcp::18080-:8080 \
+		-netdev user,id=n0,hostfwd=tcp::17779-:7779,hostfwd=tcp::18080-:8080,hostfwd=tcp::10023-:23 \
 		-device virtio-net-pci,netdev=n0,disable-legacy=on \
 		< /dev/null > /tmp/icsos-net.log 2>&1; \
 	 status=$$?; \
@@ -839,6 +882,7 @@ test-net: vmdex apps/netecho.exe apps/httpd.exe apps/nc.exe
 	 if [ -f /tmp/icsos-tcp-probe.pid ]; then wait $$(cat /tmp/icsos-tcp-probe.pid) 2>/dev/null || true; rm -f /tmp/icsos-tcp-probe.pid; fi; \
 	 if [ -f /tmp/icsos-http-probe.pid ]; then wait $$(cat /tmp/icsos-http-probe.pid) 2>/dev/null || true; rm -f /tmp/icsos-http-probe.pid; fi; \
 	 if [ -f /tmp/icsos-dns-stub.pid ]; then kill $$(cat /tmp/icsos-dns-stub.pid) 2>/dev/null || true; rm -f /tmp/icsos-dns-stub.pid; fi; \
+	 if [ -f /tmp/icsos-telnet-probe.pid ]; then wait $$(cat /tmp/icsos-telnet-probe.pid) 2>/dev/null || true; rm -f /tmp/icsos-telnet-probe.pid; fi; \
 	 exit 0
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-net.log
 	@grep -aq "VIRTIO_NET_OK" /tmp/icsos-net.log
@@ -858,6 +902,9 @@ test-net: vmdex apps/netecho.exe apps/httpd.exe apps/nc.exe
 	@grep -aq "NET_SOCK_LISTEN_OK" /tmp/icsos-net.log
 	@grep -aq "NET_HTTPD_OK" /tmp/icsos-net.log
 	@grep -aq "NET_NC_OK" /tmp/icsos-net.log
+	@grep -aq "NET_IFCONFIG_OK" /tmp/icsos-net.log
+	@grep -aq "NET_ROUTE_OK" /tmp/icsos-net.log
+	@grep -aq "NET_TELNETD_OK" /tmp/icsos-net.log
 	@! grep -aq "VIRTIO_NET_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_DHCP_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_DHCP_RENEW_FAIL" /tmp/icsos-net.log
@@ -870,13 +917,16 @@ test-net: vmdex apps/netecho.exe apps/httpd.exe apps/nc.exe
 	@! grep -aq "NET_SOCK_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_HTTPD_FAIL" /tmp/icsos-net.log
 	@! grep -aq "NET_NC_FAIL" /tmp/icsos-net.log
+	@! grep -aq "NET_IFCONFIG_FAIL" /tmp/icsos-net.log
+	@! grep -aq "NET_ROUTE_FAIL" /tmp/icsos-net.log
+	@! grep -aq "NET_TELNETD_FAIL" /tmp/icsos-net.log
 	@! grep -aq "General Protection fault" /tmp/icsos-net.log
 	@echo "test-net PASS"
 
 # Concurrent socket stress under user-smp: forked TCP+UDP clients against
 # host echo helpers while virtio-net MSI-X RX runs on another CPU.
 NETSTRESS_SMP ?= 4
-NETSTRESS_TIMEOUT ?= 120
+NETSTRESS_TIMEOUT ?= 240
 
 apps/netstress.exe: contrib/netstress/netstress.c contrib/netstress/Makefile sdk/posix.c sdk/include/sys/socket.h
 	$(MAKE) -C contrib/netstress install
@@ -913,6 +963,192 @@ test-net-stress: vmdex apps/netstress.exe
 	@! grep -aqE "PF64 |GPF64 " /tmp/icsos-netstress.log
 	@! grep -aq "General Protection fault" /tmp/icsos-netstress.log
 	@echo "test-net-stress PASS"
+
+# Same networking gates as test-net, but with QEMU -device rtl8139 (no virtio-net).
+test-net-rtl8139: vmdex apps/netecho.exe apps/httpd.exe apps/nc.exe apps/ifconfig.exe apps/route.exe apps/telnetd.exe apps/sh.exe
+	@echo "Building Multiboot2 ISO for rtl8139 + sockets + httpd + nc + netcfg + telnetd..."
+	@mkdir -p /tmp/icsos-rtl-iso/boot/grub /tmp/icsos-rtl-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-rtl-iso/vmdex
+	@cp apps/netecho.exe /tmp/icsos-rtl-iso/apps/netecho.exe
+	@cp apps/httpd.exe /tmp/icsos-rtl-iso/apps/httpd.exe
+	@cp apps/nc.exe /tmp/icsos-rtl-iso/apps/nc.exe
+	@cp apps/ifconfig.exe /tmp/icsos-rtl-iso/apps/ifconfig.exe
+	@cp apps/route.exe /tmp/icsos-rtl-iso/apps/route.exe
+	@cp apps/telnetd.exe /tmp/icsos-rtl-iso/apps/telnetd.exe
+	@cp apps/sh.exe /tmp/icsos-rtl-iso/apps/sh.exe
+	@printf '%s\n' 'netecho' 'httpd' 'nc' 'ifconfig' 'route' 'telnetd' 'reboot' \
+		> /tmp/icsos-rtl-iso/autoexec.bat
+	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
+		> /tmp/icsos-rtl-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-rtl.iso /tmp/icsos-rtl-iso >/dev/null 2>&1
+	@echo "Starting host UDP/TCP echo + listen/HTTP/DNS/telnet probes for rtl8139..."
+	@chmod +x scripts/udp_echo_server.py scripts/tcp_echo_server.py \
+		scripts/tcp_connect_probe.py scripts/http_get_probe.py scripts/dns_stub.py \
+		scripts/telnet_probe.py
+	@python3 scripts/udp_echo_server.py 7777 >/tmp/icsos-rtl-udp-echo.log 2>&1 & echo $$! > /tmp/icsos-rtl-udp-echo.pid
+	@python3 scripts/tcp_echo_server.py 7778 >/tmp/icsos-rtl-tcp-echo.log 2>&1 & echo $$! > /tmp/icsos-rtl-tcp-echo.pid
+	@python3 scripts/tcp_connect_probe.py 17779 >/tmp/icsos-rtl-tcp-probe.log 2>&1 & echo $$! > /tmp/icsos-rtl-tcp-probe.pid
+	@python3 scripts/http_get_probe.py 18080 >/tmp/icsos-rtl-http-probe.log 2>&1 & echo $$! > /tmp/icsos-rtl-http-probe.pid
+	@python3 scripts/dns_stub.py 5353 >/tmp/icsos-rtl-dns-stub.log 2>&1 & echo $$! > /tmp/icsos-rtl-dns-stub.pid
+	@python3 scripts/telnet_probe.py 10023 >/tmp/icsos-rtl-telnet-probe.log 2>&1 & echo $$! > /tmp/icsos-rtl-telnet-probe.pid
+	@echo "Running rtl8139 net test (TCG, 2 vCPUs)..."
+	@-timeout 180 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
+		-cdrom /tmp/icsos-rtl.iso -boot d \
+		-netdev user,id=n0,hostfwd=tcp::17779-:7779,hostfwd=tcp::18080-:8080,hostfwd=tcp::10023-:23 \
+		-device rtl8139,netdev=n0 \
+		< /dev/null > /tmp/icsos-rtl-net.log 2>&1; \
+	 status=$$?; \
+	 if [ -f /tmp/icsos-rtl-udp-echo.pid ]; then kill $$(cat /tmp/icsos-rtl-udp-echo.pid) 2>/dev/null || true; rm -f /tmp/icsos-rtl-udp-echo.pid; fi; \
+	 if [ -f /tmp/icsos-rtl-tcp-echo.pid ]; then kill $$(cat /tmp/icsos-rtl-tcp-echo.pid) 2>/dev/null || true; rm -f /tmp/icsos-rtl-tcp-echo.pid; fi; \
+	 if [ -f /tmp/icsos-rtl-tcp-probe.pid ]; then wait $$(cat /tmp/icsos-rtl-tcp-probe.pid) 2>/dev/null || true; rm -f /tmp/icsos-rtl-tcp-probe.pid; fi; \
+	 if [ -f /tmp/icsos-rtl-http-probe.pid ]; then wait $$(cat /tmp/icsos-rtl-http-probe.pid) 2>/dev/null || true; rm -f /tmp/icsos-rtl-http-probe.pid; fi; \
+	 if [ -f /tmp/icsos-rtl-dns-stub.pid ]; then kill $$(cat /tmp/icsos-rtl-dns-stub.pid) 2>/dev/null || true; rm -f /tmp/icsos-rtl-dns-stub.pid; fi; \
+	 if [ -f /tmp/icsos-rtl-telnet-probe.pid ]; then wait $$(cat /tmp/icsos-rtl-telnet-probe.pid) 2>/dev/null || true; rm -f /tmp/icsos-rtl-telnet-probe.pid; fi; \
+	 exit 0
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-rtl-net.log
+	@grep -aq "RTL8139_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "RTL8139_IRQ_OK\|RTL8139_POLL_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NETIF_UP" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_DHCP_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_DHCP_RENEW_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_DHCP_REBIND_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_PING_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_UDP_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_TCP_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_TCP_REXMIT_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_DNS_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_SOFTNET_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_SOCK_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_SOCK_UDP_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_SOCK_LISTEN_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_HTTPD_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_NC_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_IFCONFIG_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_ROUTE_OK" /tmp/icsos-rtl-net.log
+	@grep -aq "NET_TELNETD_OK" /tmp/icsos-rtl-net.log
+	@! grep -aq "RTL8139_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "NET_DHCP_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "NET_PING_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "NET_UDP_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "NET_TCP_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "NET_TCP_REXMIT_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "NET_DNS_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "NET_SOCK_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "NET_HTTPD_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "NET_NC_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "NET_IFCONFIG_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "NET_ROUTE_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "NET_TELNETD_FAIL" /tmp/icsos-rtl-net.log
+	@! grep -aq "General Protection fault" /tmp/icsos-rtl-net.log
+	@echo "test-net-rtl8139 PASS"
+
+# Concurrent socket stress on rtl8139 under user-smp.
+test-net-stress-rtl8139: vmdex apps/netstress.exe
+	@echo "Building Multiboot2 ISO for rtl8139 netstress (user-smp)..."
+	@mkdir -p /tmp/icsos-rtl-stress-iso/boot/grub /tmp/icsos-rtl-stress-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-rtl-stress-iso/vmdex
+	@cp apps/netstress.exe /tmp/icsos-rtl-stress-iso/apps/netstress.exe
+	@printf '%s\n' 'netstress' 'reboot' > /tmp/icsos-rtl-stress-iso/autoexec.bat
+	@printf 'set timeout=0\nmenuentry "ics" { multiboot2 /vmdex user-smp; boot }\n' \
+		> /tmp/icsos-rtl-stress-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-rtl-stress.iso /tmp/icsos-rtl-stress-iso >/dev/null 2>&1
+	@echo "Starting host UDP/TCP echo for rtl8139 netstress..."
+	@chmod +x scripts/udp_echo_server.py scripts/tcp_echo_server.py
+	@python3 scripts/udp_echo_server.py 7777 >/tmp/icsos-rtl-stress-udp.log 2>&1 & echo $$! > /tmp/icsos-rtl-stress-udp.pid
+	@python3 scripts/tcp_echo_server.py 7778 >/tmp/icsos-rtl-stress-tcp.log 2>&1 & echo $$! > /tmp/icsos-rtl-stress-tcp.pid
+	@echo "Running rtl8139 netstress (KVM, smp $(NETSTRESS_SMP), user-smp)..."
+	@-timeout $(NETSTRESS_TIMEOUT) stdbuf -oL $(QEMU_X64) -enable-kvm -cpu host \
+		-smp $(NETSTRESS_SMP) -nographic -no-reboot -m 256M \
+		-cdrom /tmp/icsos-rtl-stress.iso -boot d \
+		-netdev user,id=n0 \
+		-device rtl8139,netdev=n0 \
+		< /dev/null > /tmp/icsos-rtl-stress.log 2>&1; \
+	 status=$$?; \
+	 if [ -f /tmp/icsos-rtl-stress-udp.pid ]; then kill $$(cat /tmp/icsos-rtl-stress-udp.pid) 2>/dev/null || true; rm -f /tmp/icsos-rtl-stress-udp.pid; fi; \
+	 if [ -f /tmp/icsos-rtl-stress-tcp.pid ]; then kill $$(cat /tmp/icsos-rtl-stress-tcp.pid) 2>/dev/null || true; rm -f /tmp/icsos-rtl-stress-tcp.pid; fi; \
+	 exit 0
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-rtl-stress.log
+	@grep -aq "RTL8139_OK" /tmp/icsos-rtl-stress.log
+	@grep -aq "NETSTRESS_PASS" /tmp/icsos-rtl-stress.log
+	@grep -aqE "USER_RUN cpu=[1-7]" /tmp/icsos-rtl-stress.log
+	@! grep -aq "NETSTRESS_FAIL" /tmp/icsos-rtl-stress.log
+	@! grep -aqE "PF64 |GPF64 " /tmp/icsos-rtl-stress.log
+	@! grep -aq "General Protection fault" /tmp/icsos-rtl-stress.log
+	@echo "test-net-stress-rtl8139 PASS"
+
+# TCP/UDP throughput + RTT microbench over QEMU SLIRP (virtio-net).
+# Floors track expected SLIRP+TCG performance with pipelined TCP (not line-rate).
+apps/netbench.exe: contrib/netbench/netbench.c contrib/netbench/Makefile sdk/posix.c
+	$(MAKE) -C contrib/netbench install
+
+test-netbench: vmdex apps/netbench.exe
+	@echo "Building Multiboot2 ISO for virtio-net netbench..."
+	@mkdir -p /tmp/icsos-netbench-iso/boot/grub /tmp/icsos-netbench-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-netbench-iso/vmdex
+	@cp apps/netbench.exe /tmp/icsos-netbench-iso/apps/netbench.exe
+	@printf '%s\n' 'netbench' 'reboot' > /tmp/icsos-netbench-iso/autoexec.bat
+	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
+		> /tmp/icsos-netbench-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-netbench.iso /tmp/icsos-netbench-iso >/dev/null 2>&1
+	@echo "Starting host netbench sink/source/echo..."
+	@chmod +x scripts/netbench_host.py
+	@python3 scripts/netbench_host.py 180 >/tmp/icsos-netbench-host.log 2>&1 & echo $$! > /tmp/icsos-netbench-host.pid
+	@for i in 1 2 3 4 5 6 7 8 9 10; do grep -aq "NETBENCH_HOST_READY" /tmp/icsos-netbench-host.log && break; sleep 0.2; done
+	@grep -aq "NETBENCH_HOST_READY" /tmp/icsos-netbench-host.log
+	@echo "Running virtio-net netbench (TCG)..."
+	@-timeout 180 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
+		-cdrom /tmp/icsos-netbench.iso -boot d \
+		-netdev user,id=n0 \
+		-device virtio-net-pci,netdev=n0,disable-legacy=on \
+		< /dev/null > /tmp/icsos-netbench.log 2>&1; \
+	 status=$$?; \
+	 if [ -f /tmp/icsos-netbench-host.pid ]; then kill $$(cat /tmp/icsos-netbench-host.pid) 2>/dev/null || true; rm -f /tmp/icsos-netbench-host.pid; fi; \
+	 exit 0
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-netbench.log
+	@grep -aq "VIRTIO_NET_OK" /tmp/icsos-netbench.log
+	@grep -aq "NETBENCH_PASS" /tmp/icsos-netbench.log
+	@! grep -aq "NETBENCH_FAIL" /tmp/icsos-netbench.log
+	@! grep -aq "General Protection fault" /tmp/icsos-netbench.log
+	@# Wall-clock host sink must track expected QEMU SLIRP (~30–80 Mbit/s).
+	@python3 -c 'import re,sys; t=open("/tmp/icsos-netbench-host.log").read(); m=re.search(r"HOST_SINK bytes=(\d+) ms=(\d+) kbps=(\d+)", t); \
+	 assert m, "missing HOST_SINK"; kbps=int(m.group(3)); \
+	 print("host_sink_kbps=%d" % kbps); assert kbps >= 20000, "HOST_SINK too slow (<%d kbps)" % 20000'
+	@echo "test-netbench PASS"
+	@grep -E 'NETBENCH_' /tmp/icsos-netbench.log | head -20
+
+test-netbench-rtl8139: vmdex apps/netbench.exe
+	@echo "Building Multiboot2 ISO for rtl8139 netbench..."
+	@mkdir -p /tmp/icsos-netbench-rtl-iso/boot/grub /tmp/icsos-netbench-rtl-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-netbench-rtl-iso/vmdex
+	@cp apps/netbench.exe /tmp/icsos-netbench-rtl-iso/apps/netbench.exe
+	@printf '%s\n' 'netbench' 'reboot' > /tmp/icsos-netbench-rtl-iso/autoexec.bat
+	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
+		> /tmp/icsos-netbench-rtl-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-netbench-rtl.iso /tmp/icsos-netbench-rtl-iso >/dev/null 2>&1
+	@echo "Starting host netbench sink/source/echo for rtl8139..."
+	@chmod +x scripts/netbench_host.py
+	@python3 scripts/netbench_host.py 180 >/tmp/icsos-netbench-rtl-host.log 2>&1 & echo $$! > /tmp/icsos-netbench-rtl-host.pid
+	@for i in 1 2 3 4 5 6 7 8 9 10; do grep -aq "NETBENCH_HOST_READY" /tmp/icsos-netbench-rtl-host.log && break; sleep 0.2; done
+	@grep -aq "NETBENCH_HOST_READY" /tmp/icsos-netbench-rtl-host.log
+	@echo "Running rtl8139 netbench (TCG)..."
+	@-timeout 180 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
+		-cdrom /tmp/icsos-netbench-rtl.iso -boot d \
+		-netdev user,id=n0 \
+		-device rtl8139,netdev=n0 \
+		< /dev/null > /tmp/icsos-netbench-rtl.log 2>&1; \
+	 status=$$?; \
+	 if [ -f /tmp/icsos-netbench-rtl-host.pid ]; then kill $$(cat /tmp/icsos-netbench-rtl-host.pid) 2>/dev/null || true; rm -f /tmp/icsos-netbench-rtl-host.pid; fi; \
+	 exit 0
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-netbench-rtl.log
+	@grep -aq "RTL8139_OK" /tmp/icsos-netbench-rtl.log
+	@grep -aq "NETBENCH_PASS" /tmp/icsos-netbench-rtl.log
+	@! grep -aq "NETBENCH_FAIL" /tmp/icsos-netbench-rtl.log
+	@! grep -aq "General Protection fault" /tmp/icsos-netbench-rtl.log
+	@python3 -c 'import re,sys; t=open("/tmp/icsos-netbench-rtl-host.log").read(); m=re.search(r"HOST_SINK bytes=(\d+) ms=(\d+) kbps=(\d+)", t); \
+	 assert m, "missing HOST_SINK"; kbps=int(m.group(3)); \
+	 print("host_sink_kbps=%d" % kbps); assert kbps >= 20000, "HOST_SINK too slow (<%d kbps)" % 20000'
+	@echo "test-netbench-rtl8139 PASS"
+	@grep -E 'NETBENCH_' /tmp/icsos-netbench-rtl.log | head -20
 
 # Boot, rebuild TinyCC with itself inside ICS-OS (Multiboot2 ISO).
 # Packs an 8.3-renamed TinyCC tree as one ustar so staging is a single CD read.
@@ -1123,6 +1359,62 @@ test-vim: kernel/Kernel64.bin apps/vim.exe
 	@! grep -aq "VIM_RUN_FAIL" /tmp/icsos-vim.log
 	@echo "test-vim PASS"
 
+# NetHack 3.6.7 smoke test: boot the game and verify it reaches the interactive
+# character-creation screen (the copyright banner), which requires the TTY
+# windowing system, the termcap library, and the nhdat DLB resource (data,
+# dungeon, oracles, rumors, symbols, options, ...) to all load successfully.
+#
+# Data layout (NetHack has CHDIR/NOCWD_ASSUMPTIONS/VAR_PLAYGROUND undefined, so
+# it opens "nhdat" as a bare relative path against the process cwd, which the
+# kernel sets to the vfs root "/"):
+#   /nhdat        -- the packed DLB resource (built by make_dlb from dat/*)
+#   /etc/termcap  -- the xterm termcap entry (tclib.c default TERMCAP)
+#   /apps/nethack.exe
+apps/nethack.exe: contrib/nethack/Makefile
+	$(MAKE) -C contrib/nethack install
+
+test-nethack: kernel/Kernel64.bin apps/nethack.exe base/nethack/nhdat base/nethack/sysconf base/etc/termcap
+	@echo "Building Multiboot2 ISO for NetHack smoke test..."
+	@rm -rf /tmp/icsos-nethack-iso
+	@mkdir -p /tmp/icsos-nethack-iso/boot/grub /tmp/icsos-nethack-iso/apps /tmp/icsos-nethack-iso/etc /tmp/icsos-nethack-iso/nethack
+	@cp kernel/Kernel64.bin /tmp/icsos-nethack-iso/vmdex
+	@cp apps/nethack.exe /tmp/icsos-nethack-iso/apps/nethack.exe
+	@cp base/nethack/nhdat /tmp/icsos-nethack-iso/nethack/nhdat
+	@cp base/nethack/symbols /tmp/icsos-nethack-iso/nethack/symbols
+	@cp base/nethack/data.base /tmp/icsos-nethack-iso/nethack/data.base
+	@cp base/nethack/options /tmp/icsos-nethack-iso/nethack/options
+	@cp base/nethack/help /tmp/icsos-nethack-iso/nethack/help
+	@cp base/nethack/hh /tmp/icsos-nethack-iso/nethack/hh
+	@cp base/nethack/wizhelp /tmp/icsos-nethack-iso/nethack/wizhelp
+	@cp base/nethack/history /tmp/icsos-nethack-iso/nethack/history
+	@cp base/nethack/quest.txt /tmp/icsos-nethack-iso/nethack/quest.txt
+	@cp base/nethack/license /tmp/icsos-nethack-iso/nethack/license
+	@cp base/nethack/sysconf /tmp/icsos-nethack-iso/nethack/sysconf
+	@cp base/etc/termcap /tmp/icsos-nethack-iso/etc/termcap
+	@printf '%s\n' 'nethack' 'reboot' > /tmp/icsos-nethack-iso/autoexec.bat
+	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
+		> /tmp/icsos-nethack-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-nethack.iso /tmp/icsos-nethack-iso >/dev/null 2>&1
+	@echo "Running NetHack smoke test (TCG)..."
+	# NetHack's TTY window system prints a "Hit return to continue:" prompt
+	# (wintty.c getret()/xwaitforspace) whenever a raw_printf message appears
+	# (e.g. the read-only-CD "cannot write scoreboard" warning) and after the
+	# copyright banner, then blocks waiting for a newline on stdin.  The kernel
+	# COM1 tty is TTY_SERIAL-backed in headless (-nographic) mode, so bytes
+	# piped into QEMU stdin are routed to the foreground tty.  We feed a long
+	# stream of newlines to dismiss every prompt and let NetHack advance to the
+	# interactive player-selection screen, then hold for a few seconds so the
+	# screen (and the flushed copyright banner) are captured before the
+	# timeout kills QEMU.
+	@(for i in $(shell seq 1 200); do printf '\n'; sleep 0.4; done; sleep 8) | \
+		timeout 120 $(QEMU_X64) -nographic -no-reboot -m 256M \
+		-cdrom /tmp/icsos-nethack.iso -boot d \
+		> /tmp/icsos-nethack.log 2>&1 || true
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-nethack.log
+	@grep -aq "NetHack, Copyright 1985-2023" /tmp/icsos-nethack.log
+	@! grep -aq "panic\|GPF\|Page fault" /tmp/icsos-nethack.log
+	@echo "test-nethack PASS"
+
 # dup(2) syscall self-test: proves the kernel dup() (0xC5) works at runtime
 # (tty fd clone + write THROUGH the new fd), not merely that vim links it.
 apps/duptest.exe: contrib/duptest/duptest.c contrib/duptest/Makefile
@@ -1313,6 +1605,113 @@ test-fatwrite-coop:
 	@! grep -aq "CRITHANG" /tmp/icsos-fatwr-coop.log
 	@! grep -aq "WATCHDOG" /tmp/icsos-fatwr-coop.log
 	@echo "test-fatwrite-coop PASS"
+
+# Minimal in-OS user-memory corruption detector (contrib/memcorrupt). Replicates
+# the self-host cert's `as` working-set shape (one large contiguous buffer plus
+# many slab-carved small blocks) and drives the VFS write+read path repeatedly,
+# re-verifying every byte of both allocations after each pass. Localizes the
+# non-deterministic kernel corruption that makes the in-OS `as` reject valid .s
+# files (a different .s each run) while the on-disk bytes stay valid.
+MEMCORR_SMP      ?= 1
+MEMCORR_MEM      ?= 2048M
+MEMCORR_WORK_MIB ?= 1024
+MEMCORR_TIMEOUT  ?= 300
+apps/memcorrupt.exe: contrib/memcorrupt/memcorrupt.c contrib/memcorrupt/Makefile
+	$(MAKE) -C contrib/memcorrupt install
+
+test-memcorrupt: kernel/Kernel64.bin apps/memcorrupt.exe
+	@$(MAKE) -C kernel all
+	@echo "Building Multiboot2 ISO for in-OS memory-corruption detector..."
+	@rm -rf /tmp/icsos-memcorrupt-iso
+	@mkdir -p /tmp/icsos-memcorrupt-iso/boot/grub /tmp/icsos-memcorrupt-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-memcorrupt-iso/vmdex
+	@cp apps/memcorrupt.exe /tmp/icsos-memcorrupt-iso/apps/memcorrupt.exe
+	@printf '%s\n' 'memcorrupt' 'reboot' > /tmp/icsos-memcorrupt-iso/autoexec.bat
+	@printf 'set timeout=0\nmenuentry "ics" { multiboot2 /vmdex; boot }\n' \
+		> /tmp/icsos-memcorrupt-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-memcorrupt.iso /tmp/icsos-memcorrupt-iso >/dev/null 2>&1
+	@echo "Formatting $(MEMCORR_WORK_MIB) MiB FAT16 virtio work disk..."
+	@truncate -s $(MEMCORR_WORK_MIB)M /tmp/icsos-memcorrupt-work.img
+	@mkfs.vfat -F 16 -s 32 /tmp/icsos-memcorrupt-work.img >/dev/null
+	@echo "Running in-OS memory-corruption detector (KVM, smp $(MEMCORR_SMP), mem $(MEMCORR_MEM))..."
+	@-timeout $(MEMCORR_TIMEOUT) stdbuf -oL $(QEMU_X64) -enable-kvm -cpu host -smp $(MEMCORR_SMP) \
+		-display none -monitor none -serial file:/tmp/icsos-memcorrupt.log \
+		-no-reboot -m $(MEMCORR_MEM) \
+		-cdrom /tmp/icsos-memcorrupt.iso -boot d \
+		-drive file=/tmp/icsos-memcorrupt-work.img,if=none,id=vd0,format=raw \
+		-device virtio-blk-pci,drive=vd0,disable-legacy=on \
+		< /dev/null
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-memcorrupt.log
+	@grep -aq "work: mounted" /tmp/icsos-memcorrupt.log
+	@grep -aq "MEMCORR_PATTERN_OK" /tmp/icsos-memcorrupt.log
+	@grep -aq "MEMCORR_PASS" /tmp/icsos-memcorrupt.log
+	@! grep -aq "MEMCORR_CORRUPT" /tmp/icsos-memcorrupt.log
+	@! grep -aqE "PF64 |GPF64 " /tmp/icsos-memcorrupt.log
+	@echo "test-memcorrupt PASS"
+
+# asloop: tight-loop reproduction of the non-deterministic in-OS `as` failure.
+# Seeds one fixed 4 MiB valid .s on the work disk and runs the real in-OS `as`
+# on it N_ITER times (contrib/asloop/asloop.c). Each iteration is a fresh `as`
+# process; a failure at iter>1 means the kernel corrupted the `as` user space
+# (or its read path) cumulatively, not that the input line is bad. This is a
+# debugging tool, not a PASS/FAIL gate: it always reports the outcome
+# (REPRODUCED / no reproduction) and reads the captured `as` diagnostic back.
+ASLOOP_SMP      ?= 1
+ASLOOP_MEM      ?= 2048M
+ASLOOP_WORK_MIB ?= 1024
+ASLOOP_TIMEOUT  ?= 1800
+ASLOOP_ITER     ?= 400
+ASLOOP_BIG_S    ?= /tmp/icsos-asloop-big.s
+
+$(ASLOOP_BIG_S): contrib/asloop/gen_big_s.py
+	@python3 contrib/asloop/gen_big_s.py 4194304 > $(ASLOOP_BIG_S)
+
+apps/asloop.exe: contrib/asloop/asloop.c contrib/asloop/Makefile
+	$(MAKE) -C contrib/asloop install
+
+test-asloop: kernel/Kernel64.bin apps/asloop.exe apps/as.exe $(ASLOOP_BIG_S)
+	@$(MAKE) -C kernel all
+	@echo "Building Multiboot2 ISO for in-OS `as` tight loop..."
+	@rm -rf /tmp/icsos-asloop-iso /tmp/icsos-asloop-seed /tmp/icsos-asloop-readback
+	@mkdir -p /tmp/icsos-asloop-iso/boot/grub /tmp/icsos-asloop-iso/apps /tmp/icsos-asloop-seed
+	@cp kernel/Kernel64.bin /tmp/icsos-asloop-iso/vmdex
+	@cp apps/asloop.exe /tmp/icsos-asloop-iso/apps/asloop.exe
+	@cp apps/as.exe /tmp/icsos-asloop-iso/apps/as.exe
+	@cp $(ASLOOP_BIG_S) /tmp/icsos-asloop-seed/ASLOOP.s
+	@printf '%s\n' "asloop $(ASLOOP_ITER)" 'reboot' > /tmp/icsos-asloop-iso/autoexec.bat
+	@printf 'set timeout=0\nmenuentry "ics" { multiboot2 /vmdex; boot }\n' \
+		> /tmp/icsos-asloop-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-asloop.iso /tmp/icsos-asloop-iso >/dev/null 2>&1
+	@echo "Formatting $(ASLOOP_WORK_MIB) MiB FAT16 virtio work disk..."
+	@truncate -s $(ASLOOP_WORK_MIB)M /tmp/icsos-asloop-work.img
+	@mkfs.vfat -F 16 -s 32 /tmp/icsos-asloop-work.img >/dev/null
+	@echo "Seeding 4 MiB .s onto the work disk root..."
+	@mcopy -i /tmp/icsos-asloop-work.img /tmp/icsos-asloop-seed/ASLOOP.s ::/
+	@echo "Running in-OS `as` tight loop (KVM, smp $(ASLOOP_SMP), mem $(ASLOOP_MEM))..."
+	@-timeout $(ASLOOP_TIMEOUT) stdbuf -oL $(QEMU_X64) -enable-kvm -cpu host -smp $(ASLOOP_SMP) \
+		-display none -monitor none -serial file:/tmp/icsos-asloop.log \
+		-no-reboot -m $(ASLOOP_MEM) \
+		-cdrom /tmp/icsos-asloop.iso -boot d \
+		-drive file=/tmp/icsos-asloop-work.img,if=none,id=vd0,format=raw \
+		-device virtio-blk-pci,drive=vd0,disable-legacy=on \
+		< /dev/null
+	@echo "=== asloop markers ==="
+	@grep -a "ASLOOP_" /tmp/icsos-asloop.log | tail -25
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-asloop.log
+	@grep -aq "work: mounted" /tmp/icsos-asloop.log
+	@grep -aq "ASLOOP_BASELINE_OK" /tmp/icsos-asloop.log
+	@if grep -aq "ASLOOP_FAIL" /tmp/icsos-asloop.log; then \
+		echo "test-asloop: REPRODUCED -- see ASLOOP_FAIL above"; \
+		mkdir -p /tmp/icsos-asloop-readback; \
+		mcopy -i /tmp/icsos-asloop-work.img ::ASLOOP.err /tmp/icsos-asloop-readback/ASLOOP.err >/dev/null 2>&1; \
+		echo "--- ASLOOP.err (captured `as` diagnostic) ---"; \
+		xxd /tmp/icsos-asloop-readback/ASLOOP.err 2>/dev/null | head -40; \
+	elif grep -aq "ASLOOP_PASS" /tmp/icsos-asloop.log; then \
+		echo "test-asloop: no reproduction (ASLOOP_PASS)"; \
+	else \
+		echo "test-asloop: NO RESULT -- loop did not finish (check /tmp/icsos-asloop.log)"; \
+	fi
+	@echo "test-asloop DONE"
 
 apps/forktest.exe: contrib/forktest/forktest.c contrib/forktest/Makefile
 	$(MAKE) -C contrib/forktest install
@@ -1733,13 +2132,26 @@ test-kbuild: test-gcc-kbuild
 # CERT_TIMEOUT overrides the QEMU wall-clock bound (seconds) for bounded
 # diagnostic runs of this otherwise multi-hour closure build.
 CERT_TIMEOUT ?= 28800
-# Multi-core closure knobs. The serial closure boots `selfhost-stage1` with a
-# single vCPU; the parallel closure boots `selfhost-stage1-parallel`, which
-# starts the APs and lets the in-OS GCC driver build run with make -jN (see
-# kernel/console/selfhost.c). Overridden by test-selfhost-cert-parallel.
+# Multi-core closure knobs. The serial closure boots `selfhost-stage1` with 2
+# vCPUs but keeps the AP deferred during the in-OS build; the kexeced kernel
+# brings the AP online for `KEXEC_CAPABILITY_PASS`. The parallel closure boots
+# `selfhost-stage1-parallel`, which starts the APs and lets the in-OS GCC driver
+# build run with make -jN (see kernel/console/selfhost.c). Overridden by
+# test-selfhost-cert-parallel.
 SELFHOST_CMDLINE ?= selfhost-stage1
-SELFHOST_SMP ?= 1
+SELFHOST_SMP ?= 2
 SELFHOST_MEM ?= 2048M
+# Closure media: virtio (single 1 GiB FAT16 /work disk) or usb (two-partition
+# thumbdrive image: usb0p0 FAT root mounted at /icsos, usb0p1 FAT16 build
+# tree mounted at /work by work_mount_usb() in kernel/kernel32.c).
+SELFHOST_MEDIA ?= virtio
+SELFHOST_USB_IMG ?= /tmp/icsos-gccself-usb.img
+# Thumbdrive geometry: 1 MiB MBR gap, 64 MiB root, 1056 MiB build tree.
+SELFHOST_USB_P0_KIB ?= 65536
+SELFHOST_USB_P1_KIB ?= 1081344
+SELFHOST_USB_P0_OFF ?= 1048576
+SELFHOST_USB_P1_OFF ?= 68157440
+SELFHOST_USB_TOTAL_KIB ?= 1147904
 # COM2 (0x2F8) interactive shell endpoint. QEMU's second -serial maps to COM2;
 # 'nowait' lets the guest boot without a client, and a telnet client can then
 # attach for live command execution / introspection without a reboot:
@@ -1790,9 +2202,7 @@ test-selfhost-cert: vmdex apps/as.exe apps/ld.exe apps/ar.exe apps/hello.exe app
 	@printf 'set timeout=0\nmenuentry "ics" { multiboot2 /vmdex $(SELFHOST_CMDLINE); boot }\n' \
 		> /tmp/icsos-gccself-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-gccself.iso /tmp/icsos-gccself-iso >/dev/null 2>&1
-	@truncate -s 1G /tmp/icsos-gccself-work.img
-	@mkfs.vfat -F 16 -s 32 /tmp/icsos-gccself-work.img >/dev/null
-	@echo "Populating FAT work disk with GCC source, seed, apps, ldscripts..."
+	@echo "Staging apps, ldscripts, and SDK runtime objects..."
 	@mkdir -p /tmp/icsos-gccself-stage/apps/ldscripts
 	@cp /tmp/icsos-gcc/cc1 /tmp/icsos-gccself-stage/apps/cc1.exe
 	@cp contrib/gccdriver/gcc.exe /tmp/icsos-gccself-stage/apps/gcc.exe
@@ -1803,18 +2213,70 @@ test-selfhost-cert: vmdex apps/as.exe apps/ld.exe apps/ar.exe apps/hello.exe app
 		/tmp/icsos-gccself-stage/apps/
 	@cp apps/ldscripts/elf_x86_64.x* /tmp/icsos-gccself-stage/apps/ldscripts/
 	@cp /tmp/icsos-gcc/rt/*.o /tmp/icsos-gccself-stage/apps/
-	@mcopy -i /tmp/icsos-gccself-work.img -s /tmp/icsos-gccself/gccsrc ::gccsrc
-	@mcopy -i /tmp/icsos-gccself-work.img -s /tmp/icsos-gccself/seed ::seed
-	@mcopy -i /tmp/icsos-gccself-work.img -s /tmp/icsos-gccself-stage/apps ::apps
+	@if [ "$(SELFHOST_MEDIA)" = usb ]; then \
+		echo "Building two-partition USB selfhost image (usb0p0 root + usb0p1 build tree)..."; \
+		rm -f /tmp/icsos-gccself-p0.img /tmp/icsos-gccself-p1.img $(SELFHOST_USB_IMG); \
+		truncate -s $$(( $(SELFHOST_USB_P0_KIB) * 1024 )) /tmp/icsos-gccself-p0.img; \
+		truncate -s $$(( $(SELFHOST_USB_P1_KIB) * 1024 )) /tmp/icsos-gccself-p1.img; \
+		mkfs.vfat -F 16 -s 32 /tmp/icsos-gccself-p0.img >/dev/null; \
+		mkfs.vfat -F 16 -s 64 /tmp/icsos-gccself-p1.img >/dev/null; \
+		rm -rf /tmp/icsos-gccself-usbroot; \
+		mkdir -p /tmp/icsos-gccself-usbroot/apps; \
+		cp apps/make.exe apps/cp.exe apps/objcopy.exe apps/hello.exe \
+			/tmp/icsos-gccself-usbroot/apps/; \
+		cp /tmp/icsos-gcc/rt/*.o /tmp/icsos-gccself-usbroot/apps/; \
+		printf 'extern int puts(const char *s);\nint main(void)\n{\n   puts("GCC_E2E_OK");\n   return 0;\n}\n' \
+			> /tmp/icsos-gccself-usbroot/apps/gccprobe.c; \
+		cp /tmp/icsos-gccself-kernel/ksrc.tar /tmp/icsos-gccself-usbroot/ksrc.tar; \
+		cp /tmp/icsos-gccself-makesrc.tar /tmp/icsos-gccself-usbroot/makesrc.tar; \
+		printf '%s\n' 'set PATH=/icsos/apps' 'gccselfhost' 'reboot' \
+			> /tmp/icsos-gccself-usbroot/autoexec.bat; \
+		printf '%s\n' 'set PATH=/icsos/apps' 'exectest' 'gccclosed' 'kexeccert' 'reboot' \
+			> /tmp/icsos-gccself-usbroot/postkexec.bat; \
+		mcopy -i /tmp/icsos-gccself-p0.img -s /tmp/icsos-gccself-usbroot/apps ::apps; \
+		mcopy -o -i /tmp/icsos-gccself-p0.img \
+			/tmp/icsos-gccself-usbroot/ksrc.tar \
+			/tmp/icsos-gccself-usbroot/makesrc.tar \
+			/tmp/icsos-gccself-usbroot/autoexec.bat \
+			/tmp/icsos-gccself-usbroot/postkexec.bat ::; \
+		mcopy -i /tmp/icsos-gccself-p1.img -s /tmp/icsos-gccself/gccsrc ::gccsrc; \
+		mcopy -i /tmp/icsos-gccself-p1.img -s /tmp/icsos-gccself/seed ::seed; \
+		mcopy -i /tmp/icsos-gccself-p1.img -s /tmp/icsos-gccself-stage/apps ::apps; \
+		truncate -s $$(( $(SELFHOST_USB_TOTAL_KIB) * 1024 )) $(SELFHOST_USB_IMG); \
+		dd if=/tmp/icsos-gccself-p0.img of=$(SELFHOST_USB_IMG) bs=1M seek=1 conv=notrunc status=none; \
+		dd if=/tmp/icsos-gccself-p1.img of=$(SELFHOST_USB_IMG) bs=1M seek=65 conv=notrunc status=none; \
+		printf 'label: dos\n\n2048,%d,L\n%d,%d,L\n' \
+			$$(( $(SELFHOST_USB_P0_KIB) * 2 )) \
+			$$(( 2048 + $(SELFHOST_USB_P0_KIB) * 2 )) $$(( $(SELFHOST_USB_P1_KIB) * 2 )) \
+			| sfdisk $(SELFHOST_USB_IMG) >/dev/null; \
+	else \
+		truncate -s 1G /tmp/icsos-gccself-work.img; \
+		mkfs.vfat -F 16 -s 32 /tmp/icsos-gccself-work.img >/dev/null; \
+		mcopy -i /tmp/icsos-gccself-work.img -s /tmp/icsos-gccself/gccsrc ::gccsrc; \
+		mcopy -i /tmp/icsos-gccself-work.img -s /tmp/icsos-gccself/seed ::seed; \
+		mcopy -i /tmp/icsos-gccself-work.img -s /tmp/icsos-gccself-stage/apps ::apps; \
+	fi
 	@echo "Running strict GCC self-host closure test (may take several hours)..."
 	@rm -f /tmp/icsos-gccself.log
-	@-timeout $(CERT_TIMEOUT) $(QEMU_X64) -enable-kvm -cpu host -smp $(SELFHOST_SMP) \
-  		-display none -monitor none -serial file:/tmp/icsos-gccself.log \
-		-serial telnet:$(COM2_TELNET),server,nowait \
-		-no-reboot -m $(SELFHOST_MEM) -cdrom /tmp/icsos-gccself.iso -boot d \
-		-drive file=/tmp/icsos-gccself-work.img,if=none,id=vd0,format=raw \
-		-device virtio-blk-pci,drive=vd0,disable-legacy=on \
-		< /dev/null
+	@if [ "$(SELFHOST_MEDIA)" = usb ]; then \
+		timeout $(CERT_TIMEOUT) $(QEMU_X64) -enable-kvm -cpu host \
+			-machine q35 -smp $(SELFHOST_SMP) \
+			-display none -monitor none -serial file:/tmp/icsos-gccself.log \
+			-serial telnet:$(COM2_TELNET),server,nowait \
+			-no-reboot -m $(SELFHOST_MEM) -cdrom /tmp/icsos-gccself.iso -boot d \
+			-drive file=$(SELFHOST_USB_IMG),if=none,id=stick,format=raw \
+			-device qemu-xhci,id=xhci \
+			-device usb-storage,bus=xhci.0,drive=stick \
+			< /dev/null; \
+	else \
+		timeout $(CERT_TIMEOUT) $(QEMU_X64) -enable-kvm -cpu host -smp $(SELFHOST_SMP) \
+   			-display none -monitor none -serial file:/tmp/icsos-gccself.log \
+			-serial telnet:$(COM2_TELNET),server,nowait \
+			-no-reboot -m $(SELFHOST_MEM) -cdrom /tmp/icsos-gccself.iso -boot d \
+			-drive file=/tmp/icsos-gccself-work.img,if=none,id=vd0,format=raw \
+			-device virtio-blk-pci,drive=vd0,disable-legacy=on \
+			< /dev/null; \
+	fi
 	@grep -aq "GCC_SELF_OBJECTS_OK 349" /tmp/icsos-gccself.log
 	@grep -aq "GCC_SELF_ORCHESTRATOR GNU_MAKE_3_82" /tmp/icsos-gccself.log
 	@grep -aq "GCC_SELF_REBUILD_OK" /tmp/icsos-gccself.log
@@ -1834,8 +2296,19 @@ test-selfhost-cert: vmdex apps/as.exe apps/ld.exe apps/ar.exe apps/hello.exe app
 	@grep -aq "GCC_E2E_OK" /tmp/icsos-gccself.log
 	@grep -aq "GCC_CLOSED_TOOLCHAIN_RUN_OK" /tmp/icsos-gccself.log
 	@grep -aq "KEXEC_CAPABILITY_PASS" /tmp/icsos-gccself.log
+	@if [ "$(SELFHOST_MEDIA)" = usb ]; then \
+		grep -aq "usb: registered usb0p0" /tmp/icsos-gccself.log; \
+		grep -aq "usb: registered usb0p1" /tmp/icsos-gccself.log; \
+		grep -aq "work: mounted USB build partition (usb0p1)" /tmp/icsos-gccself.log; \
+		grep -aq "Root filesystem is the USB mass-storage device." /tmp/icsos-gccself.log; \
+		! grep -aq "PART_WARN\|PART_SCAN usb0 MBR read failed" /tmp/icsos-gccself.log; \
+	fi
 	@! grep -aq "GCC_SELF_.*FAIL\|GMAKE_SELF_FAIL\|GCC_DRV_FAIL\|GCC_CLOSED_TOOLCHAIN_FAIL\|GKBUILD_TEST_FAIL\|KEXEC_CAPABILITY_FAIL\|GCC_E2E_FAIL\|POOL EMPTY\|userpd map failed" /tmp/icsos-gccself.log
-	@echo "test-selfhost-cert PASS"
+	@if [ "$(SELFHOST_MEDIA)" = usb ]; then \
+		echo "test-selfhost-cert PASS (media=usb)"; \
+	else \
+		echo "test-selfhost-cert PASS"; \
+	fi
 
 # Multi-core strict self-host closure. Identical to test-selfhost-cert but boots
 # the `selfhost-stage1-parallel` kernel cmdline on 4 vCPUs with 4 GiB so the
@@ -1844,6 +2317,16 @@ test-selfhost-cert: vmdex apps/as.exe apps/ld.exe apps/ar.exe apps/hello.exe app
 # frontends plus their page-cache pressure.
 test-selfhost-cert-parallel:
 	@$(MAKE) test-selfhost-cert SELFHOST_CMDLINE=selfhost-stage1-parallel \
+		SELFHOST_SMP=4 SELFHOST_MEM=4096M
+
+# Strict self-host closure on a USB thumbdrive (q35 + xHCI). The two-partition
+# image puts the FAT root (autoexec, apps, ksrc/makesrc tars) on usb0p0 and the
+# GCC build tree on usb0p1, which the kernel mounts at /work (work_mount_usb,
+# kernel/kernel32.c). The closure itself is the parallel 4-vCPU variant: the
+# kexeced kernel must bring up SMP for KEXEC_CAPABILITY_PASS.
+test-selfhost-cert-usb:
+	@$(MAKE) test-selfhost-cert SELFHOST_MEDIA=usb \
+		SELFHOST_CMDLINE=selfhost-stage1-parallel \
 		SELFHOST_SMP=4 SELFHOST_MEM=4096M
 
 # Full QEMU integration suite for the x86_64 / SMP / ELF64 path.

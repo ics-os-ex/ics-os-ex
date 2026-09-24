@@ -26,10 +26,14 @@ static int getline(char *buf, int n)
       long r = dexsdk_systemcall(FXN_SYSREAD, 0, (long)&c, 1, 0, 0);
       if (r <= 0)
          break;
+      if (c == 3)
+         return 0;
       buf[i++] = c;
       if (c == '\n' || c == '\r')
          break;
    }
+   while (i > 0 && (buf[i-1] == '\n' || buf[i-1] == '\r'))
+      i--;
    buf[i] = 0;
    return i;
 }
@@ -44,23 +48,23 @@ int main(int argc, char **argv)
    char line[256];
    (void)argc;
    (void)argv;
-   putstr("ICS-OS sh (userland). Type help. Ctrl-C interrupts.\n");
+   putstr("ICS-OS sh (userland). Type help. Ctrl-C interrupts.\r\n");
    for (;;) {
       char *cmd;
       putstr("sh$ ");
       if (getline(line, sizeof(line)) <= 0)
-         continue;
+         break;
       cmd = line;
       while (*cmd == ' ')
          cmd++;
-      if (cmd[0] == 0 || cmd[0] == '\n')
+      if (cmd[0] == 0 || cmd[0] == '\n' || cmd[0] == '\r')
          continue;
       if (strncmp(cmd, "exit", 4) == 0)
          break;
       if (strncmp(cmd, "echo ", 5) == 0) {
          putstr(cmd + 5);
          if (!strchr(cmd, '\n'))
-            putstr("\n");
+            putstr("\r\n");
          continue;
       }
       if (strncmp(cmd, "help", 4) == 0) {
@@ -70,13 +74,15 @@ int main(int argc, char **argv)
       {
          char name[128], path[192];
          int j = 0;
-         while (cmd[j] && cmd[j] != ' ' && cmd[j] != '\n' && j < 127) {
+         while (cmd[j] && cmd[j] != ' ' && cmd[j] != '\n' && cmd[j] != '\r' && j < 127) {
             name[j] = cmd[j];
             j++;
          }
          name[j] = 0;
          strcpy(path, "/icsos/apps/");
          strcat(path, name);
+         if (!strchr(name, '.') && j < 120)
+            strcat(path, ".exe");
          if (execp(path, 0, cmd) == 0)
             kcmd(cmd);
       }

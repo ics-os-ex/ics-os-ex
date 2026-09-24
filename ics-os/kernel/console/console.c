@@ -1788,8 +1788,18 @@ void console_main(){
    myfg = fg_register(myddl, getprocessid());
    fg_setforeground( myfg->id );
    {
-      tty_t *t = tty_alloc((struct _dex32_direct_device_hdl *)myddl,
-                           TTY_ECHO | TTY_ICANON | TTY_ISIG);
+      int tflags = TTY_ECHO | TTY_ICANON | TTY_ISIG;
+      struct _dex32_direct_device_hdl *tdl = (struct _dex32_direct_device_hdl *)myddl;
+      /* Headless oracle: when there is no real VGA framebuffer (a QEMU
+         -nographic boot, or a laptop with no VGA), the DDL's hardware
+         pointer is a malloc'd shadow buffer, not 0xB8000.  In that case the
+         console tty must be serial-backed so full-screen applications
+         (e.g. NetHack, which writes to the tty rather than the serial log)
+         are visible on the serial console.  vt_feed() routes TTY_SERIAL
+         bytes straight to COM1; a real VGA console keeps the DDL path. */
+      if (myddl && (myddl->hdw_ptr == 0 || (void *)myddl->hdw_ptr != (void *)0xB8000))
+         tflags |= TTY_SERIAL;
+      tty_t *t = tty_alloc(tdl, tflags);
       tty_set_fg(t);
       tty_attach_proc(current_process, t);
       if (myfg && myfg != (fg_processinfo *)-1)
@@ -1869,12 +1879,6 @@ void shell2_main(void)
     static char line[512];
     int len = 0;
     int saw_cr = 0;
-    extern int serial2_getc(void);
-    extern void serial2_putc(char c);
-    extern void serial2_puts(const char *s);
-    extern void serial2_mirror_set(int on);
-    extern void taskswitch(void);
-
     serial2_mirror_set(1);
     serial2_puts("\r\n[ICS-OS com2 shell] type 'help' for commands, 'exit' to quit\r\n");
     serial2_puts("com2> ");

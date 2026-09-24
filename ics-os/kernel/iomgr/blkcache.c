@@ -23,7 +23,15 @@ extern void blk_mq_unlock(int deviceid);
 
 #define PC_SHIFT    12
 #define PC_SIZE     (1u << PC_SHIFT)
-#define PC_NPAGES   512
+/* The ELF64 stream loader pages an executable through this cache one 4KiB
+   line at a time.  With only 512 lines (2 MiB) a 3.8 MiB NetHack image
+   thrashed the cache: every 4KiB read missed, evicted a line it would need
+   again shortly, and re-read the same 4KiB from the CD -- ~28 s of TCG time
+   just to load.  4096 lines (16 MiB) hold the whole image (and the in-OS
+   cc1's 22 MiB mostly), so a full load is one sequential pass over the CD.
+   The table itself is ~16 MiB of kernel heap; the 256 MiB test boots keep
+   the rest, and the extra lines also keep FAT /work volumes hot. */
+#define PC_NPAGES   4096
 #define PC_UPTODATE 1
 #define PC_DIRTY    2
 #define PC_MAX_IO   (32u * PC_SIZE)
@@ -51,8 +59,8 @@ void blkcache_init(void)
    int i;
    memset(&pc_busy, 0, sizeof(pc_busy));
    memset(pc_bsz, 0, sizeof(pc_bsz));
-   memset(pc_bsz_generation, 0, sizeof(pc_bsz_generation));
-   pc_tab = (pc_page *)malloc(sizeof(pc_page) * PC_NPAGES);
+    memset(pc_bsz_generation, 0, sizeof(pc_bsz_generation));
+    pc_tab = (pc_page *)malloc(sizeof(pc_page) * PC_NPAGES);
    if (!pc_tab) {
       printf("pagecache: alloc failed\n");
       return;
@@ -240,13 +248,13 @@ int blkcache_get(int deviceid, u64 sector, DWORD numblocks, void *buf)
       return 0;
    bsz = pc_bsize(deviceid);
    bytes = (u64)numblocks * bsz;
-   sync_entercrit(&pc_busy);
-   ok = pc_copy_out(deviceid, sector * bsz, bytes, (char *)buf);
-   if (ok)
-      pc_hits += numblocks;
-   sync_leavecrit(&pc_busy);
-   return ok;
-}
+  sync_entercrit(&pc_busy);
+    ok = pc_copy_out(deviceid, sector * bsz, bytes, (char *)buf);
+    if (ok)
+       pc_hits += numblocks;
+  sync_leavecrit(&pc_busy);
+    return ok;
+ }
 
 int blkcache_put(int deviceid, u64 sector, DWORD numblocks, void *buf)
 {
@@ -323,9 +331,10 @@ static int pc_dev_rw(int deviceid, int write, u64 lba, DWORD nsect, void *buf,
       retval=b->read_block(lba,(char *)buf,nsect) > 0;
    }
    devmgr_setcontext(last_context);
-   devmgr_putdevice((devmgr_generic *)b);
-   return retval;
-}
+    devmgr_putdevice((devmgr_generic *)b);
+    return retval;
+ }
+
 
 static int pc_fill_range(int deviceid, u64 pg0, u64 pg1)
 {
@@ -403,26 +412,27 @@ int blkcache_read(int deviceid, u64 sector, DWORD numblocks, void *buf)
    pg0 = start >> PC_SHIFT;
    pg1 = (end - 1) >> PC_SHIFT;
 
-  sync_entercrit(&pc_busy);
+ sync_entercrit(&pc_busy);
+     ok = pc_copy_out(deviceid, start, end - start, (char *)buf);
+     if (ok) {
+        pc_hits += numblocks;
+         sync_leavecrit(&pc_busy);
+         return 1;
+     }
+     pc_misses += numblocks;
+     sync_leavecrit(&pc_busy);
+
+      if (!pc_fill_range(deviceid, pg0, pg1))
+        return pc_dev_rw(deviceid, 0, sector, numblocks, buf, 0);
+
+     sync_entercrit(&pc_busy);
     ok = pc_copy_out(deviceid, start, end - start, (char *)buf);
-    if (ok) {
-       pc_hits += numblocks;
-       sync_leavecrit(&pc_busy);
-       return 1;
-    }
-    pc_misses += numblocks;
     sync_leavecrit(&pc_busy);
-
-    if (!pc_fill_range(deviceid, pg0, pg1))
-      return pc_dev_rw(deviceid, 0, sector, numblocks, buf, 0);
-
-   sync_entercrit(&pc_busy);
-   ok = pc_copy_out(deviceid, start, end - start, (char *)buf);
-   sync_leavecrit(&pc_busy);
-   if (ok)
-      return 1;
-   return pc_dev_rw(deviceid, 0, sector, numblocks, buf, 0);
-}
+     if (ok) {
+        return 1;
+     }
+    return pc_dev_rw(deviceid, 0, sector, numblocks, buf, 0);
+ }
 
 int blkcache_write(int deviceid, u64 sector, DWORD numblocks, void *buf)
 {

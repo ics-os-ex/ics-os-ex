@@ -33,6 +33,7 @@
  * NOT include <sys/wait.h> here because it pulls in <sys/types.h>, whose
  * clock_t typedef conflicts with dexsdk.h's own clock_t in this TU. */
 int waitpid(int pid, int *status, int options);
+extern ssize_t write(int, const void *, size_t);
 
 //global ANSI variables
 int errno;
@@ -66,8 +67,9 @@ void getparameters(char *buf){
 };
 
 void charputc(char c){
-   dexsdk_systemcall(6,(long)(unsigned char)c,0,0,0,0);
-};  
+   /* Route through stdout so telnetd remapped sockets see printf. */
+   dexsdk_systemcall(0xA5, 1, (long)&c, 1, 0, 0);
+};
 
 /*this strtok is still not thread safe, so be careful!*/
 char *strtok(char *s, const char *delim){
@@ -118,13 +120,13 @@ cont:
 };
 
 size_t strlen(const char *str){
-   const char *s;
+    const char *s;
 
-   if (str == 0)
-      return 0;
-   for (s = str; *s; ++s)
-      ;
-   return s-str;
+    if (str == 0)
+       return 0;
+    for (s = str; *s; ++s)
+       ;
+    return s-str;
 };
 
 
@@ -1461,7 +1463,12 @@ int fread(void *buf,int itemsize,int noitems,FILE* fhandle){
       bytes=read(fd,buf,(unsigned long)itemsize*(unsigned long)noitems);
       return bytes > 0 ? bytes/itemsize : 0;
    }
-   return dexsdk_systemcall(0x39,(long)buf,itemsize,noitems,(long)fhandle,0);
+   if (itemsize <= 0 || noitems <= 0)
+        return 0;
+    {
+        long bytes = (long)dexsdk_systemcall(0x39,(long)buf,itemsize,noitems,(long)fhandle,0);
+        return bytes > 0 ? (int)(bytes / itemsize) : 0;
+    }
 };
 
 /* FILE is an opaque kernel handle, so retain a small user-side write cache
@@ -1779,8 +1786,13 @@ int thread_join(int tid){
 
 /* getenv() lives in posix.c (POSIX 1-arg) */
 
+extern void sdk_env_cache_set(const char *name, const char *value);
+
 int setenv(const char *name, const char *value, int replace){
-   return dexsdk_systemcall(0xA0,(long)name,(long)value,(int)replace,0,0);
+    int ret = (int)dexsdk_systemcall(0xA0,(long)name,(long)value,(int)replace,0,0);
+    if (ret == 0)
+        sdk_env_cache_set(name, value);
+    return ret;
 }
 
 

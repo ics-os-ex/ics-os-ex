@@ -121,7 +121,8 @@ void GPFhandler64(struct gpf_info *fi, unsigned long saved_rax, unsigned long sa
                           : ps_find_by_cr3((unsigned long)fi->cr3);
         if (owner && owner->accesslevel == ACCESS_USER &&
             owner != current_process &&
-            cpu >= 0 && cpu < MAX_CPUS)
+            cpu >= 0 && cpu < MAX_CPUS &&
+            owner->on_cpu == cpu)
            cpus[cpu].current = owner;
      }
 #endif
@@ -537,7 +538,7 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
                   saved_regs[14], saved_regs[13], saved_regs[12],
                   saved_regs[11], saved_regs[10], saved_regs[9],
                   saved_regs[8], frsp);
-          serial_puts(line);
+         serial_puts(line);
           if (kernel_rip)
              exc_kstack_report("PF64", frsp, rip, saved_regs[8]);
       }
@@ -548,9 +549,23 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
          (u64 *)(uintptr)fault_proc->pagedirloc,
          (unsigned long long)location,(unsigned)fault_info);
       if (cow_result>0) {
-         pf_busy[fault_cpu]=0;
-         return 0;
-      }
+          /* The COW was resolved against fault_proc (found by CR3).  If the
+             advertised current is a different task, the CPU is running
+             fault_proc's address space while cpus[].current still names
+             another PCB; the next ps_switchto would save this task's live
+             state into the wrong ctx.  Reconcile, like the not-present
+             paths below do, before iretq resumes the faulting instruction. */
+          /* Only retarget when this CPU already owns the claim.  Adopting
+             an unclaimed child during the parent's COW clone pointed
+             current at that child, and the next IRQ entered its kstack
+             while another CPU scheduled it. */
+          if (fault_proc != current_process &&
+              fault_cpu >= 0 && fault_cpu < MAX_CPUS &&
+              fault_proc->on_cpu == fault_cpu)
+             cpus[fault_cpu].current = fault_proc;
+          pf_busy[fault_cpu]=0;
+          return 0;
+       }
       if (cow_result<0) {
          serial_puts("PF64: COW resolution failed\n");
          pf_busy[fault_cpu]=0;
@@ -619,7 +634,8 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
            pf_busy[fault_cpu] = 0;
            if (fault_proc->accesslevel == ACCESS_USER) {
               if (fault_proc != current_process &&
-                  fault_cpu >= 0 && fault_cpu < MAX_CPUS)
+                  fault_cpu >= 0 && fault_cpu < MAX_CPUS &&
+                  fault_proc->on_cpu == fault_cpu)
                  cpus[fault_cpu].current = fault_proc;
               serial_puts("PF64: user not-present -> killing process\n");
               exc_recover();
@@ -644,7 +660,8 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
        pf_busy[fault_cpu] = 0;
        if (fault_proc->accesslevel == ACCESS_USER) {
           if (fault_proc != current_process &&
-              fault_cpu >= 0 && fault_cpu < MAX_CPUS)
+              fault_cpu >= 0 && fault_cpu < MAX_CPUS &&
+              fault_proc->on_cpu == fault_cpu)
              cpus[fault_cpu].current = fault_proc;
           serial_puts("PF64: user not-present -> killing process\n");
           exc_recover();
@@ -732,7 +749,8 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
    if (!kernel_rip) {
       if (fault_proc && fault_proc->accesslevel == ACCESS_USER) {
          if (fault_proc != current_process &&
-             fault_cpu >= 0 && fault_cpu < MAX_CPUS)
+             fault_cpu >= 0 && fault_cpu < MAX_CPUS &&
+             fault_proc->on_cpu == fault_cpu)
             cpus[fault_cpu].current = fault_proc;
          serial_puts("PF64: user unhandled -> killing process\n");
          exc_recover();
@@ -743,7 +761,8 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
    if (fault_proc && fault_proc->accesslevel == ACCESS_USER) {
       serial_puts("PF64: kernel unhandled -> killing user\n");
       if (fault_proc != current_process &&
-          fault_cpu >= 0 && fault_cpu < MAX_CPUS)
+          fault_cpu >= 0 && fault_cpu < MAX_CPUS &&
+          fault_proc->on_cpu == fault_cpu)
          cpus[fault_cpu].current = fault_proc;
       exc_recover();
    }
@@ -769,7 +788,7 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
        kbd_boot_leds_raw(0);
        while (1);
     }
-    /* Non-zero so waiters can distinguish crash from clean exit(0). */
+   /* Non-zero so waiters can distinguish crash from clean exit(0). */
     dex32_child_faulted = 1;
     exit(1);
     startints();

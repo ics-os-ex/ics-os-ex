@@ -31,13 +31,11 @@
    
    
    int iso9660_myid = 0;
-   
-   int iso9660_loaddirectory(iso9660_directory *dirinfo, void **buffer,int id)
-   {
-        int sectors;
-        int handle;
-        *buffer = malloc(dirinfo->length_le);
-        
+int iso9660_loaddirectory(iso9660_directory *dirinfo, void **buffer,int id)
+{
+     int sectors;
+     int handle;
+     *buffer = malloc(dirinfo->length_le);
         //obtain the number of sectors
         if  ((dirinfo->length_le % 2048) != 0)
                 sectors = (dirinfo->length_le / 2048) + 1;
@@ -341,7 +339,6 @@ int iso9660_mountdirectory(vfs_node *directory, int id)
             int i;
             iso9660_directory *dir =(iso9660_directory*)dirptr;
             vfs_node *node;
-            
             /* Directory records do not span sectors; unused bytes at the
                end of a sector are zero. Skip to the next sector instead of
                treating that padding as end-of-directory (which hid later

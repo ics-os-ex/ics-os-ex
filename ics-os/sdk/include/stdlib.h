@@ -44,6 +44,12 @@ int abs(int n);
 long labs(long n);
 int rand(void);
 void srand(unsigned int seed);
+/* glibc-compatible 48-bit linear congruential generator. NetHack (SYSV
+ * config) drives its game RNG through lrand48()/srand48() and relies on the
+ * standard period (~2^48), so the implementation in posix.c must match the
+ * glibc/ISO recurrence exactly. */
+long lrand48(void);
+void srand48(long seed);
 int system(const char *cmd);
 char *mktemp(char *template);
 

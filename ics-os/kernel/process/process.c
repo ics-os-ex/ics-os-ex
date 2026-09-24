@@ -27,6 +27,7 @@
 #include "scheduler.h"
 #include "completion.h"
 #include "irq_kstack.h"
+#include "../cpu/context.h"
 #include "../vfs/posixfd.h"
 
 extern unsigned int ticks;
@@ -856,9 +857,33 @@ volatile char *irqwrap_offchk_use=&irqwrap_offchk_cpu[0];
 volatile char *irqwrap_offchk_use2=&irqwrap_offchk_pcb[0];
 volatile char *irqwrap_offchk_use3=&irqwrap_userstack_chk[0];
 
-long user_fork_frame(u64 *frame)
-{
-   PCB386 *parent=current_process;
+/* Diagnostic: name which user_fork_frame failure path fired, with the
+    parent state that drove it.  Bounded so a failing fork storm cannot flood
+    the serial oracle. */
+ static void fork_frame_fail(const char *tag, PCB386 *parent, long code)
+ {
+    static volatile unsigned long n = 0;
+    char b[192];
+    if (n >= 24)
+       return;
+    n++;
+    sprintf(b, "FORK-FAIL %s code=%d cpu=%d parent=%d lvl=%d private=%d thread=%d otherth=%d nlive=%d waitq_n=%d fds=%d frame_ok=%d\n",
+           tag, (int)code, smp_cpu_id(),
+           parent ? (int)parent->processid : -1,
+           parent ? (int)parent->accesslevel : -1,
+           parent ? (int)userpd_is_private(parent->pagedirloc) : -1,
+           parent ? (int)(parent->status & PS_ATTB_THREAD) : -1,
+           parent ? (int)fork_has_other_threads(parent) : -1,
+           parent ? (int)parent->nlive : -1,
+           parent ? (int)parent->waitq_n : -1,
+           parent ? posix_fd_fork_ready(parent) : -1,
+           1);
+    serial_puts(b);
+ }
+
+ long user_fork_frame(u64 *frame)
+ {
+    PCB386 *parent=current_process;
    PCB386 *child=0;
    u64 *child_pml4=0;
    u64 *child_rax;
@@ -872,10 +897,11 @@ long user_fork_frame(u64 *frame)
        || !userpd_is_private(parent->pagedirloc)
          || fork_has_other_threads(parent)
          || parent->nlive+parent->waitq_n>=WAITQ_MAX
-         || posix_fd_fork_ready(parent)<0) {
-      restoreflags(entry_flags);
-      return -11;
-   }
+          || posix_fd_fork_ready(parent)<0) {
+       restoreflags(entry_flags);
+       fork_frame_fail("VALID", parent, -11);
+       return -11;
+    }
 
    /* Prefer the wrapper's PUSH_ALL pointer (this syscall). irq_user_rsp is
       only a fallback: it can still name a prior timer frame, and a child
@@ -890,19 +916,21 @@ long user_fork_frame(u64 *frame)
           && alt + 0x90ULL <= (u64)MEM_USER_STACK)
          user_frame=alt;
       else {
-         restoreflags(entry_flags);
-         return -13;
-      }
-   }
-   parent->irq_user_rsp=user_frame;
+          restoreflags(entry_flags);
+          fork_frame_fail("FRAME", parent, -13);
+          return -13;
+       }
+    }
+    parent->irq_user_rsp=user_frame;
 
    child_pml4=userpd_clone_cow((u64 *)(uintptr)parent->pagedirloc,
                                (unsigned long long)user_frame);
    if (!child_pml4) {
-      restoreflags(entry_flags);
-      return -12;
-   }
-   child_rax=(u64 *)userpd_resolve(child_pml4,
+       restoreflags(entry_flags);
+       fork_frame_fail("CLONE", parent, -12);
+       return -12;
+    }
+    child_rax=(u64 *)userpd_resolve(child_pml4,
                                    (unsigned long long)user_frame+112);
    if (!child_rax)
       goto nomem;
@@ -993,11 +1021,12 @@ fail:
    pcb_free_irq_kstack(child);
    free(child);
 nomem:
-   userpd_free(child_pml4);
-   restoreflags(entry_flags);
-   return -12;
-}
-#endif
+    fork_frame_fail("NOMEM", parent, -12);
+    userpd_free(child_pml4);
+    restoreflags(entry_flags);
+    return -12;
+ }
+ #endif
 
 //duplicates a process using the legacy 32-bit paging path
 DWORD forkprocess(PCB386 *parent){
@@ -2374,19 +2403,27 @@ static int ps_pcb_running_elsewhere(PCB386 *p, int me)
    int j;
    if (!p)
       return 0;
+   /* on_cpu is authoritative for liveness.  A PCB claimed by another core
+      (on_cpu >= 0 && != me) is live there; claiming it here would put two
+      CPUs on one PCB and one IRQ kstack.  The relaxed "only block when the
+      advertising core also claims it" version let a second core run a task
+      mid-exit on a first core (double-run pid27 around SDK_EXIT), which then
+      published a cross-CPU idle as current and broke the next fork
+      (parent=-65534, FORK-FAIL -11). */
+   if (p->on_cpu >= 0 && p->on_cpu != me)
+      return 1;
    for (j = 0; j < cpu_count && j < MAX_CPUS; j++) {
       if (j == me || !cpus[j].online)
          continue;
       if ((PCB386 *)cpus[j].current != p)
          continue;
-      /* A stale current pointer (this PCB advertised after the CPU
-         switched away, or after a leftover on_cpu claim) must not block
-         migration: test-fatwrite-coop hung with vfs_busy held by pid 31
-         on_cpu=3 while CPU 3 ran the waiter, because the old "any
-         current==p" check kept unclaiming the holder.  Treat the other
-         CPU as live only if it still claims the PCB, or it released
-         on_cpu but has not published a successor. */
-      if (p->on_cpu == j || p->on_cpu < 0)
+      /* Released on_cpu (p->on_cpu < 0) but another core still advertises it
+         and has not published a successor: that core is between releasing the
+         claim and switching, so treat the PCB as live there.  The live-claim
+         case (p->on_cpu == j) is now caught by the authoritative check above.
+         test-fatwrite-coop's stale-current hang is bounded to this on_cpu<0
+         window, not the live-claim path. */
+      if (p->on_cpu < 0)
          return 1;
    }
    return 0;
@@ -2415,11 +2452,42 @@ PCB386 *ps_find_by_cr3(unsigned long cr3)
    return 0;
 }
 
+/* Anomaly logger for the current pointer: fires only when a CPU is about to
+   advertise, as its current, another CPU's idle PCB (processid 0xFFFF0000|id
+   with id != me).  A cross-CPU idle advertisement means the CPU will run a
+   kernel idle whose on_cpu/cpu_affinity name a different core, and the next
+   user syscall on this core reads that idle PCB as current_process (fork
+   parent=-65535 on cpu=0).  Bounded; the writer tag identifies the path. */
+void ps_current_anom_log(const char *fn, int me, PCB386 *task)
+{
+   DWORD pid;
+   if (!task)
+      return;
+   pid = task->processid;
+   if ((pid & 0xFFFF0000) != 0xFFFF0000)
+      return;
+   if ((int)(pid & 0xFFFF) == me)
+      return;
+   {
+      static volatile unsigned long an = 0;
+      char b[160];
+      if (an < 32) {
+         an++;
+         sprintf(b, "CUR-ANOM %s cpu=%d task=pid0x%lx own=%d aff=%d\n",
+                 fn, me, (unsigned long)pid, (int)(pid & 0xFFFF),
+                 (int)task->cpu_affinity);
+         serial_puts(b);
+      }
+   }
+}
+
 static void ps_publish_current(int me, PCB386 *task)
 {
-   if (me >= 0 && me < MAX_CPUS)
-      cpus[me].current = task;
-   __sync_synchronize();
+    if (me >= 0 && me < MAX_CPUS) {
+       ps_current_anom_log("publish", me, task);
+       cpus[me].current = task;
+    }
+    __sync_synchronize();
 }
 
 /* Drop a scheduler CAS that this CPU has not yet published as current. */
@@ -2437,8 +2505,8 @@ void ps_switchto(PCB386 *process){
 
    if (!process)
       return;
-   if (ps_switchto_in_progress[me])
-      return; /* already switching — a nested call from IRQ would corrupt ctx */
+  if (ps_switchto_in_progress[me])
+       return; /* already switching — a nested call from IRQ would corrupt ctx */
    ps_switchto_in_progress[me] = 1;
 
    /* Always require the claim, including process==prev.  Skipping that left
@@ -2487,8 +2555,8 @@ void ps_switchto(PCB386 *process){
       context_load's final `ret` will see ps_switchto_in_progress[me]==1
       and bail out of schedule_from_timer without touching contexts. */
 
-   /* Seed context from legacy TSS fields on first run. */
-   if (process->ctx.rip == 0 && process->regs.EIP != 0) {
+    /* Seed context from legacy TSS fields on first run. */
+    if (process->ctx.rip == 0 && process->regs.EIP != 0) {
       memset(&process->ctx, 0, sizeof(process->ctx));
       process->ctx.rip = (u64)process->regs.EIP;
       process->ctx.rsp = (u64)process->regs.ESP;
@@ -2511,6 +2579,15 @@ void ps_switchto(PCB386 *process){
       this CPU does not own makes the next IRQ pick up that task's IRQ kstack
       (or user stack) while its real owner is still running it. */
    if (process->on_cpu != me || ps_pcb_running_elsewhere(process, me)) {
+      ps_unclaim_if_unused(process, prev, me);
+      ps_switchto_in_progress[me] = 0;
+      startints();
+      return;
+   }
+   /* Another CPU's idle has that CPU's stack and context.  Loading it
+      here is how a migrated self_exit published pid 0xFFFF0003 on CPU 0. */
+   if (foreign_idle_pid(me, (unsigned long)process->processid)) {
+      ps_current_anom_log("switch", me, process);
       ps_unclaim_if_unused(process, prev, me);
       ps_switchto_in_progress[me] = 0;
       startints();
@@ -2548,8 +2625,12 @@ void ps_switchto(PCB386 *process){
        before we ret into it. */
     {
       u64 rr = process->ctx.rip;
-      int ok = (rr >= 0x100000ULL && rr < 0x300000ULL)
-            || (rr >= 0x400000ULL && rr < 0x100000000ULL);
+       /* Tight code window: kernel image [0x100000,0x400000) and the user
+          ELF window [0x400000,0x1800000).  The old check accepted any address
+          below 4GiB as "user code", so a wild saved RIP in the 0x1800000..4G
+          gap (e.g. 0x779950ba) passed and executed as garbage (emulation
+          failure).  Everything else means the context RIP was corrupted. */
+       int ok = (rr >= 0x100000ULL && rr < MEM_USER_ELF_END);
       if (!ok) {
          char cb[160];
          char nm[12];
@@ -2578,43 +2659,79 @@ void ps_switchto(PCB386 *process){
        }
     }
 
-     if (prev && prev != process)
-       context_switch(&prev->ctx, &process->ctx, &prev->on_cpu, me);
-     else
-       context_load(&process->ctx, me);
+      if (prev && prev != process)
+        context_switch(&prev->ctx, &process->ctx, &prev->on_cpu, me);
+      else
+        context_load(&process->ctx, me);
 };
 
 /* Leftover timer abandon: load dest without saving prev from this RSP.
    context_switch from a leftover user/CPUIRQ stack smashed idle/make
-   (cert 248136). */
-static void ps_switchto_load_only(PCB386 *process)
+   (cert 248136).  `held` is a task whose on_cpu this CPU still owns and
+   whose stack this IRQ is still on (smp_abandon retargeted current to
+   idle without dropping that claim).  The claim is cleared only after
+   RSP has moved. */
+static void ps_switchto_load_only(PCB386 *process, PCB386 *held)
 {
    int me = smp_cpu_id();
    PCB386 *prev;
+   PCB386 *drop;
 
-   if (!process)
-      return;
    if (me < 0 || me >= MAX_CPUS)
       return;
-   if (ps_switchto_in_progress[me] || ctx_load_in_progress[me])
+   if (!process || ps_switchto_in_progress[me] || ctx_load_in_progress[me]) {
+      if (held)
+         cpus[me].current = held;
       return;
+   }
    prev = (PCB386 *)cpus[me].current;
-   if (process->on_cpu >= 0 && process->on_cpu != me)
+   if (process->on_cpu >= 0 && process->on_cpu != me) {
+      if (held)
+         cpus[me].current = held;
       return;
+   }
    if (process->on_cpu < 0 &&
-       !__sync_bool_compare_and_swap(&process->on_cpu, -1, me))
+       !__sync_bool_compare_and_swap(&process->on_cpu, -1, me)) {
+      if (held)
+         cpus[me].current = held;
       return;
+   }
    ps_switchto_in_progress[me] = 1;
    stopints();
-   if (process->on_cpu != me) {
+   if (process->on_cpu != me ||
+       foreign_idle_pid(me, (unsigned long)process->processid)) {
+      if (foreign_idle_pid(me, (unsigned long)process->processid))
+         ps_current_anom_log("load", me, process);
+      if (process->on_cpu == me && process != prev && process != held)
+         process->on_cpu = -1;
+      ps_switchto_in_progress[me] = 0;
+      if (held)
+         cpus[me].current = held;
+      startints();
+      return;
+   }
+   /* The timer is still on `held`'s live frame.  Reloading that PCB's
+      saved ctx rewinds a syscall onto a snapshot another CPU can also
+      load (fork_child_return / torn stack).  Iret the live frame. */
+   if (held && held == process) {
+      cpus[me].current = held;
       ps_switchto_in_progress[me] = 0;
       startints();
       return;
    }
-   (void)prev;
+   /* held is the stack we are leaving when abandon already published
+      idle as current, so prev is idle and must not be the PCB we drop. */
+   drop = 0;
+   if (held && held->on_cpu == me)
+      drop = held;
+   else if (prev && prev != process && prev->on_cpu == me)
+      drop = prev;
    ps_publish_current(me, process);
    fpu_restore(&process->fpu);
-   context_load(&process->ctx, me);
+   if (drop)
+      context_load_release(&process->ctx, me, &drop->on_cpu);
+   else
+      context_load(&process->ctx, me);
 }
 
 
@@ -2800,13 +2917,27 @@ static int zfree_pml4_liveness_check(PCB386 *z)
     return 0;
 }
 
+/* This CPU's idle PCB, or NULL when the slot is empty or names another
+   CPU.  The BSP never runs ap_prepare_idle(), so cpus[0].idle stays NULL
+   and the caller falls back to sPCB. */
+static PCB386 *ps_cpu_idle(int me)
+{
+   PCB386 *idle;
+   if (me < 0 || me >= MAX_CPUS)
+      return 0;
+   idle = (PCB386 *)cpus[me].idle;
+   if (!idle || foreign_idle_pid(me, (unsigned long)idle->processid))
+      return 0;
+   return idle;
+}
+
 static void self_exit_current(void)
 {
    PCB386 *dying = current_process;
    PCB386 *parent;
    PCB386 *readyprocess;
    devmgr_scheduler_extension *cursched;
-   int me = smp_cpu_id();
+   int me;
 
    if (!dying)
        return;
@@ -2833,6 +2964,18 @@ static void self_exit_current(void)
       on_cpu = me further down; another CPU could claim the parent in between,
       leaving two CPUs running one PCB -- and therefore sharing one IRQ kstack
       (KSTACK-FOREIGN). */
+   /* Close and processmgr acquire can taskswitch.  A preempted exit
+      resumes on another CPU with the stack-local cpu id still naming the
+      old core, then smp_this_cpu()->idle is the new core's idle and
+      ps_publish_current(old me, that idle) installs it on the original
+      slot (CUR-ANOM cpu=0 task=pid0xffff0003, FORK-FAIL parent=-65533).
+      Sample me only after that window, with interrupts off, and keep
+      them off through context_load. */
+   stopints();
+   me = smp_cpu_id();
+   if (me < 0 || me >= MAX_CPUS)
+      me = 0;
+
    readyprocess = 0;
    /* Only CAS from -1.  `on_cpu == me` here is a leftover claim: current
       is the dying child, so the parent is not running on this CPU.  Taking
@@ -2847,7 +2990,7 @@ static void self_exit_current(void)
         !ps_pcb_running_elsewhere(parent, me))
        readyprocess = parent;
    if (!readyprocess) {
-      readyprocess = (PCB386*)smp_this_cpu()->idle;
+      readyprocess = ps_cpu_idle(me);
       if (readyprocess && readyprocess != dying
           && readyprocess->on_cpu != me
           && !__sync_bool_compare_and_swap(&readyprocess->on_cpu, -1, me))
@@ -2872,7 +3015,7 @@ static void self_exit_current(void)
          high half is another CPU's 32-bit smp_cpu_id() result -- a return
          address read back as 0x1_xxxxxxxx, faulting in the serial path. */
       if (!readyprocess || readyprocess == dying) {
-         PCB386 *idle = (PCB386 *)smp_this_cpu()->idle;
+         PCB386 *idle = ps_cpu_idle(me);
          if (idle && idle != dying) {
             idle->on_cpu = me;
             readyprocess = idle;
@@ -2882,14 +3025,14 @@ static void self_exit_current(void)
       }
    }
 
-   /* Mark DYING, dequeue while still claimed (on_cpu == me), then drop
-      on_cpu.  kill_process must not observe on_cpu < 0 for a PCB that is
-      still in the ready ring. */
+   /* Mark DYING and dequeue while still claimed.  on_cpu stays ours
+      until context_load_release has left this stack: clearing it here
+      let another CPU enter the exiting task (torn 0x100000003).
+      kill_process sees DYING and does not treat the PCB as off-CPU. */
     dying->status |= PS_ATTB_DYING;
     dying->status |= PS_ATTB_UNLOADABLE;
     __sync_synchronize();
     ps_dequeue(dying);
-    dying->on_cpu = -1;
         sync_leavecrit(&processmgr_busy);
         /* Held-crit sweep MUST run before the PCB is published to the
            zombie list: the BSP reclaims zombies in schedule_from_timer()
@@ -2897,9 +3040,24 @@ static void self_exit_current(void)
            free(dying) while we still read dying->held_crits[]. */
         sync_release_process_crits(dying, (dying->processid & 0x007FFFFF) + 1);
    stopints();
+   {
+      int now = smp_cpu_id();
+      if (now < 0 || now >= MAX_CPUS)
+         now = 0;
+      /* scheduler() restores the caller's flags.  If that re-enabled
+         interrupts and this exit migrated, the successor was chosen for
+         the old cpu id.  Drop that claim and pick again for `now`. */
+      if (now != me) {
+         if (readyprocess && readyprocess != dying && readyprocess->on_cpu == me)
+            readyprocess->on_cpu = -1;
+         me = now;
+         readyprocess = 0;
+      }
+   }
      if (!readyprocess || readyprocess == dying
-         || ps_pcb_running_elsewhere(readyprocess, me)) {
-        PCB386 *idle = (PCB386 *)smp_this_cpu()->idle;
+         || ps_pcb_running_elsewhere(readyprocess, me)
+         || foreign_idle_pid(me, (unsigned long)readyprocess->processid)) {
+        PCB386 *idle = ps_cpu_idle(me);
         if (readyprocess && readyprocess != dying && readyprocess->on_cpu == me
             && readyprocess != idle)
            readyprocess->on_cpu = -1;
@@ -2918,7 +3076,10 @@ static void self_exit_current(void)
         finishes CR3/RSP so the BSP cannot free the live PML4. */
      ctx_load_in_progress[me] = 1;
      pending_zombie[me] = dying;
-     context_load(&readyprocess->ctx, me);
+     if (dying->on_cpu == me)
+        context_load_release(&readyprocess->ctx, me, &dying->on_cpu);
+     else
+        context_load(&readyprocess->ctx, me);
   }
 
 /*Calls the scheduler voluntarily*/
@@ -2937,6 +3098,7 @@ void schedule_from_timer(void){
    int me=smp_cpu_id();
     int voluntary;
     int leftover_load_only = 0;
+    PCB386 *abandoned = 0;
 
     {
        extern void smp_repair_stale_current(void);
@@ -2971,8 +3133,7 @@ void schedule_from_timer(void){
                                       (unsigned long)(uintptr)
                                       current_process->pagedirloc,
                                       cr3, crit_wait)) {
-         extern void smp_abandon_leftover_current(void);
-         smp_abandon_leftover_current();
+         abandoned = smp_abandon_leftover_current();
          leftover_load_only = 1;
          if (!current_process)
             return;
@@ -3051,7 +3212,7 @@ void schedule_from_timer(void){
     if (leftover_load_only) {
        if (!readyprocess)
           readyprocess = current_process;
-       ps_switchto_load_only(readyprocess);
+       ps_switchto_load_only(readyprocess, abandoned);
        return;
     }
     if (!readyprocess || readyprocess == current_process)

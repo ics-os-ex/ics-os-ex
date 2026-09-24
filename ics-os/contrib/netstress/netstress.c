@@ -28,31 +28,34 @@ static int tcp_round(int id, int round)
    char buf[32];
    struct sockaddr_in addr;
    int fd, n, want;
+   int attempt;
 
    snprintf(payload, sizeof(payload), "T%d-R%d", id, round);
    want = (int)strlen(payload);
 
-   fd = socket(AF_INET, SOCK_STREAM, 0);
-   if (fd < 0)
-      return -1;
-   memset(&addr, 0, sizeof(addr));
-   addr.sin_family = AF_INET;
-   addr.sin_port = htons(7778);
-   addr.sin_addr = inet_addr("10.0.2.2");
-   if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+   for (attempt = 0; attempt < 2; attempt++) {
+      fd = socket(AF_INET, SOCK_STREAM, 0);
+      if (fd < 0)
+         return -1;
+      memset(&addr, 0, sizeof(addr));
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons(7778);
+      addr.sin_addr = inet_addr("10.0.2.2");
+      if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+         close(fd);
+         continue;
+      }
+      if ((int)send(fd, payload, (size_t)want, 0) != want) {
+         close(fd);
+         continue;
+      }
+      memset(buf, 0, sizeof(buf));
+      n = (int)recv(fd, buf, sizeof(buf), 0);
       close(fd);
-      return -1;
+      if (n == want && memcmp(buf, payload, (size_t)want) == 0)
+         return 0;
    }
-   if ((int)send(fd, payload, (size_t)want, 0) != want) {
-      close(fd);
-      return -1;
-   }
-   memset(buf, 0, sizeof(buf));
-   n = (int)recv(fd, buf, sizeof(buf), 0);
-   close(fd);
-   if (n != want || memcmp(buf, payload, (size_t)want) != 0)
-      return -1;
-   return 0;
+   return -1;
 }
 
 static int udp_round(int id, int round)
@@ -62,30 +65,33 @@ static int udp_round(int id, int round)
    struct sockaddr_in dst, from;
    socklen_t fromlen;
    int fd, n, want;
+   int attempt;
 
    snprintf(payload, sizeof(payload), "U%d-R%d", id, round);
    want = (int)strlen(payload);
 
-   fd = socket(AF_INET, SOCK_DGRAM, 0);
-   if (fd < 0)
-      return -1;
-   memset(&dst, 0, sizeof(dst));
-   dst.sin_family = AF_INET;
-   dst.sin_port = htons(7777);
-   dst.sin_addr = inet_addr("10.0.2.2");
-   if ((int)sendto(fd, payload, (size_t)want, 0,
-                   (struct sockaddr *)&dst, sizeof(dst)) != want) {
+   for (attempt = 0; attempt < 2; attempt++) {
+      fd = socket(AF_INET, SOCK_DGRAM, 0);
+      if (fd < 0)
+         return -1;
+      memset(&dst, 0, sizeof(dst));
+      dst.sin_family = AF_INET;
+      dst.sin_port = htons(7777);
+      dst.sin_addr = inet_addr("10.0.2.2");
+      if ((int)sendto(fd, payload, (size_t)want, 0,
+                      (struct sockaddr *)&dst, sizeof(dst)) != want) {
+         close(fd);
+         continue;
+      }
+      memset(buf, 0, sizeof(buf));
+      fromlen = sizeof(from);
+      n = (int)recvfrom(fd, buf, sizeof(buf), 0,
+                        (struct sockaddr *)&from, &fromlen);
       close(fd);
-      return -1;
+      if (n == want && memcmp(buf, payload, (size_t)want) == 0)
+         return 0;
    }
-   memset(buf, 0, sizeof(buf));
-   fromlen = sizeof(from);
-   n = (int)recvfrom(fd, buf, sizeof(buf), 0,
-                     (struct sockaddr *)&from, &fromlen);
-   close(fd);
-   if (n != want || memcmp(buf, payload, (size_t)want) != 0)
-      return -1;
-   return 0;
+   return -1;
 }
 
 static int worker(int id)

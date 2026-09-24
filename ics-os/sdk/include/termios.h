@@ -100,4 +100,40 @@ int tcgetattr(int fd, struct termios *termios_p);
 int tcsetattr(int fd, int optional_actions, const struct termios *termios_p);
 int tcflush(int fd, int queue_selector);
 
+/* POSIX speed constants (c_cflag baud field).  ICS-OS has no real serial
+   line, so tcgetattr reports 0 and tcsetattr ignores c_cflag; these exist
+   purely so termios-based applications (e.g. NetHack's speednum()) compile
+   and the cfgetospeed()/cfsetospeed() accessors have a type to work on.
+   Values follow the classic System V ordering used by NetHack's speednum(). */
+typedef unsigned int speed_t;
+
+#define B0       0
+#define B50      1
+#define B75      2
+#define B110     3
+#define B134     4
+#define B150     5
+#define B200     6
+#define B300     7
+#define B600     8
+#define B1200    9
+#define B1800    10
+#define B2400    11
+#define B4800    12
+#define B9600    13
+#define B19200   14
+#define B38400   15
+
+/* System V baud-rate field mask in c_cflag (classic 00377); cfgetospeed()/
+   cfsetospeed() in posix.c mask c_cflag with this. */
+#define CBAUD    0x000000FF
+
+/* POSIX VDISABLE value: "no such character exists". */
+#define _POSIX_VDISABLE 0
+
+speed_t cfgetospeed(const struct termios *termios_p);
+speed_t cfgetispeed(const struct termios *termios_p);
+int     cfsetospeed(struct termios *termios_p, speed_t speed);
+int     cfsetispeed(struct termios *termios_p, speed_t speed);
+
 #endif

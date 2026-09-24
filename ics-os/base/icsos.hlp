@@ -1,13 +1,5 @@
 ICS-OS Commands
 ---------------
-1322:   if (strcmp(u,"posixio") == 0){
-1327:   if (strcmp(u,"spawntest") == 0){
-1332:   if (strcmp(u,"forktest") == 0){
-1337:      if (strcmp(u,"forkoomtest") == 0){
-1344:     if (strcmp(u,"ext4test") == 0){
-1349:      if (strcmp(u,"termtest") == 0){
-894:       if (u && strcmp(u,"echo") == 0) {
-897:       } else if (u && strcmp(u,"noecho") == 0) {
 brk- Show the break/heap pointers of a process. Args: <pid>
 cc1test- Run host-built GCC cc1 to compile a trivial file in-OS.
 cc- Builds a C program (invokes tcc.exe). Args: <name.exe> <name.c>
@@ -21,10 +13,9 @@ df- Shows free space on block devices.
 dkill- Dirty kill a user process/thread. No cleanup is done. Args: <pid>
 dmesg- Dump kernel log: -c | -n <0-7> | -l <0-7> (no arg = all)
 duptest- Run the dup(2) syscall self-test (tty fd clone + write).
-echo- Displays a string. Args: <string>  
 exectest- Run the host-built hello.exe (ELF loader smoke test).
 exit- Exits a console session.
-fgman-  Foreground manager
+fgman- Foreground manager
 files- Shows list of currently open files.
 find- Finds a file.
 fullhost- Generic self-host alias uses GCC.
@@ -52,11 +43,13 @@ meminfo- Show memory map information.
 mem- Shows memory information.
 mkdir- Creates a directory. Args: <directory name> 
 mount- Mounts a device. Args: fat/cdfs <partition/device> <mount point> 
-mouse-  Activate the mouse
+mouse- Activate the mouse
 newconsole- Creates a new console.  
 off- Power off the machine.
 partitions- Shows partition tables (MBR/GPT) and partitions.
 pause- Waits for a key press
+pci- Dump all PCI devices.
+pciwifi- Dump PCI network/wireless devices.
 pcut- Creates a path alias. Args: <alias:> [path]
 pf64stats- Demand-paging (PF64-DIAG) counters.
 procinfo- Show process information. Args: <pid>
@@ -83,3 +76,5 @@ use- Tells the extension manager to use the extension: Args: <extension>
 ver- Shows version information.
 version- Full version banner.
 vimtest- Run FEAT_TINY vim --version (ELF TUI loader smoke test).
+wifiscan- Poll RX for beacons; print SSIDs.
+wifistat- Dump RTL8821CE / wlan0 status (FW, MAC, RX).

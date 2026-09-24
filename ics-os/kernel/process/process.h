@@ -486,6 +486,7 @@ DWORD    forkprocess();
 PCB386  *sched_gethead(void);
 PCB386  *ps_find_by_cr3(unsigned long cr3);
 PCB386  *current_mm_process(void);
+void     ps_current_anom_log(const char *fn, int me, PCB386 *task);
 
 /* Retained child-status queue (posix waitpid). Serialized by waitq_lock in
    process.c; the exit paths publish, sys_waitpid reaps. */

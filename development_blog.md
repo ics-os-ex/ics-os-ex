@@ -1,6 +1,655 @@
 # Development blog
 
+## 2026-09-24 (Manila, UTC+8)
+
+### 07:52 — `make test-nethack` PASS; NetHack startup GPF fixed
+**Current problem / activity:** None for NetHack; committing and pushing `ics-os-v2`.
+
+- Fixed the `test-nethack` startup GPF by making SDK `getpwuid(0)` return a valid static `struct passwd` (`pw_name="icsos"`, `pw_dir="/icsos"`, uid/gid 0) and making `getpwnam("icsos")` return the same entry.
+- NetHack's `getmailstatus()` dereferences `getpwuid(getuid())->pw_name` without a null check. The previous `NULL` return read kernel memory through the low `0`-`4MiB` user mapping and produced `cr2=0xf000ff53f000ff53` in `strlen()`.
+- Fixed SDK legacy `FILE fread()` to return the C item count instead of the kernel byte count.
+- Fixed kernel `fgets()` to return the buffer when a partial line is read before EOF, and `NULL` only when no character was read.
+- Fixed `elf_module.c` stream page reads to compare `fread()` against the byte length, matching kernel `fread()` semantics.
+- Removed the temporary `strlen()` debug hook from `sdk/tccsdk.c`.
+- Verified:
+  - `make test-nethack PASS`; the log reaches `Who are you?` with no GPF.
+  - `make test-integration PASS`, `make test-iobench PASS`, `make test-posixio PASS`, `make test-spawn PASS`, and `make test-dup PASS`.
+  - `make test-fork` still fails in the 77-storm/straddle phase with `GPF64 TSS-bad`, but the same failure reproduces on clean `HEAD e075877` in a detached worktree, so it is pre-existing and not caused by the NetHack changes.
+- Commit includes regenerated `apps/nethack.exe`, kernel `vfs_core.c` and `elf_module.c` fixes, and SDK `posix.c` and `tccsdk.c` fixes.
+
+### 03:36 — `make test-selfhost-cert` PASS
+**Current problem / activity:** None for the strict GCC self-host cert; the target now passes.
+
+- Final full run after `SELFHOST_SMP ?= 2` printed:
+  - `GCC_SELF_PASS`
+  - `GMAKE_SELF_TEST_PASS`
+  - `GKBUILD_COMPILER_PROVENANCE in-os-rebuilt`
+  - `GKBUILD_TEST_PASS`
+  - `KEXEC_BOOT_OK`
+  - `EXEC_TEST_PASS`
+  - `GCC_CLOSED_TOOLCHAIN_RUN_OK`
+  - `KEXEC_SMP_OK cpus=2`
+  - `KEXEC_CAPABILITY_PASS`
+  - `test-selfhost-cert PASS`
+- No `FAIL` / `POOL EMPTY` / `userpd map failed` markers in `/tmp/icsos-gccself.log`.
+- Host output: `/tmp/cert-smp2.out`.
+
+### 03:25 — `test-selfhost-cert` SMP default fixed: serial closure now boots 2 vCPUs with the AP deferred until kexec; full cert rerun in progress
+**Current problem / activity:** Rerunning `make test-selfhost-cert` after changing `SELFHOST_SMP` from 1 to 2.
+
+- The first post-fix cert run passed the entire GCC/GNU Make/in-OS kernel-build closure and kexeced the in-OS-rebuilt kernel, but failed only at:
+  - `KEXEC_CAPABILITY_FAIL smp cpus=1`
+- `kexeccert` requires `cpu_count >= 2`, but the default `test-selfhost-cert` target booted QEMU with `-smp 1`.
+- A quick kexec-only test using the already built `/work/kernel/Kernel64.bin` confirmed the in-OS-rebuilt kernel passes with 2 vCPUs **only when the stage-1 kernel uses `selfhost-stage1` so the AP is deferred during kexec**:
+  - `SMP: 2 CPUs online`
+  - `KEXEC_BOOT_OK`
+  - `EXEC_TEST_PASS`
+  - `GCC_CLOSED_TOOLCHAIN_RUN_OK`
+  - `KEXEC_SMP_OK cpus=2`
+  - `KEXEC_CAPABILITY_PASS`
+- Fix: `SELFHOST_SMP ?= 2` in `ics-os/Makefile`. The `selfhost-stage1` cmdline still defers the AP during the long in-OS build, so the build remains single-core; the kexeced kernel brings the AP online for the final capability check.
+- Current activity: full `make test-selfhost-cert CERT_TIMEOUT=28800` is running detached with `-smp 2`. Monitor `/tmp/icsos-gccself.log` for the final `test-selfhost-cert PASS`.
+
+### 02:45 — `test-selfhost-cert` kernel-build blocker fixed: redundant local `extern taskswitch` in `console.c`; in-OS GCC 4.7.4 rejected it and produced a bad `kernel32.o`
+**Current problem / activity:** Rerunning `make test-selfhost-cert` to verify the full GCC closure after the in-OS kernel-build fix.
+
+- The previous cert run passed the GCC and GNU Make self-host phases (`GCC_SELF_PASS`, `GMAKE_SELF_TEST_PASS`) but failed during the in-OS kernel `make bzImage` with:
+  - `console/console.c:1886:17: error: nested function 'taskswitch' declared but never defined`
+  - followed by a bad/compact `ld.exe` failure and `GKBUILD_TEST_FAIL make spawn`.
+- Root cause: `shell2_main` in `ics-os/kernel/console/console.c` had redundant block-scope `extern` declarations, including `extern void taskswitch(void);`. `kernel32.c` includes `process/process.h` before `console/console.c`, and `process/process.h:545` already declares `inline void taskswitch();`. GCC 4.7.4 rejected the conflicting local declaration.
+- Fix: removed the redundant local externs for `serial2_getc`, `serial2_putc`, `serial2_puts`, `serial2_mirror_set`, and `taskswitch` from `shell2_main`.
+- Verified:
+  - Host `make -C kernel clean bzImage` passes.
+  - `make test-kbuild` guest log reached `GKBUILD_TEST_PASS`, `GKBUILD_LINK_OK`, `KEXEC_CAPABILITY_PASS`, and `GCC_E2E_RUN_OK`. The host wrapper was interrupted by the local shell timeout, so treat this as guest-phase validation, not a clean host `make test-kbuild` PASS.
+- Also disabled temporary diagnostics before the cert rerun:
+  - `PC_VERIFY` in `kernel/iomgr/blkcache.c` set to 0.
+  - `frame_poison`/`frame_watch` in `kernel/memory/dexmem.c` set to 0.
+  - Restored unrelated whitespace in `kernel/hardware/ATA/ataioreg.c`.
+- Current activity: `make test-selfhost-cert CERT_TIMEOUT=28800` is running detached. Monitor `/tmp/icsos-gccself.log` for `GKBUILD_COMPILER_PROVENANCE in-os-rebuilt`, `GKBUILD_TEST_PASS`, `KEXEC_BOOT_OK`, `EXEC_TEST_PASS`, and final `test-selfhost-cert PASS`.
+
+## 2026-09-22 (Manila, UTC+8)
+
+### 22:15 — AS-ERROR INJECTION PINNED BYTES-EXACT: `as`'s formatted `unknown pseudo-op` string is in the `.s` data on disk; it is a FORMATTED (not raw-format) string; `uaf_rel` ring widened 256→1024 for the next run
+**Current problem / activity:** Verified the on-disk `.s` corruption byte-for-byte
+against the preserved image `/tmp/icsos-gccself-work-557.img`.
+
+- The string `unknown pseudo-op` appears at **two** image offsets:
+  - `0x0b25f347` (187,036,487): inside **`as.exe`'s `.rodata`** — this is the
+    raw **format** string `unknown pseudo-op: `%s'` (surrounded by other GAS
+    messages: `.bundle_align_mode`, `Abandoning ship`, `.bundle_lock`). EXPECTED.
+  - `0x0dabc000` (229,359,616): inside the **`.s` assembly data** (cluster
+    13983). This is the **corruption**.
+- Exact corrupted bytes (the `jne` line):
+  ```
+  \tjne\t.  +  "unknown pseudo-op: `.b07'\n" (26 bytes)  +  "ax\n"
+  ```
+  i.e. the original `jne\t.L14924\n\tmovq\t-40(%rbp), %rax\n` region was
+  overwritten in place by the as error, leaving a trailing `ax\n`.
+- **KEY INSIGHT:** the injected string is **formatted** — `.b07` is substituted
+  for the format's `%s` (the raw `.rodata` copy still has the literal `%s`).
+  So `as` **ran `sprintf`/`fprintf`** to build `unknown pseudo-op: `.b07'` in a
+  **buffer in `as`'s own address space**, and **that buffer's contents ended up in
+  the `.s` file data that was later written to disk**. The `as` process only
+  *reads* the `.s` file, so the only way its error buffer reaches the `.s` data is
+  that **the error buffer and a live `.s` data page map the same physical frame**
+  (a double-map / freed-while-mapped / aliasing bug in the frame pool or VFS
+  page-cache ↔ user-malloc path). This reframes the hunt: it is not a "stale
+  writer scribbling random bytes" — it is a **specific frame alias** between an
+  `as`-process malloc buffer and a `.s` page-cache/FAT cluster buffer.
+- The VFS read path (`vfs_directread` → `fs->readfile`) copies into the caller's
+  `buf`; it does not map page-cache frames into user space. So the alias is not
+  in the read copy — it must be a **frame-pool double-alloc / double-map** where a
+  frame still backing `.s` data (page cache or a FAT `writefile12EX2` temp buffer)
+  is also handed to an `as`-process malloc.
+- **Instrumentation change for the next run (built, `bssEnd=0x36edb4`, ~546 KiB
+  headroom):** `uaf_rel[]` widened 256→1024 slots and slimmed to
+  `{u64 phys; unsigned long rip;}` (dropped `r1`) so the **free-RIP survives**
+  the high free-rate (the old 256-slot ring collided → `rel_match=0` on all 24
+  lines). `kernel/Kernel64.sym` rebuilt; `make -C kernel bzImage` clean.
+- **Next move:** rerun `make test-selfhost-cert` (up to `CERT_TIMEOUT=28800`s).
+  The widened ring should yield a real `rel_rip` (who last freed the clobbered
+  frame). In parallel, add a **frame double-map detector**: on `frame_alloc`,
+  if the phys is already mapped into a live user PML4 or already has
+  `frame_refs>0` outside the pool, print both RIPs. That directly names the
+  alias between the `as` malloc and the `.s` data page.
+
+### 23:35 — RERAN WITH 1024-SLOT `uaf_rel`; free-RIP ring STILL collides (rel_match=0); failure is NON-DETERMINISTIC (different `.s`/pseudo-op each run) but FAST (minutes); as-error-in-asm confirmed as a multi-byte clobber, not a single stale byte
+**Current problem / activity:** Reran `make test-selfhost-cert` with the widened
+`uaf_rel[]` (1024 slots). Findings:
+
+- The 1024-slot ring **still** returns `rel_match=0 rel_rip=0` on all 24 lines.
+  The hash `phys>>12 & 1023` collides under the cert's high free-rate (many
+  unrelated phys map to the same slot before the clobbered frame is reallocated).
+  **The free-RIP ring is a dead end** at this free-rate; a hash ring cannot beat
+  the churn. The `alloc_rip` also shifted (0x16682e→0x1667ca) confirming the new
+  kernel (with the slimmed struct) is what ran.
+- The failure is **NON-DETERMINISTIC across runs**: this run failed at
+  `.gccdrv.349.s` (dwarf2out.o) with pseudo-ops `.g`/`.1`/`.j`/0xa1, the prior
+  at `.gccdrv.557.s` (insn-automata.o) with `.b07`. Same `as spawn` failure class,
+  different file and different corrupted bytes each run. This is the signature of
+  a **frame clobber** (the `.s` data frame is overwritten by whatever else got
+  mapped/used there), not a fixed off-by-N bug.
+- **Fast failure:** the `as` failure hits during the early cc1 build, so the run
+  dies in **minutes**, not the full 8h `CERT_TIMEOUT`. I can iterate quickly.
+- Distinguished the on-disk `unknown pseudo-op` hits in the reused
+  `/tmp/icsos-gccself-work.img`:
+  - `0x0b25f347` = `as.exe` `.rodata` format string (EXPECTED).
+  - the new run's cluster of hits (218445355…218530068) = **ASERR.txt** (a block
+    of *only* GAS error lines, no asm) — EXPECTED, the dup2 stderr capture.
+  - `0x0dabc000` (229359616) = the PRIOR run's `.s` data with the formatted
+    `unknown pseudo-op: `.b07'` **spliced into assembly** — the real corruption.
+- So the `.s` corruption is a **multi-byte, formatted-string clobber** (the `as`
+  process's formatted error buffer lands in the `.s` data frame), which is
+  consistent with a **frame alias / double-map** between an `as`-process malloc
+  buffer and a live `.s` page-cache / FAT-cluster frame — NOT a single stale byte.
+- Frame-pool anomaly counters (DBL-ALLOC/DBL-FREE/RETAIN-FREE/REF-OVERFLOW/
+  BAD-HEAD/POOL EMPTY) are **0** in the run log, so the alias is not a naive
+  double-alloc the pool already flags; it is a map/alias the pool does not track.
+
+**Next move:** stop chasing the free-RIP ring. Add a **frame double-map /
+alias detector**: record, on every `frame_alloc`, the phys + the caller RIP into
+a bounded table; on the next `frame_alloc` of the *same* phys while a prior
+mapping is still live (or when the poison fires), print the **first alloc RIP**
+vs the **re-alloc RIP** so the two owners (e.g. `as` malloc vs FAT/blkcache) are
+named directly. Pair it with a canary on the FAT `writefile12EX2` `temp_buffer`
+head/tail to catch the clobber at the I/O layer. Then rerun (fast).
+
+### 23:55 — DOUBLE-MAP DETECTOR BUILT + RERAN: zero `FRAME ALIAS` hits → the as-error splice is NOT a live re-alloc; it is RARE. The COMMON failure is the single-byte offset-8 UAF write (page-table frames)
+**Current problem / activity:** Built the `alias_tbl` double-map detector in
+`dexmem.c` (per-phys last-alloc caller-RIP table, 1024 slots / 16KiB BSS;
+`alias_alloc` called in `frame_alloc` *outside* the spinlock, `alias_free` in
+`frame_release`). Rebuilt clean (bssEnd 0x374db4, ~532KiB headroom), reran
+`make test-selfhost-cert`.
+
+- **Zero `FRAME ALIAS` hits.** The frame pool also reports zero DBL-ALLOC. So
+  the as-error splice is **not** a live re-alloc of the same phys and **not** a
+  double-alloc the pool would flag. The double-map theory is **dead**.
+- The as-error splice is **RARE / non-deterministic**: this run's `.s`
+  (`.gccdrv.391.s`, 1443065 bytes) has **no** splice — its new `unknown
+  pseudo-op` hits (221236405, 221281239) are all in a **error-only block
+  (ASERR.txt)**, expected. Only the PRIOR run's offset (229359616) holds the
+  splice into assembly. So the splice appears in only some runs.
+- The **COMMON** failure (every run) is the `as` hitting **real** unknown
+  pseudo-ops (`.`/`.1`/`.g`/0xa1/…) in the `.s` — i.e. the `.s` bytes are
+  already wrong when `as` reads them. That correlates with the **single-byte
+  offset-8 UAF write** the poison hook catches on every run (24×, phys
+  0x7ffc5000–0x7ffdc000, `alloc_rip=upop+0x18`, `alloc_r1=userpd_create`).
+- So there are two distinct defects:
+  1. **Common:** a stale single-byte write lands in a freed page-table frame
+     (offset 8) before `upop`/`userpd_create` reallocates it → corrupts a page
+     table / mapped page → wrong bytes in the `.s` data `as` reads → real
+     unknown-pseudo-op → `as` fails. This is what fails every run.
+  2. **Rare:** a 26-byte formatted as-error splice into the `.s` frame (the
+     prior-run offset). Not a live re-alloc (detector clean); mechanism still
+     open but lower priority.
+
+**Next move:** root-cause the **common offset-8 UAF write**. The stale writer
+is a single byte written to a freed frame at offset 8 while it is on the free
+list, before `upop` reallocates it. Since `frame_release` poisons under the
+lock and the free list is intrusive (next ptr at offset 0, data from offset 8),
+a single-byte write at offset 8 is a stale dereference of a pointer that used to
+index into that frame. Instrument `frame_release` to also stamp a unique
+per-release canary at offset 8 (so a later single-byte clobber is provably a
+stale write, not the free-list write), and add a **bounded writer RIP capture**
+by making the poison check, on a hit, dump the current RIP chain of the *alloc*
+path plus the last few `frame_release` RIPs in a ring large enough (e.g. 4096)
+that the matching free survives the churn. Rerun (fast) and map the free RIP.
+
+### 21:40 — STALE-WRITER SIGNATURE PINNED: 24 consecutive frames (96 KiB) clobbered at byte 8; alloc site = `userpd_create`/`upop`; on-disk `.s` clobber = as's formatted error string in-place overwrite
+
+**Current problem / activity:** Mapped the `FRAME UAF-WRITE` RIPs from
+`/tmp/icsos-gccself-racefixed-fail.log` (the latest run, 20:13) against
+`kernel/Kernel64.sym`:
+
+- `alloc_rip=0x16682e` → **`upop + 0x18`** (constant across all 24 lines)
+- `alloc_r1` → **`userpd_create + 0x18/0x6d/0xd5`**
+
+So the clobbered frames are reallocated in `userpd_create()` (private-PML4
+build: PML4/PDPT/PD0) via `upop()`→`frame_alloc()`. Verified in
+`kernel/memory/dexmem.c`: `userpd_create()` **zeroes/copies every frame it
+takes** (`memset(pml4v,0,0x1000)`, `memset(pdptv,0,0x1000)`,
+`memcpy(pd0v, boot_pd0, 0x1000)`), and `userpd_map_page()` zeroes each fresh
+user page/PTE table. **Conclusion: the UAF clobber is CLEARED on the
+page-table path — the `userpd_create` hit is a LATENT bug, not the direct
+cause of the `.s` corruption.** The stale writer is real but its damage to
+page tables is wiped by the post-alloc memset/memcpy. The `.s` corruption must
+come from the same stale writer clobbering a **malloc'd I/O buffer that is NOT
+zeroed on alloc** and is later written to disk.
+
+**Stale-writer signature (from the 24 UAF lines):**
+- 24 **consecutive** frames `0x7ffc5000`–`0x7ffdc000` (96 KiB), all at
+  absolute byte **8** (first byte after the 8-byte free-list `next`).
+- Fires **early** (log lines 164–187, during `make.exe`/`mkdir.exe` ELF load,
+  before `cc1` runs at line ~234). Print is capped at 24, so the writer is
+  almost certainly firing **continuously** all run; these are just the first
+  batch.
+- Values at byte 8: mostly `0x00` for the low frames, non-zero (`0x81 0x70
+  0x45 0x66 0xfe 0x80 0x35 0x79 0xb8 0x4f 0x54 0x20 0x8b 0xff`) for the high
+  frames — consistent with the writer storing a **pointer/word** at offset 8
+  of each 4 KiB page (stride 0x1000) of the 96 KiB block, i.e. writing field 1
+  of a 24-node structure whose nodes sit at the head of each frame.
+- `rel_match=0 rel_rip=0` on every line: the `uaf_rel[]` hash ring slot
+  (`phys>>12 & 255`) was overwritten by other frees before the alloc, so the
+  free-RIP was lost. Need a larger/collision-free free-log to recover it.
+
+**On-disk `.s` corruption (decisive):** the freed `.gccdrv.557.s` (3,551,462
+B = 217×16 KiB clusters, clusters freed by proper deletion) leaves a
+contiguous 28-cluster segment on disk. In it, a 26-byte in-place overwrite put
+as's **runtime-formatted** error `unknown pseudo-op: \`.b07'\n` over cc1's
+emitted `L14924\n\tmovq\t-40(%rbp), %r` (leaving the trailing `ax\n` intact),
+right after an intact `\tjne\t.` — a non-block-aligned, memory-level clobber,
+not a 512/4K/16K disk-block error. Since `as` only READS the `.s`, the as
+error text must have been in a buffer that cc1 (or the I/O path) wrote to that
+cluster — i.e. the stale writer clobbered a reused I/O/heap buffer that still
+held a previous `as` error string.
+
+**Next moves:**
+1. Catch the stale writer's RIP in the act: convert a sampled freed frame to a
+   guard page (unmap from the kernel identity map) so the stale write #PFs and
+   the fault handler records RIP/RSP. (Guard page is the only way to name the
+   writer; alloc-time poison only sees the aftermath.)
+2. Replace the 256-slot `uaf_rel` hash ring with a larger ring / LRU so
+   `rel_rip` survives (recover the free-RIP).
+3. Exonerate/confirm the I/O-buffer aliasing: instrument `writefile12EX2`
+   `temp_buffer` and the VFS/blkcache buffers with a canary so the next run
+   shows whether the as-error buffer is the same allocation as the `.s` write
+   buffer.
+4. Keep the temporary `frame_refs` 2 GiB shrink + poison hook for the re-run;
+   revert both after the writer is fixed.
+
+### 17:50 — BREAKTHROUGH: freed-frame poison/verify hook CAUGHT the stale writer — `FRAME UAF-WRITE`, a use-after-free into freed frames at offset 8
+
+**Current problem / activity:** Added a temporary freed-frame poison/verify hook
+to `kernel/memory/dexmem.c` (the last suspect after bitmap/TLB/COW/DMA were all
+clean): `frame_release()` writes `0xA5` to bytes 8..0xFFF of the freed frame
+(skipping the 8-byte intrusive free-list `next`), and `frame_alloc()` verifies
+the pattern before handing the frame out. Enabled via `frame_poison = 1` in
+`mem_init()`. First build failed with `ld: kernel BSS collided with 4MiB user
+ELF window` — the kernel was already within **76 bytes** of the `bssEnd <=
+0x3FA000` assert. Fixed by shrinking the `frame_refs` table from 4GiB→2GiB
+(`FRAME_TABLE_PHYS_MAX 0x80000000`, the cert's RAM), which frees ~512KiB of
+BSS; `bssEnd` dropped to `0x36adb4`. **Both changes are TEMP and must be
+reverted after the diagnostic** (restore `frame_refs`/`frame_allocmap` to
+`0x100000000ull`, remove the poison hook + `frame_poison=1`).
+
+**Result — the hook fired.** The cert (`make test-selfhost-cert`, fresh log)
+printed **24 `FRAME UAF-WRITE`** lines (capped at 24 by `frame_anomaly_prints`):
+
+```
+FRAME UAF-WRITE phys=0x7ffdc000 off=0 val=0x81 hits=1
+FRAME UAF-WRITE phys=0x7ffdb000 off=0 val=0x70 hits=2
+...
+FRAME UAF-WRITE phys=0x7ffc5000 off=0 val=0xff hits=24
+```
+
+All **`off=0`** (= absolute byte **8**, the first byte after the free-list
+`next`), all on **24 consecutive frames** `0x7ffc5000–0x7ffdc000` (96KiB), each
+with a **different** byte value. The cert then failed exactly as before at
+`/work/.gccdrv.553.s` (8,200,690 bytes), `GCC_DRV_PROBE read deterministic
+(8200690 bytes match)` → on-disk valid, in-memory buffer corrupted →
+`GCC_DRV_FAIL as` → `GCC_SELF_CERT_FAIL` → reboot.
+
+**What this proves:** a stale kernel write is landing in a **freed** 4KiB frame
+**before it is reallocated** (the write lands between `frame_release` and the
+next `frame_alloc` of the same phys). The corruptor holds a **stale pointer to
+freed memory** and keeps writing through it. The 24-frame contiguous run +
+offset-8 + per-frame distinct values is the writer's footprint.
+
+**Key open questions (next moves):**
+1. The 24 UAF-WRITE lines fire during `make.exe` ELF load (log lines 164–187,
+   between `hdr ok` and `loaded`), but the `as` buffer corruption is at object
+   ~125 (line 5392). The poison is capped at 24 prints, so the writer is almost
+   certainly firing **continuously** all run — these 24 are just the first batch.
+   Need to (a) raise/remove the print cap or log a rolling window, and (b)
+   capture a **backtrace / RIP** at the UAF-WRITE to name the writer.
+2. Offset 8 is suspicious: it is exactly where a `struct`/`node` field would
+   sit right after a leading `next`/`prev` pointer — suggests the writer is
+   walking a **list of node structs** whose first field is a pointer and second
+   field is the byte being clobbered, and the nodes live in freed frames.
+3. Correlate the UAF phys range with what was freed just before (the frames
+   being reallocated for `make.exe`/`as.exe` text or a freed cc1 heap page).
+
+**Saved oracle:** instrumented failure log →
+`/tmp/icsos-gccself-uafwrite-fail.log` (259,639 bytes).
+
+### 17:05 — A/B SETTLED: preemption cert FAILS too → the cc1→as working set is the trigger, NOT the cooperative/tick path
+
+**Current problem / activity:** Ran the decisive A/B from the 16:45 note.
+Flipped `selfhost_cooperative_ready=0` in `gccselfhost_run()` (preemption
+regime, BSP-only `-j1`), rebuilt the kernel (clean), and re-ran
+`make test-selfhost-cert`. Result: **the preemption cert ALSO fails** with the
+identical in-memory-buffer signature:
+
+- Failed at **object 125** (cc1 ok ×125, as ok ×124) — just past the
+  cooperative run's 90, same non-deterministic band.
+- Failing file: `/work/.gccdrv.531.s` = cc1 output for **`i386.c`** (pid 531),
+  **2,183,151 bytes** (2.2 MB). `Error:` at lines **27598 / 28432**.
+- `GCC_DRV_PROBE read deterministic (2183151 bytes match)` → on-disk file
+  valid; the `as`'s **in-memory user buffer** is corrupted (mid-file).
+- `GCC_DRV_FAIL as` → `GCC_SELF_CERT_FAIL make bootstrap` → reboot.
+
+**Conclusion (settles the 12:20 open question):** the `as` in-memory-buffer
+corruption happens under **BOTH** cooperative and preemption regimes. So the
+cooperative/tick/scheduler path is **NOT** the corruptor. The real trigger is
+the **cc1→as working set**: a large cc1 heap is built up and torn down, then
+`as` allocates its own large buffer (1.4–2.2 MB source) on top of the churned
+page history. The `asloop` (as only, no cc1) never reproduces it because it
+never builds the cc1 working set. Reverted the flag to `= 1` (normal closure).
+
+**Saved oracles:** cooperative failure log → `/tmp/icsos-gccself-coop-fail.log`
+(`fold-const.s`, 1.4 MB, line ~70061, object 90). Preemption failure log →
+`/tmp/icsos-gccself.log` at time of capture (`i386.s`, 2.2 MB, lines 27598/
+28432, object 125). Both: on-disk valid, in-memory corrupted.
+
+**Next move:** root-cause the kernel page bug that corrupts a large live user
+buffer after heavy cc1 page churn. The two failures share: (1) a prior large
+cc1 allocation/free cycle, (2) a subsequent large `as` `sbrk` buffer, (3)
+corruption landing MID-buffer (not at a page boundary the `as` would catch as
+a short read). Prime suspects now that scheduling is exonerated: (a) a
+COW/page-reuse or free-list bug handing `as` a page that still aliases a
+freed cc1 page, (b) a `sbrk`/brk page-accounting bug, (c) a stale user PML4/PD
+entry after cc1 pages are unmapped. Plan: instrument the kernel page free/reuse
+path (poison freed user pages + verify on hand-out) OR add an in-OS cc1→as
+micro-harness that allocates/frees a cc1-sized buffer then allocates+verifies an
+as-sized buffer, to get a fast deterministic repro without the full cert.
+
+### 16:45 — cert reproduces the `as` corruption: `fold-const.s`, in-memory buffer, on-disk file proven valid
+
+**Current problem / activity:** Ran the real `make test-selfhost-cert`
+(`CERT_TIMEOUT=18000`, cooperative mode, `-j1`). It reproduced the bug after
+**~90 cc1 objects** (`gccdriver: cc1 ok` ×90, `as ok` ×89):
+
+- Failing file: `/work/.gccdrv.389.s` = cc1 output for **`fold-const.c`**
+  (gccdriver pid 389), **1,443,065 bytes** (1.4 MB).
+- `as` emitted an **`Assembler messages:` syntax-error CASCADE** at
+  **lines 70061–70072** (first error ~70061, then a runaway cascade of
+  `Error:`/`Warning:` through 70072). This is the signature of the `as`
+  mis-parsing a corrupted token and then losing sync.
+- `gccdriver: /work/apps/as.exe exited status=1`
+- `gccdriver: saved asm /work/.gccdrv.389.s -> /work/KEEP.S (1443065 bytes)`
+- **`GCC_DRV_PROBE read deterministic (1443065 bytes match)`** → the file is
+  byte-for-byte valid on disk AND stable across re-reads. So the corruption is
+  in the **`as`'s in-memory user buffer** (its copy of the source / its parser
+  state around line 70061, ~byte 1.2 MB into a 1.4 MB file), NOT in the VFS
+  read path or on-disk bytes.
+- `GCC_DRV_FAIL as spawn` → `make.exe: *** [/work/gccobj/cc1/fold-const.o] Error 1`
+  → `GCC_SELF_CERT_FAIL make bootstrap` → reboot.
+
+**Interpretation:** Confirms the 12:20 diagnosis (in-memory user-buffer
+corruption, read path clean) with a concrete new victim: `fold-const.s` line
+~70061. The failing file/line/offset differs every run (132→90 objects this
+time), so it is non-deterministic and allocation-history-dependent. The on-disk
+probe being clean rules out the VFS/FAT read path for the Nth time.
+
+**Next move (decisive A/B):** the cert and `asloop` differ in BOTH (a)
+scheduling regime (cert = cooperative, `asloop` = preemption) and (b) working
+set (cert = cc1→as, `asloop` = as only). `process.c:3148` documents that the
+cooperative regime was added to dodge a "legacy timer-context race" that long
+cc1 runs expose under preemption — so the two regimes are NOT interchangeable.
+Flip `selfhost_cooperative_ready=0` in `gccselfhost_run()` (preemption) and
+re-run the cert: if the `as` in-memory corruption stops, the cooperative/tick
+path is implicated; if it persists, the cc1→as working set is the real
+trigger and the preemption "timer race" is the same underlying memory bug.
+
+### 15:50 — `asloop` (real `as` tight loop, fixed 4 MiB .s) does NOT reproduce the cert `as` corruption in 143 runs
+
+**Current problem / activity:** Pursued the 13:40 direction (a): run the REAL
+in-OS `as` in a tight loop over a large fixed valid `.s`, capturing the first
+failing run. Fixed two harness bugs first: (1) `gen_big_s.py` emitted **Intel**
+syntax but the in-OS `as` is AT&T-by-default (the baseline `iter=1` was failing
+deterministically on every line — NOT the non-deterministic bug); rewrote the
+generator to emit valid AT&T 64-bit (`%` regs, `movq/addq/subq/...`,
+`addq $imm,%reg`, `leaq -off(%rsp),%reg`), now host-validated with
+`as --64` (exit 0). (2) `asloop.c` only redirected fd 2 on the failure rerun,
+so `/work/ASLOOP.err` came back empty; now dup2's the err file onto BOTH fd 1
+and fd 2 (same technique as `gccdriver.c`). Rebuilt + installed `asloop.exe`.
+
+**Result (the key negative):** a fixed valid 4 MiB AT&T `.s`
+(`/tmp/icsos-asloop-big.s`, 4,194,404 B / 182,700 lines, `ASLOOP_BASELINE_OK`)
+ran the real `as` **143 times** (QEMU timeout at `ASLOOP_ITER=400`,
+`ASLOOP_TIMEOUT=1700`) with **zero** `ASLOOP_FAIL` / `ASLOOP_FAIL obj` /
+`Assembler messages` / `Error:`. `ASLOOP_OK` reached iter=125 then the run was
+killed (NO RESULT, not a clean PASS). So a tight loop of the real `as` over a
+single fixed `.s` does NOT reproduce the cert's non-deterministic failure.
+
+**Why the `asloop` is not a faithful repro (the real differences):**
+1. The cert's `as` runs **after cc1** in each gcc invocation (the large cc1
+   working set is just freed); the `asloop` never runs cc1.
+2. The cert assembles **~132 distinct real GCC `.s` files** (2–8 MiB, varied
+   patterns) cumulatively; the `asloop` reuses ONE fixed file.
+3. The cert runs in **cooperative mode** (`selfhost_cooperative_ready=1`,
+   `make -f Selfhost.mk`); the `asloop` ran in the default **preemption**
+   mode. This is the 12:20 "coop-smp vs preemption" open question.
+So the trigger is `as`-specific AND context-specific (cc1→as, varied working
+sets, cooperative scheduling), not "run the real `as` on a fixed file".
+
+**Next move:** run the real cert (cooperative mode) to capture more reliable
+oracles (the `GCC_DRV_PROBE` line, the failing `.s` size/name, and the `as`
+`Error:` line number from the serial log — `ASERR.txt`/`KEEP.S` remain
+unreliable per 12:20). Then A/B the 12:20 hypothesis: re-run the cert with the
+`selfhost_cooperative_ready` path disabled (preemption) to see if the `as`
+corruption is specific to the cooperative/tick/scheduler path.
+
+### 13:40 — memcorrupt detector built; 4 synthetic working-set shapes do NOT reproduce the `as` corruption
+
+**Current problem / activity:** Built `contrib/memcorrupt` (in-OS user-memory
+corruption detector) + `make test-memcorrupt` (1 GiB FAT16 virtio /work, KVM,
+smp 1, 2048M). It replicates the cert's `as` working-set shape and drives the
+VFS write+read path while re-verifying every byte of a large buffer and a set
+of live slab blocks, reporting the first mismatch with region/offset/bytes.
+Four synthetic shapes all **PASS** (no corruption):
+  1. one 8 MiB buffer + one fixed 64 B×100k block array, bulk 64 KiB IO ×200
+  2. 8 MiB buffer + varying-size slab churn (malloc/touch/free ×200k) + bulk IO
+  3. 8 MiB buffer + 4 MiB seed file walked in 128 B sequential reads ×32768 + churn
+  4. 8 MiB buffer + **250k live varying-size blocks (63.8 MiB resident)** + 4 MiB
+     seed file walked in 128 B sequential reads ×32768, both regions re-verified
+So the corruption is NOT a simple function of resident size, slab churn, or
+small-read cadence. It is specific to the real `as`'s exact allocation
+sequence + computation + I/O mix.
+
+**Implication / next move (direction call needed):** the synthetic-shape route
+has hit a wall — the trigger is `as`-specific. Two viable continuations:
+  (a) run the REAL `as` in a tight loop over a large .s (e.g. the saved
+      insn-attrtab.s / a 3–8 MiB .s) N times in-OS, capturing the first failing
+      run + the exact .s + line, to get a deterministic repro of the real bug;
+  (b) instrument the SDK `sbrk`/`free`/page layer to log the first write that
+      lands in a live user page with an unexpected value (catch the corruptor
+      in the act), then correlate with the `as` run.
+`test-memcorrupt` is kept as a regression gate (it must stay PASS); the
+detector's `MEMCORR_CORRUPT`/`MEMCORR_SEEDBAD` markers are the tripwires.
+
+### 12:20 — Self-host cert: read-path corruption HYPOTHESIS refuted; `as` fails non-deterministically on valid .s (kernel memory corruption suspected)
+
+**Current problem / activity:** Continued `make test-selfhost-cert` (Round 4
+closure). Added a byte-by-byte **read-determinism probe** to `gccdriver keep_asm()`:
+on `as` failure it re-reads the original `.s` and the saved `/work/KEEP.S` and
+compares every byte. Three bounded runs (`CERT_TIMEOUT=1500 SELFHOST_SMP=1`,
+single CPU) now all print `GCC_DRV_PROBE read deterministic (N bytes match)`
+and then `GCC_DRV_FAIL as spawn`. The failing file **differs each run**:
+8,200,690 B (insn-attrtab.s), 2,183,151 B (i386.o), 3,355,954 B (insn-emit.o).
+The cert compiles **~132 cc1 objects** before failing (up from ~90), so it is
+progressing further each build.
+
+**Diagnosis — the 10:45 "deterministic read-path corruption" conclusion is
+WRONG and is retracted.** The probe proves the guest re-reads the exact same
+valid bytes as on disk, and the host GNU `as` assembles the saved `.s` cleanly.
+The failure is **non-deterministic across runs/files** (a single-threaded `as`
+with different failing inputs each run). That rules out a deterministic
+read-path/DMA/coherency bug and points to **kernel memory corruption of the
+`as` user address space** (or a latent `as`/SDK bug that is memory-state
+dependent): the `as` reads the `.s` correctly, then its in-memory copy /
+working set gets corrupted, so it reports `Error:` at lines that are valid on
+disk (e.g. insn-emit.s:92418/94121). No PF64/GPF64/UD64/watchdog at the
+failure; `free=463948/466141` (no OOM); `execp: child faulted` is make's
+nonzero-exit path, not a page fault.
+
+**Diagnostic dead-ends this session (do not repeat):** (1) redirecting the
+`as` stdout/stderr to `/work/ASERR.txt` via `dup2` in the driver did NOT
+capture the real `as` diagnostics — the SDK `printf`/`as` write to the shared
+serial console and the file ended up 125 B of binary garbage; (2) the on-disk
+work-image FAT chain for `KEEP.S` is **stale** (chain len 1 vs expected 205),
+so the full `.s` cannot be pulled from the image after a failed run — the
+in-OS probe is the reliable oracle, not host-side FAT extraction.
+
+**Next move (needs a decision — deep kernel memory debugging):** the
+non-determinism + valid-on-disk input means the next step is to find *where*
+the `as` user memory is corrupted. Options: (a) build a minimal in-OS test
+that allocates a large buffer, fills it with a pattern, runs an unrelated
+syscall/IO load, then re-checks the pattern to localize the corruption; (b)
+instrument the `as`/SDK `sbrk`/`memcpy` to catch the first corrupted write;
+(c) re-enable the cert under `coop-smp` vs preemption and compare, to see if
+the timer tick / scheduler path is the corruptor. This is a kernel memory-safety
+hunt, not a one-line fix. **Blocked on a direction call from the user.**
+
+### 10:45 — Self-host cert: SMP GPF64 gone; new blocker is a read-path data corruption of the huge insn-attrtab .s
+
+**Current problem / activity:** Resumed `make test-selfhost-cert` (Round 4
+compiler closure) after the SMP rework. The old pre-rework cert log died at
+`GPF64 rip=0x16d774 proc=/work/apps/cc1.exe` during `make bootstrap`. A fresh
+bounded run (`CERT_TIMEOUT=1200`) gets **past** that GPF64 and compiles ~90 cc1
+objects (`cc1 ok`/`as ok`) before dying at `insn-attrtab.o`:
+`GCC_DRV_FAIL as spawn` -> `GCC_SELF_CERT_FAIL make bootstrap`. `test-stress-user-smp`
+and `test-fatwrite-coop` now pass on the current build (`bssEnd 0x3f9db4`);
+`fatwrite-coop` still logs benign `CUR-ANOM switch` cross-idle detections.
+
+**Diagnosis of the `as` failure (not an OOM, not bad .s):** Added a
+`keep_asm()` hook to `gccdriver` that copies the cc1 `.s` to `/work/KEEP.S`
+(clean 8.3 name; the per-pid `.gccdrv.NNN.s` LFN is subject to the FAT LFN
+name corruption) on `as` failure. Extracted `/work/KEEP.S` (8,200,690 bytes,
+474,200 lines) from the work image and ran **host** GNU `as` (2.42) on it:
+**assembles cleanly, exit 0.** So the `.s` content is valid and complete
+(501 clusters, ends in EOC 0xFFF8). The guest `as` log shows a single
+`/work/.gccdrv.553.s:335123: Error:` (message lost to serial batching) and
+`free=463948/466141` (no OOM). Line 335123 = byte 5,787,637 = **cluster 353**
+(offset 4085), valid assembly on disk. So the guest `as` read cluster 353
+**corrupted** even though the on-disk `.s` is valid: a read-path data
+corruption, deterministic (both cert runs fail on `insn-attrtab.s`).
+
+**Next move:** trace the read path for the large-file interior (`direct`)
+cluster read in `fat12.c loadfile12EX2` / `dex32_requestIO` / write-back
+`blkcache` (blkcache.c) — likely a DMA/coherency or cache-page fault that
+corrupts a middle-of-file cluster for a >4 MiB file. Repro: `CERT_TIMEOUT=1200
+make test-selfhost-cert`, pull `/work/KEEP.S`, run host `as`.
+
+### 06:20 — user-smp exit must not publish another CPU's idle
+
+**Current problem / activity:** `test-stress-user-smp` still fails
+intermittently after the `ps_pcb_running_elsewhere` claim tighten.
+`CUR-ANOM publish cpu=0 task=pid0xffff0003` then `FORK-FAIL parent=-65533`:
+CPU 0's `current` is CPU 3's idle PCB, so the next fork treats that idle
+as the parent.
+
+**Cause:** `self_exit_current` sampled `smp_cpu_id()` before file close and
+`processmgr_busy`, both of which can `taskswitch`. The timer migrates the
+exit. The stack-local cpu id stays 0 while `smp_this_cpu()->idle` is now
+CPU 3's idle, and `ps_publish_current(0, idle3)` installs it. The cpu id
+is now sampled only after that window, with interrupts off, and a foreign
+idle (`0xFFFF0000|cpu`) is not published or loaded. The per-switch
+`SW` / `SWITCH-DESYNC` / `SWITCH-RSP` traces were removed so `.data`
+ends before the next page and page-aligned BSS stays under `0x3FA000`
+(`bssEnd` `0x3f9db4`). `make test-stress-user-smp` passed 6/6 with no
+`CUR-ANOM` or `FORK-FAIL`. `test-smp`, `test-fork`, and `test-apuser`
+passed. `test-fatwrite-coop` still faults intermittently (`PF64-STALE-CURRENT`,
+`UD64` at `context_switch` / `cpu_idle`); that path is not closed.
+
+## 2026-09-21 (Manila, UTC+8)
+
+### 12:22 — USB two-partition selfhost image fixed (standard FAT16); cert now blocked by pre-existing SMP scheduler GPF
+
+**Current problem / activity:** `make test-selfhost-cert-usb` (new target:
+two-partition thumbdrive image, `usb0p0` = FAT root `/icsos`,
+`usb0p1` = FAT16 build tree `/work`) was failing before the in-OS work could
+start: the kernel booted and mounted both partitions but `autoexec.bat`
+silently did nothing — `script_load` → `openfilex` found no files.
+Resolved the root cause and fixed the image; a full cert run now boots,
+mounts, runs `gccselfhost`, and compiles a few files in-OS before dying in a
+pre-existing kernel SMP scheduler bug. **Not claiming certification.**
+
+**Root cause of the silent autoexec:** `mformat -F` writes **FAT32-style
+volumes even at FAT16 range** (BPB `rootent=0`, `rootclust=2`, FAT size in
+the 32-bit `fatsz32` field, 32-bit FAT entries, root directory as a cluster
+chain at cluster 2). The kernel's `fat_get_fat_type()` (fat12.c:2312)
+classifies by *cluster count* (<4085 FAT12, <65525 FAT16, else FAT32), so a
+16,312-cluster "FAT16" p0 was classified FAT16 and `loadroot()`
+(fat12.c:611) computed the fixed root region as `(0*32+511)/512 = 0` sectors
+→ empty root → `ls /icsos` = 0 files → `autoexec.bat` never loaded
+(`script_load` fails silently). Live-confirmed via the COM2 shell2 telnet
+probe (`cd /icsos` + `ls` → "Total Files: 0"), BPB struct decode, and FAT
+forensics (FAT[2]=0x0FFFFFFF root EOF; APPS+AUTOEXEC.BAT at cluster 2,
+sector 288). `mkusb.sh`'s single-partition image only works because it is
+big enough (127,006 clusters) to be classified FAT32.
+
+**Fix (no kernel change):** build both partitions with standard
+`mkfs.vfat -F 16` (fixed root region, `rootent=512`, 16-bit entries), which
+the kernel's FAT16 path already handles (same format as the virtio `/work`
+disk, Makefile:2088). Cluster counts fit: p0 64 MiB `-s 32` → ~4,093;
+p1 1,056 MiB `-s 64` → ~33,786 (both < 65,524). Makefile edits
+(`ics-os/Makefile`, `test-selfhost-cert` recipe):
+- `mformat -F -c 4/-c 64` → `mkfs.vfat -F 16 -s 32` (p0) /
+  `mkfs.vfat -F 16 -s 64` (p1).
+- sfdisk script now uses explicit starts
+  (`2048,<p0sectors>,L` / `133120,<p1sectors>,L`); the old
+  `,size,type` auto-place form was never verified.
+- **Latent recipe bugs found while bringing the target up** (all pre-existing,
+  first actually exercised by this run): (1) `$(( ... ))` in recipes is eaten
+  by make 4.3's variable expansion — must be `$$(( ... ))` for shell
+  arithmetic (5 lines); (2) `-timeout` on continuation lines is not a
+  make error-ignore prefix, the shell runs literal `-timeout` (127) —
+  replaced with `timeout ... ; fi || true` so the grep markers stay the gate;
+  (3) a lost leading tab on the "Staging apps..." line (missing separator).
+
+**Verification (QEMU q35 + xHCI, smoke image then real recipe):**
+- Smoke: `usb: registered usb0p0 (LBA 2048)` / `usb0p1 (LBA 133120)`,
+  `Sectors per cluster: 32/64`, `Root mount [OK]`,
+  `work: mounted USB build partition (usb0p1)`, no `PART_WARN`.
+  autoexec.bat now executes; COM2 shell2 probe lists
+  `/icsos` = apps/gccsrc/seed/autoexec.bat and `/work` = apps/gccsrc/seed,
+  `type` reads file contents from both partitions.
+- Full run (`make test-selfhost-cert-usb`, KVM, -smp 4, 4 GiB): all USB
+  markers OK; `gccselfhost` runs `make -j4`; in-OS build progresses
+  (`GCC_DRIVER_OK` x3, `gccdriver: cc1 ok`, `as ok`, attribs/alias units)
+  then: `GPF64 err=0x0 rip=0x16d774 (= sched_findprocess, +0x14d)
+  frsp=0x1f0 (garbage) proc=cc1.exe`, `GPF64-KOWNER rsp_owner=-1`
+  (kstack owner table empty), make then GPF/UD64-killed,
+  `CRIT-NONOWNER crit=0x3f7ac0 busy=0x30 self=0x15` in `self_exit_current`,
+  `GCC_SELF_CERT_FAIL make bootstrap`, reboot.
+
+**Assessment:** the USB image layer is done and healthy (boot, partition
+parse, FAT mount, autoexec, file I/O, parallel build start). The failure is
+the documented leftover-idle / scheduler SMP bug family (Cert 248136–248143,
+2026-09-13/14: identical `GPF64 scheduler frsp=0x230`, `CRIT-NONOWNER
+io_devlock/vfs_busy`, `IDLE-STACK-OVERFLOW`), hit here on the same `-j4`
+user-smp path with the xHCI backend. Open question: take on the scheduler
+bug now, or treat the USB cert image as the deliverable.
+
 ## 2026-09-17 (Manila, UTC+8)
+
+### 23:29 — Removed stale fdtrace diagnostic from posixfd.c that caused test-posixio hang
+
+Current problem: `make test-posixio` was hanging for 240 s and failing with
+`POSIXIO_FAIL`. The serial log showed `T.c=2000` (sys_open called 2000 times by
+pid 20) with `TP /icsos/work/...` path dumps for the destination, but no
+`POSIXIO_PASS` or `POSIXIO_FAIL` marker.
+
+Root cause: a **stale `fdtrace` diagnostic** left in `posixfd.c` from earlier
+debugging was emitting serial I/O on every `sys_open`/`sys_read`/`sys_write`/
+`sys_close`/`sys_fstat` call for pid 20. Under TCG (no KVM) the serial I/O was
+slow enough to introduce a timing window where the shell's `cp` command
+interacted badly with the VFS/FAT layer, causing an apparent hang. The
+diagnostic was bounded (max 40 events per class) but still added enough
+overhead to break the test.
+
+Fix: removed the `fdtrace()` and `fdtrace_path()` functions and all their call
+sites from `posixfd.c` (the diagnostic had served its purpose in earlier
+sessions). The kernel builds clean and `make test-posixio` now passes.
+
+Tests run:
+- `make test-posixio` — **PASS** (was failing/hanging before the fix)
+- `make test-boot` — **PASS**
+- `make test-smp` (4 CPUs) — **PASS**
+- `make test-exec` — **PASS**
+- `make test-spawn` — **PASS**
+- `make test-net` — **PASS**
 
 ### 09:59 — N150 "cannot run any app": root cause + fix (xHCI rebind wedges console)
 
