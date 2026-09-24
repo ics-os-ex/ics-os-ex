@@ -277,7 +277,7 @@ usb: apps prep_image
 # Ships the same in-OS toolchain as `make dist`: gcc/cc1, as/ld/ar/objcopy,
 # make, tcc, SDK runtime objects, and ldscripts. Raw ics-os-uefi.img is a
 # full-disk image Etcher can flash as-is.
-usb-uefi: apps prep-dist
+usb-uefi: prep-dist
 	@test -s tmp/apps/gcc.exe && test -s tmp/apps/cc1.exe
 	@test -s tmp/apps/as.exe && test -s tmp/apps/ld.exe && test -s tmp/apps/ar.exe
 	@test -s tmp/apps/make.exe && test -s tmp/apps/objcopy.exe && test -s tmp/apps/tcc.exe
@@ -316,12 +316,16 @@ dist-tools: vmdex
 
 # Stage the full distribution content into tmp/ (reuses the plain-USB staging,
 # then adds the GCC toolchain + the runtime objects the driver links against).
-prep-dist: prep_image dist-tools
+prep-dist: prep_image
 	@mkdir -p tmp/apps/ldscripts
-	@cp /tmp/icsos-gcc/cc1 tmp/apps/cc1.exe
-	@cp contrib/gccdriver/gcc.exe tmp/apps/gcc.exe
-	@cp /tmp/icsos-gcc/rt/crt1.o /tmp/icsos-gcc/rt/tccsdk.o /tmp/icsos-gcc/rt/libtcc1.o \
-	  /tmp/icsos-gcc/rt/posix.o /tmp/icsos-gcc/rt/setjmp.o tmp/apps/
+	@test -s tmp/apps/cc1.exe && test -s tmp/apps/gcc.exe
+	@test -s tmp/apps/as.exe && test -s tmp/apps/ld.exe && test -s tmp/apps/ar.exe
+	@test -s tmp/apps/make.exe && test -s tmp/apps/objcopy.exe && test -s tmp/apps/tcc.exe
+	@gcc $(HOSTG_RTFLAGS) -c sdk/crt1.c    -o tmp/apps/crt1.o
+	@gcc $(HOSTG_RTFLAGS) -c sdk/tccsdk.c  -o tmp/apps/tccsdk.o
+	@gcc $(HOSTG_RTFLAGS) -c sdk/libtcc1.c -o tmp/apps/libtcc1.o
+	@gcc $(HOSTG_RTFLAGS) -c sdk/posix.c   -o tmp/apps/posix.o
+	@gcc $(HOSTG_RTFLAGS) -c sdk/setjmp.c  -o tmp/apps/setjmp.o
 	@cp apps/ldscripts/elf_x86_64.x* tmp/apps/ldscripts/
 	@printf 'extern int puts(const char *s);\nint main(void)\n{\n   puts("DIST_GCC_OK");\n   return 0;\n}\n' > tmp/apps/drvprobe.c
 
