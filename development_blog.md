@@ -1,5 +1,20 @@
 # Development blog
 
+## 2026-09-27 (Manila, UTC+8)
+
+### 01:28 — ELF64 stream loader batched: vim/nethack cold load 6.7x faster (52.3 s → 7.8 s)
+**Current problem / activity:** `vim` (2.3 MB) and `nethack` (3.8 MB) took ~52 s to load on a cold boot — far from the "instant" loads on the Linux host. Traced the ELF64 load path, found the per-page read bottleneck, batched the reads, resolved the resulting 4 MiB link-limit collision, and re-measured.
+
+- Root cause: `elf64_stream_load()` (`ics-os/kernel/module/elf_module.c`) issued one `fseek`+`fread` per 4 KiB page — 559 for vim, 944 for nethack. Each small read paid full VFS + filesystem + device-request overhead, so cold load ran ~93.5 ms/page. This is a shared software read path (not device-specific), consistent with the observed slow loads on the UEFI USB thumbdrive as well.
+- Fix: allocate one 128 KiB chunk (`ELF64_STREAM_CHUNK == PC_MAX_IO`) and refetch only when a page's `[fileoff, fileoff+len)` leaves the cached chunk; within a PT_LOAD the file offsets are contiguous, so one 128 KiB fetch serves 32 pages. A heap-exhausted fallback (`chunk == 0`) keeps the original per-page read; `free(chunk)` (guarded, since `free(NULL)` is not a no-op in this kheap) runs after the page loop on both success and error paths.
+- The 608 B of new `.text` pushed `.data` past the 0x1be000 `.bss` alignment boundary, bumping `bssEnd` to 0x3FA714 and tripping `ASSERT(bssEnd <= 0x3FA000)` in `lscript64.ld`. The 24 KiB guard gap is provably inert: `dexmem.c`'s frame allocator reserves the fixed `[MEM_KERNEL_LOAD, MEM_KERNEL_LIMIT=4MiB)` range regardless of `bssEnd`, so nothing ever uses `[bssEnd, 4MiB)`. Raised the guard to 16 KiB (`0x3FB000`) — matching the earlier RTL8821CE bump precedent — and corrected the stale `MEM_KERNEL_BSS_LIMIT` (was `0x3F0000`, already violated by HEAD) plus the "64 KiB slack" diagram text in `memlayout.h`.
+- Measurement (QEMU TCG, `-cdrom`, cold): vim load 52.3 s → 7.76 s (6.7x); per-page 93.5 ms → 13.4 ms. The residual ~10.6 ms/page cold is the emulated CD PIO transfer rate amortized over the batch — a device/emulation limit, not software. The warm (page-cache) floor is ~2.8 ms/page, the `userpd_map_page` frame alloc + 4 KiB zero + PTE write.
+- The FAT/USB path benefits the same way: `loadfile12EX2()` coalesces contiguous clusters into ≤32 KiB device requests, so batching cuts the I/O request count from ~700 (4 KiB) to ~72 (32 KiB). The in-memory FAT makes the cluster-chain walk cheap (array lookups), so it is not the cost.
+- `mmap` evaluation: not state-of-the-art. `dex32_mmap` (syscall 0xB6) is an anonymous bump allocator over `userpd_map_page`; `vfs_mapfile` mallocs+freads a kernel buffer; the 64-bit `pagefaulthandler` kills on any not-present user fault. There is no file-backed demand paging, VMA management, or COW.
+- Verified: `make -C kernel bzImage` links (bssEnd=0x3FA714 ≤ 0x3FB000); `make test-vim PASS`, `make test-exec PASS`, `make test-nethack PASS`.
+- Follow-ups (separate): propagate `readfile` failure in `vfs_directread`/`fat_openfileEX` (read errors are currently swallowed); consider a read-path sequential cursor in `loadfile12EX2` to remove the residual O(offset) chain walk; and a real file-backed demand-paging `mmap` if "state-of-the-art mmap" becomes a hard requirement.
+- Current state: the batched loader is green across the exec/vim/nethack gates. Ready for a focused commit if requested.
+
 ## 2026-09-26 (Manila, UTC+8)
 
 ### 23:43 — Kernel VT parser hardened and `test-termtest` expanded to pass

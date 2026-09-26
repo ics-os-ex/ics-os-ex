@@ -34,10 +34,13 @@ SECTIONS {
 }
 /* bssEnd must stay below the 4MiB user-ELF base (TinyCC ELF_START_ADDR).
    The former 256KiB "frame stack" after bssEnd was replaced by the global
-   E820-seeded frame allocator (see dexmem.c), so only a small guard is kept.
-   Raised to 0x3FA000 for the RTL8821CE plus the current network stack; this
-   leaves a 24 KiB guard before the fixed 4 MiB user-ELF window. */
-ASSERT(bssEnd <= 0x003FA000, "kernel BSS collided with 4MiB user ELF window");
+   E820-seeded frame allocator (see dexmem.c), which reserves the fixed
+   [MEM_KERNEL_LOAD, MEM_KERNEL_LIMIT) range regardless of bssEnd, so the
+   gap between bssEnd and 4MiB is inert slack and only a small guard is
+   kept.  Raised to 0x3FA000 for the RTL8821CE plus the current network
+   stack, then to 0x3FB000 (16 KiB guard) when the ELF64 stream loader's
+   batched 128KiB reads crossed the 0x1be000 .bss alignment boundary. */
+ASSERT(bssEnd <= 0x003FB000, "kernel BSS collided with 4MiB user ELF window");
 INPUT(startup.o asmlib.o context.o ap_trampoline.o lapic.o smp.o
       kernel32.o scheduler.o iomgr.o blkcache.o posixfd.o fat.o ext4.o iso9660.o ramdisk.o
       devfs.o irqwrap.o devmgr_error.o kexec.o irq_lifecycle.o vtd.o pci_probe.o

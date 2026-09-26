@@ -17,7 +17,7 @@
  *  +------------------+ 0x00100000  MEM_KERNEL_LOAD
  *  | kernel ELF       |          linker .text/.data/.bss (grows down)
  *  |  + kstacks in BSS|
- *  |  + guard region  |          64KiB slack before the user ELF (the former
+ *  |  + guard region  |          16KiB slack before the user ELF (the former
  *  |                  |          256KiB "frame stack" was replaced by the
  *  |                  |          global E820-seeded frame pool in dexmem.c)
  *  +------------------+ 0x00400000  MEM_KERNEL_LIMIT / MEM_USER_ELF_BASE
@@ -47,7 +47,7 @@
  *
  * Rules:
  *  1. The kernel image (bssEnd) MUST stay <= MEM_KERNEL_BSS_LIMIT (linker
- *     ASSERT), leaving 64KiB of slack below the 4MiB user-ELF base.  TinyCC
+ *     ASSERT), leaving 16KiB of slack below the 4MiB user-ELF base.  TinyCC
  *     user ELFs start at 4MiB.  The frame pool skips the whole
  *     MEM_KERNEL_LOAD..MEM_KERNEL_LIMIT reserved range, so growing the kernel
  *     image into that gap is safe.
@@ -85,11 +85,14 @@
 #define MEM_KERNEL_LOAD        0x00100000UL
 #define MEM_KERNEL_LIMIT       0x00400000UL   /* TinyCC ELF_START_ADDR */
 
-/* Linker ASSERT bound: bssEnd must stay <= this.  It is MEM_KERNEL_LIMIT
-   (the 4MiB user-ELF base) minus a 64KiB guard.  The former 256KiB "frame
-   stack" that occupied that gap was replaced by the global E820-seeded frame
-   allocator (dexmem.c), which skips the reserved kernel range entirely. */
-#define MEM_KERNEL_BSS_LIMIT   0x003F0000UL
+/* Linker ASSERT bound: bssEnd must stay <= this (lscript64.ld).  It is
+   MEM_KERNEL_LIMIT (the 4MiB user-ELF base) minus a 16KiB guard.  The
+   former 256KiB "frame stack" that occupied that gap was replaced by the
+   global E820-seeded frame allocator (dexmem.c), which reserves the fixed
+   [MEM_KERNEL_LOAD, MEM_KERNEL_LIMIT) range entirely, so the gap between
+   bssEnd and 4MiB is inert slack.  Raised 0x3F0000 -> 0x3FA000 (RTL8821CE
+   + net stack) -> 0x3FB000 (ELF64 batched stream reads) as the stack grew. */
+#define MEM_KERNEL_BSS_LIMIT   0x003FB000UL
 
 /* Per-CPU idle stacks (not BSS).  16KiB and 24KiB both overflowed
    through the guard (cert 248117/248120 IDLE-STACK-OVERFLOW).  32KiB * 8
