@@ -2,6 +2,17 @@
 
 ## 2026-09-28 (Manila, UTC+8)
 
+### 05:40 — `test-nethack` engrave gap closed: staged xcrypt-obfuscated `engrave` data file
+**Current problem / activity:** The 04:20 entry left a non-blocking gap — the guest log printed `Can't open 'engrave' file.` → `Program in disorder!` because `engrave` was not one of the 13 `nhdat` entries and was not staged on the writable RAM disk. Closed it by staging a correctly-formatted `engrave` data file that the game's `dlb_fopen()` filesystem fallback reads.
+
+- Chose between repacking `nhdat` with `engrave` vs. staging a filesystem file. Repacking needs the full host pipeline (`makedefs` + `dgn_comp` + `dlb`; the latter two need flex/bison) and risks perturbing the working 13-entry `nhdat`. Staging uses `dlb_fopen()`'s built-in `fopen_datafile()` fallback (confirmed in `src/src/dlb.c`) — a legitimate first-class path, not a hack — so staged the file.
+- Determined the exact on-disk format by extracting the known-good `epitaph` entry from the working `nhdat` with a small Python DLB parser (header `rev nentries strsize liboffset totalsize`; entries `<handling> <name> <offset>\n`). Confirmed: line 0 is the `Dont_Edit_Data` header, then `xcrypt()`-obfuscated phrases. Also confirmed a pre-existing makedefs quirk: the default content is written with no trailing newline, so it concatenates with the first phrase on line 1 (a position-dependent `xcrypt` mismatch on the tail — identical in `epitaph`, so not a regression I introduced).
+- Wrote `contrib/nethack/gen_engrave.c`, a self-contained host tool that replicates `makedefs`' `do_rnd_access_file()` + `xcrypt()` + `fgetline()` byte-for-byte (the same production code that made the working `epitaph`), so the output is correct by construction. It reads `contrib/nethack/src/dat/engrave.txt` (48 phrases; `#`/blank lines skipped) and emits `base/nethack/engrave`.
+- Verified the generated file against the extracted `epitaph`: identical line-0 header, matching line-1 structure, and a clean `xcrypt` round-trip on the phrase lines (`Vlad was here`, `ad aerarium`). The tool reproduces the committed file byte-for-byte.
+- Wired into `test-nethack` (Makefile): added `base/nethack/engrave` to the prerequisites, a `cp` into the ISO `/nethack/` tree, and an autoexec line staging it to `/ramdisk/nethack/engrave`; documented the `/engrave` filesystem data file in the target's data-layout comment.
+- Verified: `make test-nethack` → **PASS**. The log now has **zero** `Can't open 'engrave'` and **zero** `Program in disorder` (both were emitted by `couldnt_open_file()` → `impossible()`), and `Hello Tester, welcome to NetHack!` is present. `engrave` is now read via the DLB filesystem fallback.
+- Current state: the NetHack test is fully clean — no data-file errors, a character is created, and the first level is reached.
+
 ### 04:20 — `test-nethack` green: NetHack reaches first level (root cause: `DLB` disabled)
 **Current problem / activity:** `make test-nethack` hung/failed after character creation: `Cannot open dungeon description - "dungeon" file!` → `Program initialization has failed.`. The guest printed the copyright banner and the `Who are you?` / `Shall I pick … [ynaq]` prompts, then died when `init_dungeons()` → `dlb_fopen("dungeon")` returned NULL. Traced the packed-data path end to end and found the real cause.
 
