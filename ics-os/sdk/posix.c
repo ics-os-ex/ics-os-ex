@@ -2790,73 +2790,120 @@ FILE *freopen(const char *path, const char *mode, FILE *stream)
     return 0;
 }
 
-/* fscanf: minimal scanf for the file/line reading NetHack's topten readentry()
-   performs.  Supports %s (whitespace-delimited token), %d (signed int) and
-   %c (single char) with width, and literal characters in the format.
+/* fscanf: minimal scanf for the FILE-based scanning NetHack performs (the
+   DLB directory in dlb.c readlibdir() and the topten scoreboard in topten.c).
+   Supports %s (whitespace-delimited token), %d/%u (int), %ld/%lu (long), and
+   %c (single char), each with an optional width and length modifier, plus
+   literal characters in the format.  A one-char pushback keeps the stream
+   positioned correctly so a literal (e.g. the space in "%c%s %ld") matches
+   the character that terminated the previous conversion.
    Returns the number of conversions (EOF => EOF). */
 int fscanf(FILE *f, const char *fmt, ...)
 {
     va_list ap;
     int matched = 0;
     int c;
+    int pushback = -1; /* one-char pushback so conversions don't eat a
+                          trailing separator the format still expects.  It is
+                          flushed into the stream via ungetc() on every return
+                          so a char pushed back at the end of one fscanf() call
+                          (e.g. the 'n' handling byte left by a trailing "\n"
+                          literal) survives into the next call - the FILE buffer
+                          is the only place such a char can persist. */
+#define fsgetc() (pushback >= 0 ? (c = pushback, pushback = -1) : (c = fgetc(f)))
+#define fspurk(ch) (pushback = (ch))
     if (!f || !fmt) return -1;
     va_start(ap, fmt);
     while (*fmt) {
         if (*fmt != '%') {
-            /* literal: skip leading whitespace in input, then match char */
-            do { c = fgetc(f); if (c == EOF) { va_end(ap); return matched; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
-            if (c != *fmt) { va_end(ap); return matched; }
+            if (*fmt == ' ' || *fmt == '\t' || *fmt == '\n' || *fmt == '\r') {
+                /* whitespace literal: consumes any run of whitespace in the
+                   input (scanf semantics); push back the first non-space so
+                   the next conversion sees it. */
+                do { fsgetc();                if (c == EOF) { va_end(ap); goto fscout; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+                if (c != EOF) fspurk(c);
+            } else {
+                /* non-whitespace literal: skip leading whitespace, then match */
+                do { fsgetc(); if (c == EOF) { va_end(ap); goto fscout; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+                if (c != *fmt) { fspurk(c); va_end(ap); goto fscout; }
+            }
             fmt++;
             continue;
         }
         fmt++;
+        /* optional assignment suppression (*) */
+        int suppress = 0;
+        if (*fmt == '*') { suppress = 1; fmt++; }
         /* optional width */
         int width = 0;
         while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+        /* optional length modifier (l for long, h/z ignored for value width) */
+        int islong = 0;
+        if (*fmt == 'l') { islong = 1; fmt++; if (*fmt == 'l') fmt++; }
+        else if (*fmt == 'h' || *fmt == 'z') { fmt++; }
         switch (*fmt) {
         case 's': {
             int n = 0;
-            char *dst = va_arg(ap, char *);
+            char *dst = suppress ? 0 : va_arg(ap, char *);
             /* skip whitespace */
-            do { c = fgetc(f); if (c == EOF) { va_end(ap); return matched; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+            do { fsgetc(); if (c == EOF) { va_end(ap); goto fscout; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
             while (c != EOF && c != ' ' && c != '\t' && c != '\n' && c != '\r' && (width == 0 || n < width)) {
                 if (dst && (n < 255)) dst[n] = (char)c;
                 n++;
-                c = fgetc(f);
+                fsgetc();
             }
+            if (c != EOF) fspurk(c); /* put back the terminating separator */
             if (dst) dst[n > 255 ? 255 : n] = 0;
             matched++;
             break;
         }
-        case 'd': {
-            int sign = 1, v = 0, got = 0;
-            int *dst = va_arg(ap, int *);
-            do { c = fgetc(f); if (c == EOF) { va_end(ap); return matched; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
-            if (c == '-') { sign = -1; c = fgetc(f); }
-            else if (c == '+') c = fgetc(f);
-            while (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); got++; c = fgetc(f); }
-            if (!got) { va_end(ap); return matched; }
-            if (dst) *dst = sign * v;
+        case 'd':
+        case 'u': {
+            int sign = 1, got = 0;
+            long v = 0;
+            do { fsgetc(); if (c == EOF) { va_end(ap); goto fscout; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+            if (c == '-' && *fmt == 'd') { sign = -1; fsgetc(); }
+            else if (c == '+') fsgetc();
+            while (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); got++; fsgetc(); }
+            if (c != EOF) fspurk(c); /* put back the first non-digit */
+            if (!got) { va_end(ap); goto fscout; }
+            v *= sign;
+            if (!suppress) {
+                if (islong) {
+                    long *dst = va_arg(ap, long *);
+                    if (dst) *dst = v;
+                } else {
+                    int *dst = va_arg(ap, int *);
+                    if (dst) *dst = (int)v;
+                }
+            }
             matched++;
             break;
         }
         case 'c': {
-            char *dst = va_arg(ap, char *);
-            c = fgetc(f);
-            if (c == EOF) { va_end(ap); return matched; }
+            char *dst = suppress ? 0 : va_arg(ap, char *);
+            fsgetc();
+            if (c == EOF) { va_end(ap); goto fscout; }
             if (dst) *dst = (char)c;
             matched++;
             break;
         }
         default:
             /* unsupported conversion: skip one char, count as matched */
-            if (fgetc(f) == EOF) { va_end(ap); return matched; }
+            fsgetc();
+            if (c == EOF) { va_end(ap); goto fscout; }
+            fspurk(c);
             matched++;
             break;
         }
         fmt++;
     }
     va_end(ap);
+fscout:
+#undef fsgetc
+#undef fspurk
+    if (pushback >= 0)
+        ungetc(pushback, f); /* persist a trailing pushed-back char across calls */
     return matched;
 }
 

@@ -315,14 +315,14 @@ int tty_read(tty_t *t, char *buf, int n)
 }
 
 int tty_write(tty_t *t, const char *buf, int n)
-{
-   int i;
-   if (!t || !buf || n <= 0)
-      return 0;
-   for (i = 0; i < n; i++)
-      tty_echo(t, buf[i]);
-   return n;
-}
+ {
+    int i;
+    if (!t || !buf || n <= 0)
+       return 0;
+    for (i = 0; i < n; i++)
+       tty_echo(t, buf[i]);
+    return n;
+ }
 
 int sys_kcmd(char *cmd)
 {

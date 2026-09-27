@@ -2,10 +2,13 @@
 #
 # The kernel sets TERM=xterm at boot (kernel/kernel32.c) and the console is a
 # fixed 80x25 DDL-backed VT100/xterm interpreter (kernel/console/tty_vt.c) that
-# supports CUP/CUU/ED/EL/SGR (colors 30-37/40-47/90-97, bold, underline,
-# reverse), DSR-6, and the ?1049 alternate screen. NetHack's built-in termcap
-# library (sys/share/tclib.c) reads this file at startup; the capabilities
-# below are a standard xterm entry trimmed to what the VT actually renders.
+ # supports CUP/CUU/ED/EL/SGR (colors 30-37/40-47/90-97/100-107, 256-color
+ # 38;5;n/48;5;n and truecolor 38;2;r;g;b/48;2 mapped to the 16-color palette,
+ # bold, underline, reverse), DSR-6, and the ?1049 alternate screen. Co/AF/AB
+ # advertise 256 colors so color-aware apps (vim, nethack) emit SGR sequences
+ # the VT renders. NetHack's built-in termcap library (sys/share/tclib.c) reads
+ # this file at startup; the capabilities below are a standard xterm entry
+ # trimmed to what the VT actually renders.
 #
 # co/li are also obtained at runtime via TIOCGWINSZ (sys_ttyioctl returns 80x25);
 # they are listed here as a fallback.
@@ -28,6 +31,9 @@ xterm|ICS-OS 80x25 VT100/xterm console:\
 	:so=\E[1m:se=\E[0m:\
 	:us=\E[4m:ue=\E[0m:\
 	:md=\E[1m:\
+	:Co#256:\
+	:AF=\E[3%dm:\
+	:AB=\E[4%dm:\
 	:mr=\E[7m:\
 	:mb=\E[5m:\
 	:mh=\E[2m:\

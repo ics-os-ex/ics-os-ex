@@ -108,6 +108,7 @@ kernel32.o: kernel32.c build.h hardware/usb/uhci.c hardware/usb/xhci.c hardware/
 		console/foreground.c process/dex_taskmgr.c process/pdispatch.c \
 		console/console.c console/selfhost.c console/tty.c console/tty.h \
 		console/tty_vt.c console/tty_tc.c console/tty_canon.h console/dex_DDL.h console/console_mux.h \
+		console/vt_color.c console/vt_color.h \
 		console/script_comment.h \
 	hardware/chips/ports.c hardware/vga/dexvga.c hardware/vga/fbconsole.c hardware/vga/fbconsole.h hardware/vga/fbconsole_geom.h stdlib/qsort.c \
 		hardware/dexapm.c hardware/chips/irqhandlers.c memory/dlmalloc.c \

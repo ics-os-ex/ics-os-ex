@@ -885,6 +885,41 @@ static int console_screenshot(const char *path)
     return ok;
 }
 
+/* Drive the real VT SGR parser (DDL vt_feed path) on scratch state and verify
+   the resulting cell attribute. Integration complement to the host TAP in
+   tests/vt_color_unit.c: proves the CSI dispatch + vt_feed byte path maps
+   256-color and truecolor SGR onto the 16-color palette, independent of
+   whether the live console tty is serial- or DDL-backed. */
+static void console_colortest(void)
+{
+    int ok = 1;
+    int sgr;
+
+    sgr = vt_sgr_probe("\033[0m");
+    if (sgr != 0x07) { ok = 0; printf("COLORTEST_FAIL reset sgr=0x%x\n", sgr); }
+
+    sgr = vt_sgr_probe("\033[38;5;196m");      /* 256 fg: pure red -> palette 4 */
+    if ((sgr & 0x0F) != 4) { ok = 0; printf("COLORTEST_FAIL fg256 sgr=0x%x\n", sgr); }
+
+    sgr = vt_sgr_probe("\033[48;5;21m");       /* 256 bg: blue -> palette 1 */
+    if (((sgr >> 4) & 0x0F) != 1) { ok = 0; printf("COLORTEST_FAIL bg256 sgr=0x%x\n", sgr); }
+
+    sgr = vt_sgr_probe("\033[38;2;255;0;0m");  /* 24 fg: red -> palette 4 */
+    if ((sgr & 0x0F) != 4) { ok = 0; printf("COLORTEST_FAIL fg24 sgr=0x%x\n", sgr); }
+
+    sgr = vt_sgr_probe("\033[48;2;0;170;170m"); /* 24 bg: cyan -> palette 3 */
+    if (((sgr >> 4) & 0x0F) != 3) { ok = 0; printf("COLORTEST_FAIL bg24 sgr=0x%x\n", sgr); }
+
+    sgr = vt_sgr_probe("\033[91m");            /* bright fg red -> palette 12 */
+    if ((sgr & 0x0F) != 12) { ok = 0; printf("COLORTEST_FAIL fg9 sgr=0x%x\n", sgr); }
+
+    sgr = vt_sgr_probe("\033[101m");           /* bright bg red -> palette 12 */
+    if (((sgr >> 4) & 0x0F) != 12) { ok = 0; printf("COLORTEST_FAIL bg10 sgr=0x%x\n", sgr); }
+
+    if (ok)
+        printf("COLORTEST_OK vt=256+truecolor\n");
+}
+
 /* ==================================================================
    console_execute(const char *str):
    * This command is used to execute a console string.
@@ -1118,9 +1153,12 @@ int console_execute(const char *str){
         }
      }else
      if (strcmp(u,"screenshot") == 0){   //-- Save the framebuffer as PPM. Args: [path]
-        char *p = strtok(0," ");
-        console_screenshot(p ? p : "/icsos/screenshot.ppm");
-     }else
+         char *p = strtok(0," ");
+         console_screenshot(p ? p : "/icsos/screenshot.ppm");
+      }else
+      if (strcmp(u,"colortest") == 0){    //-- Drive the VT SGR parser; verify 256/truecolor mapping.
+         console_colortest();
+      }else
      if (strcmp(u,"cpuid") == 0){        //-- Displays CPU information.
       hardware_cpuinfo mycpu;
       hardware_getcpuinfo(&mycpu);
@@ -1866,9 +1904,9 @@ void console_main(){
           not be serial-backed: TTY_SERIAL would send key echo to a missing
           UART and make tty_read() poll an absent 16550 receiver. */
        if (serial_com1_present() &&
-           myddl && (myddl->hdw_ptr == 0 || (void *)myddl->hdw_ptr != (void *)0xB8000))
-          tflags |= TTY_SERIAL;
-      tty_t *t = tty_alloc(tdl, tflags);
+            myddl && (myddl->hdw_ptr == 0 || (void *)myddl->hdw_ptr != (void *)0xB8000))
+           tflags |= TTY_SERIAL;
+       tty_t *t = tty_alloc(tdl, tflags);
       tty_set_fg(t);
       tty_attach_proc(current_process, t);
       if (myfg && myfg != (fg_processinfo *)-1)

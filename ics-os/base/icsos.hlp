@@ -5,6 +5,7 @@ cc1test- Run host-built GCC cc1 to compile a trivial file in-OS.
 cc- Builds a C program (invokes tcc.exe). Args: <name.exe> <name.c>
 cd- Changes working directory. Args: <directory>
 cls- Clears the screen. 
+colortest- Drive the VT SGR parser; verify 256/truecolor mapping.
 copy- Copy source to destination: Args: <source> <destination>
 cpuid- Displays CPU information.
 del- Deletes a files or directory. Args: <filename/dirname>

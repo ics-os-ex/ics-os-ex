@@ -165,6 +165,7 @@ extern int cpu_count;
 #include "console/dex_DDL.c"
 #include "hardware/vga/fbconsole.c"
 #include "console/tty.c"
+#include "console/vt_color.c"
 #include "console/tty_vt.c"
 #include "console/tty_tc.c"
 #include "hardware/dexapm.c"

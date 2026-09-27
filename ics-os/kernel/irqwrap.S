@@ -114,11 +114,31 @@
     movq %rsp, %r13
     movabs $smp_have_rdtscp, %rax
     cmpl $1, (%rax)
-    jne .Lkenter\@
+    je .Lhave_rdtscp\@
+    /* No RDTSCP: derive cpu id from GS base (= &cpus[id] via MSR 0xC0000101).
+       cpus[] is in low 4GiB, so 32-bit math is safe.  Fall back to staying
+       on the current stack only if the GS base is not a valid cpus[] slot. */
+    movl $0xC0000101, %ecx
+    rdmsr                              /* eax = lo32, edx = hi32 of GS base */
+    movl %eax, %r11d
+    movabs $cpus, %r12
+    movl %r12d, %r10d
+    subl %r10d, %r11d                  /* r11d = (gs_base - &cpus[0]) = id*48 */
+    shrl $4, %r11d                     /* r11d = id*3 */
+    movl %r11d, %eax
+    xorl %edx, %edx
+    movl $3, %r10d
+    divl %r10d                         /* eax = id */
+    movl %eax, %ecx
+    cmpl $MAX_CPUS_VAL, %ecx
+    jae .Lkenter\@
+    jmp .Lgot_cpu\@
+.Lhave_rdtscp\@:
     rdtscp                             /* ecx = IA32_TSC_AUX = cpu id */
     movl %ecx, %eax
     cmpl $MAX_CPUS_VAL, %eax
     jae .Lkenter\@
+.Lgot_cpu\@:
     /* Already on this CPU's IRQ stack? nested. */
     movabs $irq_safe_stack_top, %rdx
     movq (%rdx,%rax,8), %r8

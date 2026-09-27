@@ -123,10 +123,10 @@ void putc(char x)
  };
 
 void putcEX(char x)
- {
-  /* Always mirror user/kernel putc to serial so nographic boots see output
-      even when the process DDL is not the active console. */
-   extern void serial_putc(char c);
+  {
+   /* Always mirror user/kernel putc to serial so nographic boots see output
+       even when the process DDL is not the active console. */
+    extern void serial_putc(char c);
    /* Kernel-log capture: while a kernel printf() is in progress, record every
       character into the ring (always) and suppress the live console echo when
       the message severity is below the console log-level threshold. User-space
