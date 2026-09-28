@@ -688,6 +688,12 @@ process_init();    //defined in process.c
     fbdbg_stage(15, "APs started");
     kbd_boot_leds_hold(KBD_LED_CAPS | KBD_LED_NUM);
 
+    {
+       extern volatile int sched_inject_switch_gap;
+       if (strcmp(kernel_cmdline, "fault-switch-gap") == 0)
+          sched_inject_switch_gap = 16;
+    }
+
     /* BSP keeps PIT/LAPIC timer for scheduling; enable after AP probe. */
    {
       extern void lapic_timer_init(unsigned int hz);

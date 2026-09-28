@@ -2,6 +2,59 @@
 
 ## 2026-09-28 (Manila, UTC+8)
 
+### 21:10 — `FORK-FRAME-BAD` root-caused: voluntary switch into a DYING fork child
+
+**Current problem / activity:** intermittent `test-fork` failure (`FORK-FRAME-BAD`
+/ `FORK-FRAME-PREBAD`; on committed HEAD it shows as `GPF64 TSS-bad` at the
+`iretq` in `fork_child_return`). Reproduces on HEAD too, so it is not from the
+in-progress mmap work.
+
+- The "64-byte shifted" frame was decoded from the dump as a complete `int 0x30`
+  frame based at `F-64`: saved `rax=3` (exit), `rbx=0x4d` (status 77), return
+  into `dex_exit`. `0x401946` is the generic SDK syscall stub return, not a
+  fork-only address. At the same recursion depth the `_exit→exit→dex_exit→stub`
+  chain is exactly 64 bytes deeper than `fork→stub`, so the writer was the
+  victim child itself: its own exit stack.
+- A `ps_switchto` probe caught `SWITCH-DYING` from `taskswitch→schedule_from_timer`
+  with `prev`=parent. Race: `scheduler()` claims the child and restores IF; on the
+  voluntary (waitpid) path a timer before `ps_switchto`'s `cli` runs the child
+  nested to `self_exit_current` (it never yields, so `ctx.rip` stays
+  `fork_child_return`), which marks it DYING and releases `on_cpu`. The outer
+  call then switches to the stale choice and re-runs `fork_child_return` over
+  the exit stack.
+- Fix: `schedule_from_timer` keeps IF=0 from the choice to `ps_switchto`
+  (`context_switch` already saves prev with IF=1); `ps_switchto` and
+  `ps_switchto_load_only` refuse a DYING non-prev PCB under the claim
+  (`SWITCH-DYING-REFUSED`, counter `ps_switch_dying_refusals`).
+- Regression: `make test-fork-switch-gap` boots with `fault-switch-gap`, which
+  holds the choose→switch gap open until the chosen child self-exits. Guard
+  disabled: `FORK-FRAME-BAD` on the first injection (pid 21) and a hang. Guard
+  enabled: 16 injections, `SWITCH-DYING-REFUSED`, PASS.
+- Earlier "freed page" readings in this investigation were a `0xFFF000` mask
+  artifact (fixed to `0x000FFFFFFFFF000`).
+- Removed the investigation diagnostics (clone snapshot ring, read-only frame
+  write probe, `PREBAD`/`PREWALK`, `FORK-FRAME-*`, `COW401946`, the
+  `fork_child_return` frame check in `irqwrap.S`). Kept the `SWITCH-DYING-REFUSED`
+  counter and the `fault-switch-gap` hook. The `.bootpt` section split stays:
+  the kernel BSS still collides with the 4MiB user window without it.
+- Cleaned tree: `test-fork` (1 vCPU) 6/6, `test-fork-switch-gap`,
+  `test-fork-matrix`, `test-restart`, `test-stress-user-smp`, `test-spawn`,
+  `test-integration`, `test-posixio` all PASS. `test-fatwrite-coop` remains
+  flaky (separate open issue, see 20:26).
+
+### 20:26 — fatwrite-coop still open after claim-release and adopt guard
+
+**Current problem / activity:** Cooperative FAT writers still fault under
+`coop-smp`. `on_cpu` now drops only in `context_load_release` after RSP
+moves, a leftover timer does not reload the task it is still on, and
+page-fault/#UD paths adopt a PCB only when `on_cpu` is already this CPU.
+
+Five `make test-fatwrite-coop` runs: 2 pass, 3 fail. Failures are
+`GPF64` at `scheduler`'s `ret` with `frsp=0x230` (pid 21, pid 22) and
+`UD64` into the middle of `context_switch` (`rip=0x100477`) and into
+`cpus[]` (`rip=0x3ee922`) on `fatwr.exe`, `task_mgr`, and `cpu_idle`.
+Not closed.
+
 ### 05:40 — `test-nethack` engrave gap closed: staged xcrypt-obfuscated `engrave` data file
 **Current problem / activity:** The 04:20 entry left a non-blocking gap — the guest log printed `Can't open 'engrave' file.` → `Program in disorder!` because `engrave` was not one of the 13 `nhdat` entries and was not staged on the writable RAM disk. Closed it by staging a correctly-formatted `engrave` data file that the game's `dlb_fopen()` filesystem fallback reads.
 

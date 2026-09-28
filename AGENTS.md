@@ -90,6 +90,7 @@ Useful individual targets (from `ics-os/`):
 | `test-fatwrite-coop` | Same writers under `coop-smp` (user processes on APs, no timer preemption of a running user tool — the self-host closure's scheduling regime); asserts no `CRITHANG`/`WATCHDOG`, so it fails on a lock hang rather than on a missing success marker |
 | `test-fork` | COW fork ABI/isolation, fast path, text protection, OOM, inherited fd, exit/wait, and delayed reaping |
 | `test-fork-matrix` | COW fork pressure gate on `-smp 1/2/4/8` |
+| `test-fork-switch-gap` | `fault-switch-gap` cmdline holds the scheduler choose→switch window open until the chosen fork child self-exits; asserts `SWITCH-GAP-INJECT child-exited` + `SWITCH-DYING-REFUSED` and no `FORK-FRAME-BAD`/`GPF64` (regression for re-running `fork_child_return` on a DYING PCB) |
 | `test-restart` | Fork/wait process-restart regression (Multiboot2 ISO, TCG 2 vCPU): a parent forks a counting child and `waitpid`s; asserts `RESTART_TEST_CHILD_STARTUP` appears exactly once and `RESTART_TEST_PASS` is reached; no GPF/PF |
 | `test-restart-xhci` | Same fork/wait reproducer on the xHCI q35 UEFI thumbdrive — the platform where `smp_have_rdtscp` is 0 and IRQ-entry CPU-id falls back to the GS base; asserts `RESTART_TEST_CHILD_STARTUP` count 1 + `RESTART_TEST_PASS` (regression for the user-IRQ staying on the user stack and `schedule_from_timer` skipping the switch) |
 | `test-make` | In-OS TinyCC builds GNU make 3.82 onto `/work`; `make -f t.mk` spawns `hello.exe` (`MAKE_PASS`) |

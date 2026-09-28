@@ -14,6 +14,7 @@ QEMU_MEM=128M
 SMP_CPUS?=4
 SMP_MATRIX?=1 2 4 8
 FORK_CPUS?=2
+FORK_CMDLINE?=
 FORK_MATRIX?=1 2 4 8
 QEMU_NET=-net nic,model=rtl8139 -net none
 # QEMU can load the 32-bit multiboot kernel the same way GRUB does.
@@ -38,7 +39,7 @@ vmdex:
 
 .PHONY: usb-uefi usb-etcher test-usb-uefi-gpt test-vbox-uefi-gpt test-vbox-uefi-gpt-bios test-bochs-uefi-gpt test-usb-cdc-pico test-nethack
 .PHONY: test-screenshot
-.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-netdhcp-unit test-net-stress test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-memcorrupt test-asloop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-selfhost-cert-usb test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-vtcolor-unit test-vtcolor-guest test-vtcolor-xhci test-vim-xhci test-nethack-xhci test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-termcap-unit test-ttycanon-unit test-usbdbg-unit test-rtwfw-unit test-rtwphy-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-netdhcp-unit test-net-stress test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-memcorrupt test-asloop test-fork test-fork-switch-gap test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-selfhost-cert-usb test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-vtcolor-unit test-vtcolor-guest test-vtcolor-xhci test-vim-xhci test-nethack-xhci test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-termcap-unit test-ttycanon-unit test-usbdbg-unit test-rtwfw-unit test-rtwphy-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -1982,7 +1983,7 @@ test-fork: kernel/Kernel64.bin apps/forktest.exe
 	@cp kernel/Kernel64.bin /tmp/icsos-fork-iso/vmdex
 	@cp apps/forktest.exe /tmp/icsos-fork-iso/apps/forktest.exe
 	@printf '%s\n' 'forktest' 'forkoomtest' 'reboot' > /tmp/icsos-fork-iso/autoexec.bat
-	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
+	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex $(FORK_CMDLINE); boot }' \
 		> /tmp/icsos-fork-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-fork.iso /tmp/icsos-fork-iso >/dev/null 2>&1
 	@truncate -s 64M /tmp/icsos-fork-work.img
@@ -2013,6 +2014,17 @@ test-fork: kernel/Kernel64.bin apps/forktest.exe
 	@! grep -aq "General Protection Fault\|DOUBLE FAULT" /tmp/icsos-fork.log
 	@test $$(grep -ac "Page fault (" /tmp/icsos-fork.log) -le 1
 	@echo "test-fork FORK_CPUS=$(FORK_CPUS) PASS"
+
+# Fault injection: "fault-switch-gap" holds the scheduler's choose->switch window
+# open until the chosen, never-run fork child self-exits under a nested timer
+# switch.  ps_switchto() must refuse the now-DYING PCB; switching into it re-ran
+# fork_child_return over the child's exit stack (64-byte-shifted iretq frame).
+test-fork-switch-gap: kernel/Kernel64.bin apps/forktest.exe
+	@$(MAKE) --no-print-directory test-fork FORK_CPUS=1 FORK_CMDLINE=fault-switch-gap
+	@grep -aq "SWITCH-GAP-INJECT child-exited" /tmp/icsos-fork.log
+	@grep -aq "SWITCH-DYING-REFUSED switch" /tmp/icsos-fork.log
+	@! grep -aq "FORK-FRAME-BAD\|FORK-FRAME-PREBAD\|GPF64" /tmp/icsos-fork.log
+	@echo "test-fork-switch-gap PASS"
 
 test-fork-matrix: kernel/Kernel64.bin apps/forktest.exe
 	@set -e; for cpus in $(FORK_MATRIX); do \

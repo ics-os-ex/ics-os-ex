@@ -1000,6 +1000,7 @@ volatile char *irqwrap_offchk_use3=&irqwrap_userstack_chk[0];
       goto fail;
    if (posix_fd_clone_fork(child,parent)<0)
       goto fail;
+   vm_area_fork(parent, child);
 
    dex32_stopints(&flags);
    sync_entercrit(&processmgr_busy);
@@ -1019,6 +1020,7 @@ fail:
    if (child->parameters)
       free(child->parameters);
    pcb_free_irq_kstack(child);
+   vm_area_exit(child);
    free(child);
 nomem:
     fork_frame_fail("NOMEM", parent, -12);
@@ -1295,6 +1297,7 @@ DWORD createprocess(
 
 DWORD dex32_asyncproc(saveregs *r,void *entrypoint,char *name,DWORD stacksize){
    PCB386 *temp=(PCB386*)malloc(sizeof(PCB386));
+   memset(temp,0,sizeof(PCB386));
 
    temp->before=current_process;
    strcpy(temp->name,name);
@@ -1685,6 +1688,11 @@ DWORD kill_process(DWORD processid){
             freeprocessmemory(ptr->meminfo,(DWORD*)ptr->pagedirloc); //
 
 #ifdef __x86_64__
+         /* Flush MAP_SHARED dirty pages and drop the VMA file refs BEFORE the
+            private PML4 is freed.  We hold processmgr_busy, so the flush's
+            io_busy acquire is a nested sync_entercrit and pure-spins (no
+            yield) — the timer still preempts the spin, so no deadlock. */
+         vm_area_exit(ptr);
          /* Reclaim a private PML4 whenever CR3 is a pool frame.
             User ELFs enter with kernel CS but still own the directory.
             Threads share the parent's PML4 — only the non-thread PCB
@@ -2497,6 +2505,23 @@ static void ps_unclaim_if_unused(PCB386 *process, PCB386 *prev, int me)
       process->on_cpu = -1;
 }
 
+volatile unsigned long ps_switch_dying_refusals;
+
+static void ps_switch_dying_refused(const char *path, int me, PCB386 *process,
+                                    PCB386 *prev)
+{
+   unsigned long n = __sync_add_and_fetch(&ps_switch_dying_refusals, 1);
+   if (n <= 8) {
+      char db[160];
+      sprintf(db, "SWITCH-DYING-REFUSED %s cpu=%d pid=%d status=0x%x "
+              "rip=0x%llx prev=%d n=%lu\n",
+              path, me, (int)process->processid, (unsigned)process->status,
+              (unsigned long long)process->ctx.rip,
+              prev ? (int)prev->processid : -1, n);
+      serial_puts(db);
+   }
+}
+
 void ps_switchto(PCB386 *process){
    int me = smp_cpu_id();
    PCB386 *prev = (me >= 0 && me < MAX_CPUS) ? (PCB386 *)cpus[me].current
@@ -2579,6 +2604,19 @@ void ps_switchto(PCB386 *process){
       this CPU does not own makes the next IRQ pick up that task's IRQ kstack
       (or user stack) while its real owner is still running it. */
    if (process->on_cpu != me || ps_pcb_running_elsewhere(process, me)) {
+      ps_unclaim_if_unused(process, prev, me);
+      ps_switchto_in_progress[me] = 0;
+      startints();
+      return;
+   }
+   /* The caller picked `process` before this interrupt-off window.  A timer
+      in between can run it to self_exit_current(), which marks it DYING and
+      releases on_cpu without saving ctx -- a fork child that never yielded
+      still has ctx.rip == fork_child_return over its exited stack.  DYING is
+      set while the exiting CPU still owns on_cpu, so holding the claim here
+      guarantees the flag is visible. */
+   if (process != prev && (process->status & PS_ATTB_DYING)) {
+      ps_switch_dying_refused("switch", me, process, prev);
       ps_unclaim_if_unused(process, prev, me);
       ps_switchto_in_progress[me] = 0;
       startints();
@@ -2699,9 +2737,13 @@ static void ps_switchto_load_only(PCB386 *process, PCB386 *held)
    ps_switchto_in_progress[me] = 1;
    stopints();
    if (process->on_cpu != me ||
-       foreign_idle_pid(me, (unsigned long)process->processid)) {
+       foreign_idle_pid(me, (unsigned long)process->processid) ||
+       (process != held && process != prev &&
+        (process->status & PS_ATTB_DYING))) {
       if (foreign_idle_pid(me, (unsigned long)process->processid))
          ps_current_anom_log("load", me, process);
+      else if (process->on_cpu == me && (process->status & PS_ATTB_DYING))
+         ps_switch_dying_refused("load", me, process, prev);
       if (process->on_cpu == me && process != prev && process != held)
          process->on_cpu = -1;
       ps_switchto_in_progress[me] = 0;
@@ -2817,6 +2859,11 @@ static void zombie_reclaim(PCB386 *z)
              zombie_enqueue(z);
              return;
           }
+          /* Flush MAP_SHARED dirty pages and drop VMA file refs before the
+             PML4 is freed.  self_exit_current already closed the fds in this
+             path; the VMA's own active_refs keep the file_PCB alive for the
+             flush. */
+          vm_area_exit(z);
           userpd_free((u64 *)(uintptr)z->pagedirloc);
           z->pagedirloc = pagedir1;
        }
@@ -3092,6 +3139,35 @@ inline void taskswitch(){
 
 /* Invoked from the timer IRQ wrapper after time_handler(). */
 
+/* Fault injection ("fault-switch-gap" cmdline): hold the window between
+   scheduler() picking a never-run fork child and ps_switchto() open with
+   interrupts enabled until a nested timer switch has run that child to
+   self-exit.  Deterministically reproduces the stale-choice switch into a
+   DYING PCB that re-ran fork_child_return over the child's exit stack. */
+volatile int sched_inject_switch_gap;
+
+static void sched_switch_gap_inject(PCB386 *chosen)
+{
+   extern void fork_child_return(void);
+   DWORD flags;
+   unsigned int t0;
+
+   if (chosen->accesslevel != ACCESS_USER ||
+       chosen->ctx.rip != (u64)(uintptr)fork_child_return)
+      return;
+   if (__sync_sub_and_fetch(&sched_inject_switch_gap, 1) < 0)
+      return;
+   storeflags(&flags);
+   startints();
+   t0 = ticks;
+   while (!(chosen->status & PS_ATTB_DYING) && ticks - t0 < 200)
+      __asm__ __volatile__("hlt");
+   restoreflags(flags);
+   serial_puts((chosen->status & PS_ATTB_DYING)
+               ? "SWITCH-GAP-INJECT child-exited\n"
+               : "SWITCH-GAP-INJECT timeout\n");
+}
+
 void schedule_from_timer(void){
     PCB386 *readyprocess;
     devmgr_scheduler_extension *cursched;
@@ -3099,6 +3175,7 @@ void schedule_from_timer(void){
     int voluntary;
     int leftover_load_only = 0;
     PCB386 *abandoned = 0;
+    DWORD sft_flags;
 
     {
        extern void smp_repair_stale_current(void);
@@ -3207,19 +3284,33 @@ void schedule_from_timer(void){
         }
      }
 
+   /* Keep interrupts off from the choice to ps_switchto()'s own cli.  On the
+      voluntary path (taskswitch with IF=1) a timer in that gap could run the
+      chosen task to self-exit, leaving readyprocess naming a DYING PCB that
+      zombie_drain() may then free.  context_switch() saves prev with IF=1,
+      so a switched-out task still resumes interruptible. */
+   storeflags(&sft_flags);
+   stopints();
    readyprocess = (PCB386*)bridges_link((devmgr_generic*)cursched, &cursched->scheduler,
                                           current_process,0,0,0,0,0);
     if (leftover_load_only) {
        if (!readyprocess)
           readyprocess = current_process;
        ps_switchto_load_only(readyprocess, abandoned);
+       restoreflags(sft_flags);
        return;
     }
-    if (!readyprocess || readyprocess == current_process)
+    if (!readyprocess || readyprocess == current_process) {
+       restoreflags(sft_flags);
        return;
+    }
+
+    if (sched_inject_switch_gap > 0 && voluntary)
+       sched_switch_gap_inject(readyprocess);
 
     current_process->totalcputime++;
     ps_switchto(readyprocess);
+    restoreflags(sft_flags);
 }
 
 //The taskswitcher() is basically the program that runs all the time, aka CPU scheduler.

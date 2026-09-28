@@ -29,7 +29,11 @@ mb1_header:
     .long 0x00000003
     .long -(0x1BADB002 + 0x00000003)
 
-.section .bss
+/* Boot page tables (PML4/PDPT/PD) live in a dedicated 4096-aligned section
+   so the .bss section does not inherit 4096-byte alignment.  They are set up
+   by the boot code (CR3 -> boot_pml4) and, as before, are deliberately
+   excluded from the [boot_stack_top, bssEnd) zeroing loop. */
+.section .bootpt, "aw"
 .align 4096
 .globl boot_pml4
 boot_pml4:
@@ -52,6 +56,8 @@ boot_pd3:
 .globl boot_pdpt_high
 boot_pdpt_high:
     .skip 4096
+
+.section .bss
 .align 16
 boot_stack:
     .skip 65536

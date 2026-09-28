@@ -36,6 +36,16 @@ Default scheduler is **priority round-robin** (`process/scheduler.c`):
 - Higher `PCB.priority` wins.
 - Equal priority: next runnable after the previous process.
 - Ready-queue walks are protected with a spinlock (SMP-ready).
+- The choice returned by `scheduler()` is only valid while interrupts stay
+  off. `schedule_from_timer()` keeps IF=0 from the choice to `ps_switchto()`
+  even on the voluntary `taskswitch()` path. Otherwise a nested timer switch
+  can run the chosen task to `self_exit_current()`, and the outer call then
+  loads a DYING PCB whose saved `ctx` was never updated. A fork child that
+  never yielded still has `ctx.rip == fork_child_return` pointing at its exit
+  stack. `ps_switchto()` / `ps_switchto_load_only()` also refuse a DYING
+  destination under the claim (`SWITCH-DYING-REFUSED`). The
+  `fault-switch-gap` cmdline (`make test-fork-switch-gap`) reopens the window
+  on purpose to exercise that guard.
 
 ## SMP
 

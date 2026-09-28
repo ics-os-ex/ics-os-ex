@@ -29,6 +29,7 @@
 #include "../dextypes.h"
 #include "../types.h"
 #include "../memory/memlayout.h"
+#include "../memory/vma.h"
 #include "../vfs/vfs_core.h"
 #include "../console/dex_DDL.h"
 #include "../cpu/context.h"
@@ -369,6 +370,20 @@ typedef struct _PCB386 {
    /* Lock-free self-exit reclaim list. After dequeue, next/before belong to
       the scheduler; this pointer is only used once the PCB is a zombie. */
    struct _PCB386 *zombie_next;
+
+#ifdef __x86_64__
+    /* Process VMAs for mmap (anonymous + file-backed).  Deliberately placed at
+       the END of the struct: irqwrap.S accesses accesslevel/on_cpu/kstack_base/
+       kstack_top at hardcoded byte offsets (asserted in process.c), so a new
+       field must not shift them.
+
+       A pointer (not an inline VMA_MAX array) so the ~1.5 KiB table does not
+       bloat BSS for every static/heap PCB; it is heap-allocated lazily on the
+       first mmap by vm_area_alloc() and freed by vm_area_exit().  NULL means
+       the process has no VMAs.  See vm_area_* in dexmem.h.  `file` refs are
+       dropped by vm_area_exit(). */
+   vm_area *vmas;
+#endif
 
 }PCB386;
 

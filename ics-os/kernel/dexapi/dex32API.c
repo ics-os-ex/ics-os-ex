@@ -23,6 +23,7 @@ although a user procedure call is in the works
 ********************************************************************/
 
 #include "dex32API.h"
+#include "../memory/dexmem.h"
 
 /* Diagnostic: monotonic count of api_syscall() entries.  The selfhost
    spin watchdog (stdlib/time.c) samples this to tell a busy syscall loop
@@ -212,6 +213,8 @@ void api_init(){
     api_addsystemcall(0xB5,console_puts,0,0);
    api_addsystemcall(0xB6,dex32_mmap,0,0);
     api_addsystemcall(0xB7,dex32_munmap,0,0);
+    api_addsystemcall(0xB8,dex32_mprotect,0,0);
+    api_addsystemcall(0xB9,dex32_msync,0,0);
     api_addsystemcall(0xC0,sys_tcgetattr,0,0);
     api_addsystemcall(0xC1,sys_tcsetattr,0,0);
     api_addsystemcall(0xC2,sys_tcflush,0,0);

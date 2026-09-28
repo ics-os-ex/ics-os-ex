@@ -26,6 +26,7 @@
 */
 
 #include "../process/irq_kstack.h"
+#include "../memory/dexmem.h"
 
 void GPFhandler(DWORD address)
   {
@@ -581,6 +582,27 @@ DWORD pagefaulthandler(unsigned long location, DWORD fault_info,
        silently corrupts kernel state, so map VA==PA for kernel RIPs. */
     if ((mm & PG_PRESENT) == 0) {
        DWORD *pd = (DWORD *)(uintptr)fault_proc->pagedirloc;
+       /* Lazy file-backed / anonymous mmap demand-load.  A not-present fault
+          inside the process's heap/mmap window may be a legitimate first
+          touch of a VMA; load the backing frame here, before the identity
+          restore and the not-present kill below would treat it as a bad
+          pointer.  vm_area_fault() does file I/O and may yield, so reconcile
+          current_process to the faulting task first. */
+       if (fault_proc->accesslevel == ACCESS_USER
+           && (unsigned long long)location >= (unsigned long long)MEM_USER_WIN_END
+           && (unsigned long long)location < (unsigned long long)MEM_USER_HEAP_LIMIT) {
+          int vres;
+          if (fault_proc != current_process &&
+              fault_cpu >= 0 && fault_cpu < MAX_CPUS &&
+              fault_proc->on_cpu == fault_cpu)
+             cpus[fault_cpu].current = fault_proc;
+          vres = vm_area_fault(fault_proc, (unsigned long)location,
+                               (unsigned)fault_info);
+          if (vres == 1) {
+             pf_busy[fault_cpu] = 0;
+             return 0;
+          }
+       }
        if (pd && pd != pagedir1
            && rip < (unsigned long)MEM_USER_ELF_BASE
            && (unsigned long long)location < 0x40000000ULL) {

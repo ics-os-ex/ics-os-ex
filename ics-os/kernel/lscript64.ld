@@ -25,6 +25,16 @@ SECTIONS {
     *(.bss.*)
   }
   bssEnd = .;
+  /* Boot page tables (PML4/PDPT/PD), 4096-aligned and set up by the boot
+     code (CR3 -> boot_pml4).  Kept in their own section so .bss does not
+     inherit 4096-byte alignment, which would otherwise force .bss to jump a
+     full page for every ~4KiB of .text growth.  Placed after .bss but still
+     within the frame-reserved [MEM_KERNEL_LOAD, MEM_KERNEL_LIMIT) range. */
+  . = ALIGN(4096);
+  .bootpt (NOLOAD) : {
+    *(.bootpt)
+  }
+  bootptEnd = .;
   /DISCARD/ : {
     *(.comment)
     *(.note*)
@@ -41,6 +51,9 @@ SECTIONS {
    stack, then to 0x3FB000 (16 KiB guard) when the ELF64 stream loader's
    batched 128KiB reads crossed the 0x1be000 .bss alignment boundary. */
 ASSERT(bssEnd <= 0x003FB000, "kernel BSS collided with 4MiB user ELF window");
+/* The boot page tables (.bootpt) sit after bssEnd; the whole kernel image
+   (bssEnd + boot page tables) must still end below the 4MiB user-ELF base. */
+ASSERT(bootptEnd <= 0x00400000, "boot page tables collided with 4MiB user ELF window");
 INPUT(startup.o asmlib.o context.o ap_trampoline.o lapic.o smp.o
       kernel32.o scheduler.o iomgr.o blkcache.o posixfd.o fat.o ext4.o iso9660.o ramdisk.o
       devfs.o irqwrap.o devmgr_error.o kexec.o irq_lifecycle.o vtd.o pci_probe.o

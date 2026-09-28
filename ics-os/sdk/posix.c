@@ -68,6 +68,8 @@ extern void exit(int status);
 #define FXN_GETDENTS 0xB4
 #define FXN_MMAP     0xB6
 #define FXN_MUNMAP   0xB7
+#define FXN_MPROTECT 0xB8
+#define FXN_MSYNC    0xB9
 #define FXN_TCGETATTR 0xC0
 #define FXN_TCSETATTR 0xC1
 #define FXN_TCFUSH    0xC2
@@ -320,140 +322,60 @@ int rename(const char *oldpath, const char *newpath)
    return r ? 0 : -1;
 }
 
-struct sdk_mm_map {
-   struct sdk_mm_map *next;
-   char *orig;
-   char *base;
-   size_t length;
-   size_t page_count;
-   unsigned long *free_pages;
-};
+/* mmap/munmap/mprotect/msync are thin wrappers over the kernel's VMA-backed
+   implementation (kernel/memory/dexmem.c).  The kernel owns the VA window
+   (disjoint from the sbrk malloc arena), the page tables, the lazy file-backed
+   demand loads, and the MAP_SHARED write-back.  mmap() passes its six
+   arguments by pointer in a struct mmap_args because they do not fit the
+   5-register DEX int 0x30 ABI. */
 
-static struct sdk_mm_map *sdk_mm_maps;
-
-static int
-sdk_mm_all_free(const struct sdk_mm_map *m)
-{
-   size_t i;
-   for (i = 0; i < m->page_count; i++)
-      if (!(m->free_pages[i >> 6] & (1UL << (i & 63))))
-         return 0;
-   return 1;
-}
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset)
 {
-   size_t page = 4096;
-   size_t pages;
-   size_t rlen;
-   size_t bitmap_words;
-   char *orig;
-   char *base;
-   struct sdk_mm_map *m;
-   ssize_t n;
-   (void)addr;
-   (void)prot;
+    struct mmap_args a;
+    long r;
 
-   if (length == 0)
-      return MAP_FAILED;
+    if (length == 0)
+       return MAP_FAILED;
 
-   /* Anonymous maps go through the kernel so they live in a VA window
-      disjoint from the sbrk malloc arena (required by GCC's zone GC). */
-   if ((flags & MAP_ANONYMOUS) || fd < 0) {
-      void *p = (void *)dexsdk_systemcall(FXN_MMAP, (long)length, (long)flags, 0, 0, 0);
-      if (!p || p == (void *)(long)-1)
-         return MAP_FAILED;
-      return p;
-   }
+    a.addr = (unsigned long)addr;
+    a.length = (unsigned long)length;
+    a.prot = (unsigned long)prot;
+    a.flags = (unsigned long)flags;
+    a.fd = (fd < 0) ? (unsigned long)-1 : (unsigned long)fd;
+    a.offset = (unsigned long)offset;
 
-   pages = (length + page - 1) / page;
-   rlen = pages * page;
-   orig = (char *)malloc(rlen + page);
-   if (!orig)
-      return MAP_FAILED;
-   base = (char *)((((size_t)orig + page - 1) & ~(size_t)(page - 1)));
-
-   if ((flags & MAP_ANONYMOUS) || fd < 0)
-      memset(base, 0, rlen);
-   else {
-      n = pread(fd, base, rlen, offset);
-      if (n < 0) {
-         free(orig);
-         return MAP_FAILED;
-      }
-      if ((size_t)n < rlen)
-         memset(base + n, 0, rlen - (size_t)n);
-   }
-
-   bitmap_words = (pages + 63) / 64;
-   m = (struct sdk_mm_map *)malloc(sizeof(*m));
-   if (!m) {
-      free(orig);
-      return MAP_FAILED;
-   }
-   m->free_pages = (unsigned long *)malloc(bitmap_words * sizeof(unsigned long));
-   if (!m->free_pages) {
-      free(m);
-      free(orig);
-      return MAP_FAILED;
-   }
-   memset(m->free_pages, 0, bitmap_words * sizeof(unsigned long));
-   m->next = sdk_mm_maps;
-   m->orig = orig;
-   m->base = base;
-   m->length = rlen;
-   m->page_count = pages;
-   sdk_mm_maps = m;
-   return base;
+    r = ics_sys(FXN_MMAP, (long)&a, 0, 0, 0, 0);
+    if (r < 0)
+       return MAP_FAILED;
+    return (void *)r;
 }
 
 int munmap(void *addr, size_t length)
 {
-   char *a = (char *)addr;
-   char *end;
-   struct sdk_mm_map *m;
-   struct sdk_mm_map *prev;
-   size_t first;
-   size_t last;
-   size_t i;
+    long r;
 
-   if (length == 0)
-      return 0;
+    if (length == 0)
+       return 0;
 
-   if (dexsdk_systemcall(FXN_MUNMAP, (long)addr, (long)length, 0, 0, 0) == 0)
-      return 0;
-
-   end = a + length;
-
-   m = sdk_mm_maps;
-   prev = 0;
-   while (m) {
-      if (a >= m->base && end <= m->base + m->length) {
-         first = (size_t)(a - m->base) / 4096;
-         last = (size_t)(end - 1 - m->base) / 4096;
-         for (i = first; i <= last; i++)
-            m->free_pages[i >> 6] |= (1UL << (i & 63));
-         if (sdk_mm_all_free(m)) {
-            if (prev)
-               prev->next = m->next;
-            else
-               sdk_mm_maps = m->next;
-            free(m->free_pages);
-            free(m->orig);
-            free(m);
-         }
-         return 0;
-      }
-      prev = m;
-      m = m->next;
-   }
-   return -1;
+    r = ics_sys(FXN_MUNMAP, (long)addr, (long)length, 0, 0, 0);
+    return (r < 0) ? -1 : 0;
 }
 
 int mprotect(void *addr, size_t len, int prot)
 {
-   (void)addr; (void)len; (void)prot;
-   return 0;
+    long r;
+
+    r = ics_sys(FXN_MPROTECT, (long)addr, (long)len, (long)prot, 0, 0);
+    return (r < 0) ? -1 : 0;
+}
+
+int msync(void *addr, size_t length, int flags)
+{
+    long r;
+
+    r = ics_sys(FXN_MSYNC, (long)addr, (long)length, (long)flags, 0, 0);
+    return (r < 0) ? -1 : 0;
 }
 
 double ldexp(double x, int exp)
