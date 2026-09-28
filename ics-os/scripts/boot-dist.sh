@@ -27,6 +27,7 @@
 #   MONITOR=none|socket           default: none
 #   MONITOR_SOCK=/tmp/icsos-boot-dist-monitor.sock
 #   AUTO_BUILD=1                  build a missing known image with make (default: 1)
+#   ALLOW_REBOOT_AUTOEXEC=1       boot even if autoexec.bat contains 'reboot'
 #   DRY_RUN=1                     print the QEMU command instead of running it
 #
 # Examples:
@@ -41,7 +42,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 usage() {
-    sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -137,6 +138,24 @@ case "$MODE" in
         exit 1
         ;;
 esac
+
+# A test harness that rewrote autoexec.bat in place (e.g. `colortest` +
+# `reboot`) turns a manual boot into a reboot loop. Refuse such images.
+check_autoexec() {
+    local autoexec
+    command -v mtype >/dev/null 2>&1 || return 0
+    autoexec="$(mtype -i "$IMG@@$((2048 * 512))" ::autoexec.bat 2>/dev/null | tr -d '\r')" || return 0
+    if printf '%s\n' "$autoexec" | grep -qix '[[:space:]]*reboot[[:space:]]*'; then
+        echo "error: $IMG autoexec.bat ends in 'reboot' (left behind by a test run):" >&2
+        printf '%s\n' "$autoexec" | sed 's/^/    /' >&2
+        echo "Rebuild the image (make $(image_make_target "$(basename "$IMG")" || echo usb-uefi))" >&2
+        echo "or set ALLOW_REBOOT_AUTOEXEC=1 to boot it anyway." >&2
+        exit 1
+    fi
+}
+if [ "${ALLOW_REBOOT_AUTOEXEC:-0}" != "1" ] && [ "${DRY_RUN:-0}" != "1" ]; then
+    check_autoexec
+fi
 
 shift $(( $# >= 2 ? 2 : $# ))
 EXTRA_ARGS=("$@")

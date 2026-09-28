@@ -494,11 +494,12 @@ test-ide-thumbdrive: usb
 test-screenshot: usb
 	@echo "Testing in-OS framebuffer screenshot..."
 	@rm -f /tmp/icsos-screenshot.ppm /tmp/icsos-screenshot-autoexec.bat
+	@cp --sparse=always ics-os-usb.img /tmp/icsos-screenshot.img
 	@printf '%s\n' '@echo off' 'screenshot /icsos/screenshot.ppm' 'reboot' \
 		> /tmp/icsos-screenshot-autoexec.bat
-	@mcopy -o -i "ics-os-usb.img@@$$((2048 * 512))" /tmp/icsos-screenshot-autoexec.bat ::autoexec.bat
+	@mcopy -o -i "/tmp/icsos-screenshot.img@@$$((2048 * 512))" /tmp/icsos-screenshot-autoexec.bat ::autoexec.bat
 	@-timeout 180 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
-		$(QEMU_DISK_BOOT) \
+		-drive file=/tmp/icsos-screenshot.img,format=raw,if=ide -boot c \
 		< /dev/null > /tmp/icsos-screenshot.log 2>&1
 	@grep -aq "serial console ready" /tmp/icsos-screenshot.log
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-screenshot.log
@@ -506,7 +507,7 @@ test-screenshot: usb
 	@grep -aq "SCREENSHOT_OK path=/icsos/screenshot.ppm width=[1-9][0-9]* height=[1-9][0-9]*" /tmp/icsos-screenshot.log
 	@! grep -aq "SCREENSHOT_FAIL" /tmp/icsos-screenshot.log
 	@! grep -aq "General Protection fault" /tmp/icsos-screenshot.log
-	@mcopy -i "ics-os-usb.img@@$$((2048 * 512))" ::SCREENSH.PPM /tmp/icsos-screenshot.ppm
+	@mcopy -i "/tmp/icsos-screenshot.img@@$$((2048 * 512))" ::SCREENSH.PPM /tmp/icsos-screenshot.ppm
 	@python3 -c 'import pathlib,re,sys;d=pathlib.Path("/tmp/icsos-screenshot.ppm").read_bytes();m=re.match(rb"P6\n([1-9][0-9]*) ([1-9][0-9]*)\n255\n",d);w,h=(int(m.group(1)),int(m.group(2))) if m else (0,0);assert d[:2]==b"P6" and m and len(d)==m.end()+w*h*3 and w<=8192 and h<=8192, "screenshot: bad PPM"'
 	@echo "test-screenshot PASS"
 
@@ -517,10 +518,11 @@ test-screenshot: usb
 test-vtcolor-guest: usb
 	@echo "Testing in-guest VT 256/truecolor SGR mapping..."
 	@rm -f /tmp/icsos-vtcolor-autoexec.bat
+	@cp --sparse=always ics-os-usb.img /tmp/icsos-vtcolor.img
 	@printf '%s\n' '@echo off' 'colortest' 'reboot' > /tmp/icsos-vtcolor-autoexec.bat
-	@mcopy -o -i "ics-os-usb.img@@$$((2048 * 512))" /tmp/icsos-vtcolor-autoexec.bat ::autoexec.bat
+	@mcopy -o -i "/tmp/icsos-vtcolor.img@@$$((2048 * 512))" /tmp/icsos-vtcolor-autoexec.bat ::autoexec.bat
 	@-timeout 180 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
-		$(QEMU_DISK_BOOT) \
+		-drive file=/tmp/icsos-vtcolor.img,format=raw,if=ide -boot c \
 		< /dev/null > /tmp/icsos-vtcolor.log 2>&1
 	@grep -aq "serial console ready" /tmp/icsos-vtcolor.log
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-vtcolor.log
@@ -537,11 +539,12 @@ test-vtcolor-xhci: usb-uefi
 	@echo "Testing in-guest VT 256/truecolor SGR on xHCI UEFI thumbdrive..."
 	@test -n "$(OVMF_FD)" || { echo "OVMF firmware not found (install ovmf)."; exit 1; }
 	@rm -f /tmp/icsos-vtcolor-xhci-autoexec.bat
+	@cp --sparse=always ics-os-uefi.img /tmp/icsos-vtcolor-xhci.img
 	@printf '%s\n' '@echo off' 'colortest' 'reboot' > /tmp/icsos-vtcolor-xhci-autoexec.bat
-	@mcopy -o -i "ics-os-uefi.img@@$$((2048 * 512))" /tmp/icsos-vtcolor-xhci-autoexec.bat ::autoexec.bat
+	@mcopy -o -i "/tmp/icsos-vtcolor-xhci.img@@$$((2048 * 512))" /tmp/icsos-vtcolor-xhci-autoexec.bat ::autoexec.bat
 	@-timeout 90 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
 		-machine q35 -bios $(OVMF_FD) \
-		-drive if=none,id=stick,format=raw,file=ics-os-uefi.img \
+		-drive if=none,id=stick,format=raw,file=/tmp/icsos-vtcolor-xhci.img \
 		-device qemu-xhci,id=xhci \
 		-device usb-storage,bus=xhci.0,drive=stick \
 		< /dev/null > /tmp/icsos-vtcolor-xhci.log 2>&1
@@ -1478,11 +1481,12 @@ test-vim-xhci: usb-uefi
 	@echo "Testing vim --version on xHCI UEFI thumbdrive..."
 	@test -n "$(OVMF_FD)" || { echo "OVMF firmware not found (install ovmf)."; exit 1; }
 	@rm -f /tmp/icsos-vim-xhci-autoexec.bat
+	@cp --sparse=always ics-os-uefi.img /tmp/icsos-vim-xhci.img
 	@printf '%s\n' 'vimtest' 'reboot' > /tmp/icsos-vim-xhci-autoexec.bat
-	@mcopy -o -i "ics-os-uefi.img@@$$((2048 * 512))" /tmp/icsos-vim-xhci-autoexec.bat ::autoexec.bat
+	@mcopy -o -i "/tmp/icsos-vim-xhci.img@@$$((2048 * 512))" /tmp/icsos-vim-xhci-autoexec.bat ::autoexec.bat
 	@-timeout 90 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
 		-machine q35 -bios $(OVMF_FD) \
-		-drive if=none,id=stick,format=raw,file=ics-os-uefi.img \
+		-drive if=none,id=stick,format=raw,file=/tmp/icsos-vim-xhci.img \
 		-device qemu-xhci,id=xhci \
 		-device usb-storage,bus=xhci.0,drive=stick \
 		< /dev/null > /tmp/icsos-vim-xhci.log 2>&1
@@ -1602,12 +1606,13 @@ test-nethack-xhci: usb-uefi apps/nethack.exe
 	@test -n "$(OVMF_FD)" || { echo "OVMF firmware not found (install ovmf)."; exit 1; }
 	@rm -f /tmp/icsos-nethack-xhci-autoexec.bat
 	@printf '%s\n' 'cd /icsos/nethack' 'nethack -d /icsos/nethack' 'reboot' > /tmp/icsos-nethack-xhci-autoexec.bat
-	@mcopy -o -i "ics-os-uefi.img@@$$((2048 * 512))" /tmp/icsos-nethack-xhci-autoexec.bat ::autoexec.bat
-	@mcopy -o -i "ics-os-uefi.img@@$$((2048 * 512))" apps/nethack.exe ::/apps/nethack.exe
+	@cp --sparse=always ics-os-uefi.img /tmp/icsos-nethack-xhci.img
+	@mcopy -o -i "/tmp/icsos-nethack-xhci.img@@$$((2048 * 512))" /tmp/icsos-nethack-xhci-autoexec.bat ::autoexec.bat
+	@mcopy -o -i "/tmp/icsos-nethack-xhci.img@@$$((2048 * 512))" apps/nethack.exe ::/apps/nethack.exe
 	@(for i in $(shell seq 1 250); do printf '\n'; sleep 0.4; done; sleep 8) | \
 		timeout 150 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
 		-machine q35 -bios $(OVMF_FD) \
-		-drive if=none,id=stick,format=raw,file=ics-os-uefi.img \
+		-drive if=none,id=stick,format=raw,file=/tmp/icsos-nethack-xhci.img \
 		-device qemu-xhci,id=xhci \
 		-device usb-storage,bus=xhci.0,drive=stick \
 		> /tmp/icsos-nethack-xhci.log 2>&1 || true
@@ -1653,12 +1658,13 @@ test-restart-xhci: usb-uefi apps/restarttest.exe
 	@test -n "$(OVMF_FD)" || { echo "OVMF firmware not found (install ovmf)."; exit 1; }
 	@rm -f /tmp/icsos-restart-xhci-autoexec.bat
 	@printf '%s\n' 'restarttest' 'reboot' > /tmp/icsos-restart-xhci-autoexec.bat
-	@mcopy -o -i "ics-os-uefi.img@@$$((2048 * 512))" /tmp/icsos-restart-xhci-autoexec.bat ::autoexec.bat
-	@mcopy -o -i "ics-os-uefi.img@@$$((2048 * 512))" apps/restarttest.exe ::/apps/restarttest.exe
+	@cp --sparse=always ics-os-uefi.img /tmp/icsos-restart-xhci.img
+	@mcopy -o -i "/tmp/icsos-restart-xhci.img@@$$((2048 * 512))" /tmp/icsos-restart-xhci-autoexec.bat ::autoexec.bat
+	@mcopy -o -i "/tmp/icsos-restart-xhci.img@@$$((2048 * 512))" apps/restarttest.exe ::/apps/restarttest.exe
 	@(for i in $(shell seq 1 250); do printf '\n'; sleep 0.4; done; sleep 8) | \
 		timeout 150 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
 		-machine q35 -bios $(OVMF_FD) \
-		-drive if=none,id=stick,format=raw,file=ics-os-uefi.img \
+		-drive if=none,id=stick,format=raw,file=/tmp/icsos-restart-xhci.img \
 		-device qemu-xhci,id=xhci \
 		-device usb-storage,bus=xhci.0,drive=stick \
 		> /tmp/icsos-restart-xhci.log 2>&1 || true
