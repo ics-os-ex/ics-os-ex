@@ -2,6 +2,23 @@
 
 ## 2026-09-28 (Manila, UTC+8)
 
+### 21:26 — Main repo moved to `github.com/ics-os-ex/ics-os-ex`
+
+**Current problem / activity:** user declared the org repo the main repository;
+all future pushes go there.
+
+- `ics-os-v2` was 11 commits ahead of `org/ics-os-v2` (0 behind); fast-forward
+  push `1adde08..fedfa91` to `github.com:ics-os-ex/ics-os-ex.git` succeeded.
+- `git branch` upstream retargeted: `ics-os-v2` now tracks `org/ics-os-v2`
+  (was `ex/ics-os-v2` on `jedld/ics-os-ex`). Plain `git push` from this branch
+  now lands on the org repo.
+- Remotes kept: `org` = new main repo, `ex` = `jedld/ics-os-ex` (old), `jedld`
+  = `jedld/ics-os`, `origin` = `srg-ics-uplb/ics-os` (fork source).
+- Earlier today also: root-caused the `boot-dist.sh` `Failed to get "write"
+  lock` — a test harness was holding the shared `ics-os-uefi.img`; fixed by
+  running autoexec-mutating tests on `--sparse=always` /tmp copies
+  (`fedfa91`).
+
 ### 21:10 — `FORK-FRAME-BAD` root-caused: voluntary switch into a DYING fork child
 
 **Current problem / activity:** intermittent `test-fork` failure (`FORK-FRAME-BAD`
