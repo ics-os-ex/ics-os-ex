@@ -49,6 +49,7 @@ Useful individual targets (from `ics-os/`):
  | `test-dist` | BIOS+UEFI FAT thumb-drive image with the full in-OS GCC toolchain; `gccdrv` drives cc1/as/ld against a long-named ldscript and runs the resulting ELF (`GCC_DRIVER_OK` + `DIST_GCC_OK` + `GCC_DRV_RUN_OK`); regression for FAT long-name (LFN) padding that corrupted VFS node names |
  | `test-usb-storage-xhci` | q35 xHCI USB root; guest write + SCSI cache sync + host readback |
 | `test-usb-storage-xhci-multi-controller` | Empty HCD 0 is skipped; HCD 1 delivers MSI-X and persists USB-root writes |
+| `test-usb-storage-xhci-multi-msc` | Two simultaneous q35 xHCI MSC drives (usb0 root + usb1); kernel self-test (`xhci-multi-msc-test`) proves both bound independently (distinct media identities, per-drive block 0 read) and a raw write to the secondary persists, then the host reads LBA 512 back from the secondary image file (`XHCI_MULTI_MSC_OK`, two `usb: registered block device`, no `XHCI_MULTI_MSC_FAIL`/GPF/PF) |
 | `test-usb-storage-xhci-sg` | Chained multi-segment xHCI bulk TDs with MSI-X and persistent write |
 | `test-usb-storage-xhci-bounce` | Bidirectional xHCI bounce DMA with MSI-X and persistent write |
 | `test-usb-storage-xhci-vtd-discovery` | ACPI DMAR/DRHD discovery with QEMU VT-d and persistent xHCI write |

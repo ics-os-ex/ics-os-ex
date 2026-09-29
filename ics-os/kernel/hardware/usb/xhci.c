@@ -10,7 +10,10 @@ extern void taskswitch(void);
 #define XHCI_EVENT_TRBS       256
 #define XHCI_MAX_SLOTS        8
 #define XHCI_MAX_HCDS         8
-#define XHCI_MAX_USBDEVS      2
+#define XHCI_MAX_USBDEVS      8
+/* Concurrent posted bulk-IN polls (console RX, network RX, ...). One slot
+   per (device, endpoint) pair; see xhci_posted_in below. */
+#define XHCI_MAX_POSTED_IN    8
 #define XHCI_TIMEOUT          4000000
 
 static int xhci_no_recover;
@@ -73,21 +76,42 @@ typedef struct {
     DWORD link_chain;
 } xhci_ring;
 
-/* Per-device port/slot state. Device 0 is the enumerated primary (normally
-   the MSC root); device 1 is the optional secondary (CDC-ACM console). */
+/*
+  Per-device ring/context resources, allocated once per HCD in
+  xhci_alloc_dma_storage(). Kept out of the static xhci_hcd image (the kernel
+  must stay under the 4MiB user-ELF base) and indexed per slot so any number
+  of downstream devices can be driven concurrently.
+*/
+typedef struct {
+    xhci_ring ep0;
+    xhci_ring ep_in;
+    xhci_ring ep_out;
+    dma_region input_ctx_dma;
+    dma_region device_ctx_dma;
+    BYTE *input_ctx;
+    BYTE *device_ctx;
+} xhci_dev_res;
+
+/*
+  One xHCI device slot. A slot is claimed by xhci_claim_port_dev() and
+  released by xhci_release_dev(). The host (uhci.c) assigns a port to a slot
+  and tags its class; `console` marks a polled CDC-ACM console (short IN
+  spin, posted bulk-IN, stashed completions). `res` points at the slot's
+  dynamically allocated rings and context DMA.
+*/
 typedef struct {
     DWORD port;
     DWORD speed;
     DWORD slot;
     DWORD ep0_mps;
+    int console;
+    xhci_dev_res *res;
 } xhci_usbdev;
 
 typedef struct {
     u64 *dcbaa;
     xhci_trb *event_trbs;
     xhci_erst_entry *erst;
-    BYTE *input_ctx;
-    BYTE *device_ctx;
     volatile BYTE *mmio;
     volatile BYTE *op;
     volatile BYTE *runtime;
@@ -99,23 +123,9 @@ typedef struct {
     DWORD event_dequeue;
     DWORD event_cycle;
     xhci_ring cmd_ring;
-    xhci_ring ep0_ring;
-    xhci_ring ep_in_ring;
-    xhci_ring ep_out_ring;
-    xhci_ring cdc_ep0_ring;
-    xhci_ring cdc_ep_in_ring;
-    xhci_ring cdc_ep_out_ring;
     dma_region dcbaa_dma;
     dma_region event_dma;
     dma_region erst_dma;
-    dma_region input_ctx_dma;
-    dma_region device_ctx_dma;
-    dma_region cdc_input_ctx_dma;
-    dma_region cdc_device_ctx_dma;
-    dma_region cdc_ep0_dma;
-    dma_region cdc_ep_out_dma;
-    BYTE *cdc_input_ctx;
-    BYTE *cdc_device_ctx;
     dma_region scratchpad_array_dma;
     dma_region scratchpad_pages_dma;
     dma_device stream_dma;
@@ -300,33 +310,65 @@ static int xhci_device_attached(xhci_hcd *hcd)
    return xhci_port_ccs_mask(hcd) != 0;
 }
 
-/* Per-device accessors. Device 0 (the MSC root) always exists once the HCD
-  has a primary; device 1 is the optional CDC-ACM console. */
+/* Per-device accessors. Any slot 0..XHCI_MAX_USBDEVS-1 may hold a device;
+   the host (uhci.c) assigns ports to slots and tags their class. */
 static xhci_usbdev *xhci_ud(xhci_hcd *hcd, DWORD index)
 {
    if (!hcd || index >= XHCI_MAX_USBDEVS)
-       return 0;
-   return &hcd->usbdevs[index];
+        return 0;
+    return &hcd->usbdevs[index];
 }
 
 static xhci_ring *xhci_ep0_ring_for(xhci_hcd *hcd, DWORD dev)
 {
-   return dev ? &hcd->cdc_ep0_ring : &hcd->ep0_ring;
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    return (ud && ud->res) ? &ud->res->ep0 : 0;
 }
 
 static xhci_ring *xhci_ep_out_ring_for(xhci_hcd *hcd, DWORD dev)
 {
-   return dev ? &hcd->cdc_ep_out_ring : &hcd->ep_out_ring;
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    return (ud && ud->res) ? &ud->res->ep_out : 0;
 }
 
 static xhci_ring *xhci_ep_in_ring_for(xhci_hcd *hcd, DWORD dev)
 {
-   return dev ? &hcd->cdc_ep_in_ring : &hcd->ep_in_ring;
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    return (ud && ud->res) ? &ud->res->ep_in : 0;
 }
 
 static BYTE *xhci_input_ctx_base(xhci_hcd *hcd, DWORD dev)
 {
-   return dev ? hcd->cdc_input_ctx : hcd->input_ctx;
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    return (ud && ud->res) ? ud->res->input_ctx : 0;
+}
+
+/* Mark a slot as a polled console (CDC-ACM). The host sets this after
+   binding a CDC-ACM device so the transfer path applies the console spin
+   policy and posted bulk-IN handling. */
+static void xhci_set_console(xhci_hcd *hcd, DWORD dev, int on)
+{
+    xhci_usbdev *ud = xhci_ud(hcd, dev);
+    if (ud)
+        ud->console = on ? 1 : 0;
+}
+
+/* Return the slot index that owns a ring, or -1 if none. Used to apply the
+   per-device (console) transfer policy without hard-coding a slot. */
+static int xhci_ring_owner(xhci_hcd *hcd, xhci_ring *ring)
+{
+    DWORD dev;
+    if (!hcd || !ring)
+        return -1;
+    for (dev = 0; dev < XHCI_MAX_USBDEVS; dev++) {
+        xhci_usbdev *ud = &hcd->usbdevs[dev];
+        if (!ud->port || !ud->res)
+            continue;
+        if (ring == &ud->res->ep0 || ring == &ud->res->ep_in ||
+            ring == &ud->res->ep_out)
+            return (int)dev;
+    }
+    return -1;
 }
 
 static DWORD *xhci_input_context_dev(xhci_hcd *hcd, DWORD dev, DWORD index)
@@ -367,17 +409,18 @@ static int xhci_device_connected(xhci_hcd *hcd)
    return 0;
 }
 
+/* True if the ring belongs to a polled console slot (CDC-ACM). */
 static int xhci_ring_is_cdc(xhci_hcd *hcd, xhci_ring *ring)
 {
-    if (!hcd || !ring)
-        return 0;
-    return ring == &hcd->cdc_ep0_ring || ring == &hcd->cdc_ep_in_ring ||
-           ring == &hcd->cdc_ep_out_ring;
+    int dev = xhci_ring_owner(hcd, ring);
+    return dev >= 0 && hcd->usbdevs[dev].console;
 }
 
 static int xhci_ring_owner_connected(xhci_hcd *hcd, xhci_ring *ring)
 {
-    DWORD dev = xhci_ring_is_cdc(hcd, ring) ? 1 : 0;
+    int dev = xhci_ring_owner(hcd, ring);
+    if (dev < 0)
+        return xhci_device_connected(hcd);
     if (!hcd->usbdevs[dev].port)
         return xhci_device_connected(hcd);
     return xhci_usbdev_connected(hcd, dev);
@@ -803,36 +846,67 @@ static int xhci_command(xhci_hcd *hcd, u64 parameter, DWORD status,
     return 1;
 }
 
-static DWORD *xhci_input_context(xhci_hcd *hcd, DWORD index)
+static void xhci_free_dev_dma(xhci_usbdev *ud);
+
+static int xhci_alloc_dev_dma(xhci_usbdev *ud)
 {
-    return (DWORD *)(hcd->input_ctx + index * hcd->context_size);
+    xhci_dev_res *res;
+    if (ud->res)
+        return 1;
+    res = (xhci_dev_res *)malloc(sizeof(xhci_dev_res));
+    if (!res)
+        return 0;
+    memset(res, 0, sizeof(xhci_dev_res));
+    ud->res = res;
+    if (!dma_alloc_coherent(&res->ep0.dma, sizeof(xhci_trb) * XHCI_TRBS, 64,
+                            0xFFFFFFFFULL, malloc, free) ||
+        !dma_alloc_coherent(&res->ep_in.dma, sizeof(xhci_trb) * XHCI_TRBS, 64,
+                            0xFFFFFFFFULL, malloc, free) ||
+        !dma_alloc_coherent(&res->ep_out.dma, sizeof(xhci_trb) * XHCI_TRBS, 64,
+                            0xFFFFFFFFULL, malloc, free) ||
+        !dma_alloc_coherent(&res->input_ctx_dma, 33 * 64, 64,
+                            0xFFFFFFFFULL, malloc, free) ||
+        !dma_alloc_coherent(&res->device_ctx_dma, 32 * 64, 64,
+                            0xFFFFFFFFULL, malloc, free)) {
+        xhci_free_dev_dma(ud);
+        return 0;
+    }
+    res->input_ctx = (BYTE *)res->input_ctx_dma.cpu_addr;
+    res->device_ctx = (BYTE *)res->device_ctx_dma.cpu_addr;
+    return 1;
+}
+
+static void xhci_free_dev_dma(xhci_usbdev *ud)
+{
+    xhci_dev_res *res = ud->res;
+    if (!res)
+        return;
+    dma_free_coherent(&res->ep0.dma, free);
+    dma_free_coherent(&res->ep_in.dma, free);
+    dma_free_coherent(&res->ep_out.dma, free);
+    dma_free_coherent(&res->input_ctx_dma, free);
+    dma_free_coherent(&res->device_ctx_dma, free);
+    free(res);
+    ud->res = 0;
 }
 
 static void xhci_free_dma_storage(xhci_hcd *hcd)
 {
+    DWORD i;
+    for (i = 0; i < XHCI_MAX_USBDEVS; i++)
+        xhci_free_dev_dma(&hcd->usbdevs[i]);
     dma_free_coherent(&hcd->cmd_ring.dma, free);
     dma_free_coherent(&hcd->event_dma, free);
-    dma_free_coherent(&hcd->ep0_ring.dma, free);
-    dma_free_coherent(&hcd->ep_in_ring.dma, free);
-    dma_free_coherent(&hcd->ep_out_ring.dma, free);
-    dma_free_coherent(&hcd->cdc_ep0_ring.dma, free);
-    dma_free_coherent(&hcd->cdc_ep_in_ring.dma, free);
-    dma_free_coherent(&hcd->cdc_ep_out_ring.dma, free);
-    dma_free_coherent(&hcd->cdc_input_ctx_dma, free);
-    dma_free_coherent(&hcd->cdc_device_ctx_dma, free);
     dma_free_coherent(&hcd->dcbaa_dma, free);
     dma_free_coherent(&hcd->erst_dma, free);
-    dma_free_coherent(&hcd->input_ctx_dma, free);
-    dma_free_coherent(&hcd->device_ctx_dma, free);
     hcd->dcbaa = 0;
     hcd->event_trbs = 0;
     hcd->erst = 0;
-    hcd->input_ctx = 0;
-    hcd->device_ctx = 0;
 }
 
 static int xhci_alloc_dma_storage(xhci_hcd *hcd)
 {
+    DWORD i;
     if (hcd->dcbaa_dma.cpu_addr)
         return 1;
     if (!dma_alloc_coherent(&hcd->cmd_ring.dma,
@@ -841,46 +915,22 @@ static int xhci_alloc_dma_storage(xhci_hcd *hcd)
         !dma_alloc_coherent(&hcd->event_dma,
                             sizeof(xhci_trb) * XHCI_EVENT_TRBS, 64,
                             0xFFFFFFFFULL, malloc, free) ||
-        !dma_alloc_coherent(&hcd->ep0_ring.dma,
-                            sizeof(xhci_trb) * XHCI_TRBS, 64,
-                            0xFFFFFFFFULL, malloc, free) ||
-        !dma_alloc_coherent(&hcd->ep_in_ring.dma,
-                            sizeof(xhci_trb) * XHCI_TRBS, 64,
-                            0xFFFFFFFFULL, malloc, free) ||
-        !dma_alloc_coherent(&hcd->ep_out_ring.dma,
-                            sizeof(xhci_trb) * XHCI_TRBS, 64,
-                            0xFFFFFFFFULL, malloc, free) ||
         !dma_alloc_coherent(&hcd->dcbaa_dma, 256 * sizeof(u64), 64,
                             0xFFFFFFFFULL, malloc, free) ||
         !dma_alloc_coherent(&hcd->erst_dma, sizeof(xhci_erst_entry), 64,
-                            0xFFFFFFFFULL, malloc, free) ||
-        !dma_alloc_coherent(&hcd->input_ctx_dma, 33 * 64, 64,
-                            0xFFFFFFFFULL, malloc, free) ||
-        !dma_alloc_coherent(&hcd->device_ctx_dma, 32 * 64, 64,
-                            0xFFFFFFFFULL, malloc, free) ||
-        !dma_alloc_coherent(&hcd->cdc_input_ctx_dma, 33 * 64, 64,
-                            0xFFFFFFFFULL, malloc, free) ||
-        !dma_alloc_coherent(&hcd->cdc_device_ctx_dma, 32 * 64, 64,
-                            0xFFFFFFFFULL, malloc, free) ||
-        !dma_alloc_coherent(&hcd->cdc_ep0_ring.dma,
-                            sizeof(xhci_trb) * XHCI_TRBS, 64,
-                            0xFFFFFFFFULL, malloc, free) ||
-        !dma_alloc_coherent(&hcd->cdc_ep_in_ring.dma,
-                            sizeof(xhci_trb) * XHCI_TRBS, 64,
-                            0xFFFFFFFFULL, malloc, free) ||
-        !dma_alloc_coherent(&hcd->cdc_ep_out_ring.dma,
-                            sizeof(xhci_trb) * XHCI_TRBS, 64,
                             0xFFFFFFFFULL, malloc, free)) {
         xhci_free_dma_storage(hcd);
         return 0;
     }
+    for (i = 0; i < XHCI_MAX_USBDEVS; i++) {
+        if (!xhci_alloc_dev_dma(&hcd->usbdevs[i])) {
+            xhci_free_dma_storage(hcd);
+            return 0;
+        }
+    }
     hcd->dcbaa = (u64 *)hcd->dcbaa_dma.cpu_addr;
     hcd->event_trbs = (xhci_trb *)hcd->event_dma.cpu_addr;
     hcd->erst = (xhci_erst_entry *)hcd->erst_dma.cpu_addr;
-    hcd->input_ctx = (BYTE *)hcd->input_ctx_dma.cpu_addr;
-    hcd->device_ctx = (BYTE *)hcd->device_ctx_dma.cpu_addr;
-    hcd->cdc_input_ctx = (BYTE *)hcd->cdc_input_ctx_dma.cpu_addr;
-    hcd->cdc_device_ctx = (BYTE *)hcd->cdc_device_ctx_dma.cpu_addr;
     return 1;
 }
 
@@ -960,18 +1010,14 @@ static int xhci_address_device(xhci_hcd *hcd, DWORD dev,
     if (!ud)
         return 0;
     ep0_ring = xhci_ep0_ring_for(hcd, dev);
-    memset(xhci_input_ctx_base(hcd, dev), 0,
-           dev ? hcd->cdc_input_ctx_dma.length
-               : hcd->input_ctx_dma.length);
+    memset(xhci_input_ctx_base(hcd, dev), 0, ud->res->input_ctx_dma.length);
     control = xhci_input_context_dev(hcd, dev, 0);
     slot = xhci_input_context_dev(hcd, dev, 1);
     ep0 = xhci_input_context_dev(hcd, dev, 2);
     control[1] = 3;
     xhci_fill_slot_context(hcd, dev, slot, 1);
     xhci_fill_ep_context(hcd, ep0, 4, ud->ep0_mps, 0, ep0_ring, 8);
-    return xhci_command(hcd,
-                        dev ? hcd->cdc_input_ctx_dma.dma_addr
-                            : hcd->input_ctx_dma.dma_addr, 0,
+    return xhci_command(hcd, ud->res->input_ctx_dma.dma_addr, 0,
                         XHCI_TRB_ADDRESS | (block_set_address ? (1u << 9) : 0) |
                         (ud->slot << 24), 0);
 }
@@ -984,17 +1030,13 @@ static int xhci_evaluate_ep0(xhci_hcd *hcd, DWORD dev)
     if (!ud)
         return 0;
     ep0_ring = xhci_ep0_ring_for(hcd, dev);
-    memset(xhci_input_ctx_base(hcd, dev), 0,
-           dev ? hcd->cdc_input_ctx_dma.length
-               : hcd->input_ctx_dma.length);
+    memset(xhci_input_ctx_base(hcd, dev), 0, ud->res->input_ctx_dma.length);
     control = xhci_input_context_dev(hcd, dev, 0);
     control[1] = 3;
     xhci_fill_slot_context(hcd, dev, xhci_input_context_dev(hcd, dev, 1), 1);
     xhci_fill_ep_context(hcd, xhci_input_context_dev(hcd, dev, 2),
                          4, ud->ep0_mps, 0, ep0_ring, 8);
-    return xhci_command(hcd,
-                        dev ? hcd->cdc_input_ctx_dma.dma_addr
-                            : hcd->input_ctx_dma.dma_addr, 0,
+    return xhci_command(hcd, ud->res->input_ctx_dma.dma_addr, 0,
                         XHCI_TRB_EVALUATE | (ud->slot << 24), 0);
 }
 
@@ -1505,8 +1547,7 @@ static int xhci_configure_endpoints(xhci_hcd *hcd, DWORD dev, BYTE ep_in,
     out_id = xhci_endpoint_id(ep_out, 0);
     in_id = in_ring ? xhci_endpoint_id(ep_in, 1) : 0;
     entries = in_id > out_id ? in_id : out_id;
-    memset(xhci_input_ctx_base(hcd, dev), 0,
-           dev ? hcd->cdc_input_ctx_dma.length : hcd->input_ctx_dma.length);
+    memset(xhci_input_ctx_base(hcd, dev), 0, ud->res->input_ctx_dma.length);
     if ((in_ring && !xhci_ring_init(in_ring, XHCI_TRB_CHAIN)) ||
         !xhci_ring_init(out_ring, XHCI_TRB_CHAIN)) {
         printf("xhci: bulk ring DMA mapping failed\n");
@@ -1521,9 +1562,7 @@ static int xhci_configure_endpoints(xhci_hcd *hcd, DWORD dev, BYTE ep_in,
                              6, mps_in, burst_in, in_ring, USB_BULK_MAX);
     xhci_fill_ep_context(hcd, xhci_input_context_dev(hcd, dev, out_id + 1), 2,
                          mps_out, burst_out, out_ring, USB_BULK_MAX);
-    if (!xhci_command(hcd,
-                      dev ? hcd->cdc_input_ctx_dma.dma_addr
-                          : hcd->input_ctx_dma.dma_addr, 0,
+    if (!xhci_command(hcd, ud->res->input_ctx_dma.dma_addr, 0,
                       XHCI_TRB_CONFIG_EP | (ud->slot << 24), 0))
         return 0;
     printf("xhci: configured bulk endpoints in=%u out=%u (dev=%u)\n",
@@ -1625,24 +1664,30 @@ static int xhci_release_dev(xhci_hcd *hcd, DWORD dev)
 
 static int xhci_claim_port_dev(xhci_hcd *hcd, DWORD port, DWORD dev)
 {
-    xhci_usbdev *ud;
+   xhci_usbdev *ud;
     xhci_ring *ep0;
     if (!hcd || !port || port > hcd->max_ports || dev >= XHCI_MAX_USBDEVS)
         return 0;
     xhci_release_dev(hcd, dev);
+    ud = &hcd->usbdevs[dev];
+    /* Reset per-claim runtime state only. The endpoint rings and context
+       DMA persist for the lifetime of the HCD (allocated once by
+       xhci_alloc_dma_storage), so they must not be zeroed here. */
+    ud->slot = 0;
+    ud->speed = 0;
+    ud->ep0_mps = 8;
+    ud->console = 0;
+    ud->port = port;
     ep0 = xhci_ep0_ring_for(hcd, dev);
     if (!xhci_ring_init(ep0, XHCI_TRB_CHAIN))
         return 0;
-    memset(&hcd->usbdevs[dev], 0, sizeof(hcd->usbdevs[dev]));
-    hcd->usbdevs[dev].port = port;
     if (hcd->usbdev_count <= dev)
         hcd->usbdev_count = dev + 1;
     if (!xhci_reset_port_dev(hcd, dev)) {
-        hcd->usbdevs[dev].port = 0;
+        ud->port = 0;
         xhci_recount_usbdevs(hcd);
         return 0;
     }
-    ud = &hcd->usbdevs[dev];
     ud->slot = 0;
     if (dev == 0) {
         hcd->connection_lost = 0;
@@ -1651,12 +1696,11 @@ static int xhci_claim_port_dev(xhci_hcd *hcd, DWORD port, DWORD dev)
     if (!xhci_command(hcd, 0, 0, XHCI_TRB_ENABLE_SLOT, &ud->slot) ||
         !ud->slot) {
         printf("xhci: port %u enable slot failed\n", port);
-        hcd->usbdevs[dev].port = 0;
+        ud->port = 0;
         xhci_recount_usbdevs(hcd);
         return 0;
     }
-    hcd->dcbaa[ud->slot] = dev ? hcd->cdc_device_ctx_dma.dma_addr
-                               : hcd->device_ctx_dma.dma_addr;
+    hcd->dcbaa[ud->slot] = ud->res->device_ctx_dma.dma_addr;
     /* BSR=0: the xHC issues SET_ADDRESS. GET_DESCRIPTOR follows on EP0. */
     if (!xhci_address_device(hcd, dev, 0)) {
         printf("xhci: port %u address failed\n", port);
@@ -1679,7 +1723,7 @@ static int xhci_init_hcd(xhci_hcd *hcd)
 {
     BYTE bus, slot, func;
     u64 bar = 0, bar_size = 0, required;
-    DWORD caplen, hcs1, hcs2, hcc, dboff, rtsoff;
+    DWORD caplen, hcs1, hcs2, hcc, dboff, rtsoff, dev;
     volatile BYTE *intr;
     if (!hcd)
         return 0;
@@ -1793,9 +1837,7 @@ static int xhci_init_hcd(xhci_hcd *hcd)
     if (!xhci_setup_scratchpads(hcd, hcs2))
         return 0;
     memset(hcd->event_trbs, 0, hcd->event_dma.length);
-    memset(hcd->device_ctx, 0, hcd->device_ctx_dma.length);
-    if (!xhci_ring_init(&hcd->cmd_ring, 0) ||
-        !xhci_ring_init(&hcd->ep0_ring, XHCI_TRB_CHAIN)) {
+    if (!xhci_ring_init(&hcd->cmd_ring, 0)) {
         printf("xhci: command ring DMA mapping failed\n");
         return 0;
     }
@@ -1840,7 +1882,16 @@ static int xhci_init_hcd(xhci_hcd *hcd)
     }
     hcd->usbdev_count = 0;
     hcd->enumerating = 0;
-    memset(hcd->usbdevs, 0, sizeof(hcd->usbdevs));
+    /* Reset per-claim runtime state on every slot without touching the
+       endpoint rings or context DMA (allocated once above). */
+    for (dev = 0; dev < XHCI_MAX_USBDEVS; dev++) {
+        xhci_usbdev *ud = &hcd->usbdevs[dev];
+        ud->port = 0;
+        ud->speed = 0;
+        ud->slot = 0;
+        ud->ep0_mps = 8;
+        ud->console = 0;
+    }
     return 1;
 }
 
