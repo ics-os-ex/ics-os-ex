@@ -14,6 +14,8 @@
 // Chris Giese <geezer@execpc.com>	http://www.execpc.com/~geezer  - for the
 //                  initial 16-bit VGA code
 
+#include "hardware/vga/fbconsole.h"
+
 
 //defines the port addresses used by the VGA
 #define	VGA_AC_INDEX		0x3C0
@@ -1184,11 +1186,91 @@ static void draw_x(void)
 }
 
 /**
- * Automatically clear the screen after setting the graphics mode
+ * Standard 256-color VGA DAC palette (6-6-6: 6 bits per channel, 0-63 range).
+ * Used to map legacy 256-color indices to RGB for the GOP framebuffer.
+ */
+static unsigned char vga256_r[256];
+static unsigned char vga256_g[256];
+static unsigned char vga256_b[256];
+
+/* Build the standard VGA 256-color palette at init.
+   Layout:
+   0-15:   16 standard text colors
+   16-231: 6x6x6 color cube (r = (i-16)/36, g = (i-16)/6 % 6, b = (i-16) % 6)
+   232-255: grayscale ramp
+   Each channel value 0-5 maps to 0, 0x21, 0x42, 0x63, 0x84, 0xA5, 0xC6, 0xE7. */
+static unsigned char vga6val(int v)
+{
+    if (v < 0) v = 0;
+    if (v > 5) v = 5;
+    return (unsigned char)(v * 43 + (v > 0 ? 1 : 0));
+}
+
+/* 16 standard text colors (6-bit range 0-63) */
+static const unsigned char vga16_rgb[16][3] = {
+    {  0,   0,   0}, {  0,   0, 0x9A}, {  0, 0x9A,   0}, {  0, 0x9A, 0x9A},
+    {0x9A,   0,   0}, {  0, 0x9A, 0x9A}, {0x9A, 0x4D,   0}, {0xAA, 0xAA, 0xAA},
+    {0x55, 0x55, 0x55}, {0x55, 0x55, 0xAA}, {0x55, 0xAA, 0x55}, {0x55, 0xAA, 0xAA},
+    {0xAA, 0x55, 0x55}, {0xAA, 0x55, 0xAA}, {0xAA, 0xAA, 0x55}, {0xFF, 0xFF, 0xFF}
+};
+
+static void vga256_palette_init(void)
+{
+    int i;
+    for (i = 0; i < 16; i++) {
+        vga256_r[i] = vga16_rgb[i][0];
+        vga256_g[i] = vga16_rgb[i][1];
+        vga256_b[i] = vga16_rgb[i][2];
+    }
+    for (i = 16; i < 232; i++) {
+        int c = i - 16;
+        vga256_r[i] = vga6val(c / 36);
+        vga256_g[i] = vga6val((c / 6) % 6);
+        vga256_b[i] = vga6val(c % 6);
+    }
+    for (i = 232; i < 256; i++) {
+        int v = (i - 232) * 10 + 8;
+        vga256_r[i] = (unsigned char)v;
+        vga256_g[i] = (unsigned char)v;
+        vga256_b[i] = (unsigned char)v;
+    }
+}
+
+/* Flag: set when setgmode is called while fbconsole (GOP) is active.
+   In this mode we do NOT poke legacy VGA ports; write_pixel goes to GOP. */
+static int gop_mode_active = 0;
+
+/**
+ * Automatically clear the screen after setting the graphics mode.
+ * Under UEFI/GOP (fbconsole_active), no legacy VGA ports are poked; the
+ * framebuffer is already mapped and we simply track the virtual resolution
+ * so that write_pixel bounds-checks and clears work via the GOP path.
  */
 void dex32vga_setgmode(int mode)
  {
    int x,y;
+   if (fbconsole_active()) {
+       /* GOP/UEFI path: no legacy VGA register pokes. */
+       gop_mode_active = 1;
+       if (mode == DEX32VGA_320X200X256) {
+           g_wd = 320;
+           g_ht = 200;
+       } else if (mode == DEX32VGA_640X480X16) {
+           g_wd = 640;
+           g_ht = 480;
+       } else {
+           /* TEXT80X25X16: restore fbconsole text rendering */
+           gop_mode_active = 0;
+           return;
+       }
+       /* Clear the virtual area via GOP */
+       for (y = 0; y < g_ht; y++)
+           for (x = 0; x < g_wd; x++)
+               fbconsole_put_pixel(x, y, 0, 0, 0);
+       return;
+   }
+   /* Legacy BIOS/VGA path */
+   gop_mode_active = 0;
    if (mode==DEX32VGA_320X200X256)
      {
        write_regs(g_320x200x256);
@@ -1202,7 +1284,7 @@ void dex32vga_setgmode(int mode)
      };
    if (mode==DEX32VGA_640X480X16)
      {
-	write_regs(g_640x480x16);
+ 	write_regs(g_640x480x16);
        	g_wd = 640;
       	g_ht = 480;
       	g_write_pixel = write_pixel4p;
@@ -1216,6 +1298,12 @@ void dex32vga_setgmode(int mode)
 
 void dex32vga_writepixel(int x,int y,char color)
  {
+   if (gop_mode_active && fbconsole_active()) {
+       int idx = (color < 0) ? (color + 256) : color;
+       if (idx >= 256) idx = 0;
+       fbconsole_put_pixel(x, y, vga256_r[idx], vga256_g[idx], vga256_b[idx]);
+       return;
+   }
    g_write_pixel(x,y,color);
  };
 
@@ -1320,6 +1408,7 @@ void write_char(unsigned char ch,int x, int y,int color,int size)
 void vga_init()
 {
 
+    vga256_palette_init();
     devmgr_graphics mygraphics;
     memset(&mygraphics,0,sizeof(mygraphics));
     mygraphics.hdr.size = sizeof(mygraphics);
