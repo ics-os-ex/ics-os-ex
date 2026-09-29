@@ -9,6 +9,41 @@
 #ifndef KLOG_RING_H
 #define KLOG_RING_H
 
+/*
+ * Kernel-log policy (shared by klog.c, dexio.c and the host unit test):
+ *
+ * Severity follows syslog convention: 0 is the most severe, KLOG_DEBUG the
+ * least. Every message is buffered in the ring (readable with `dmesg`). A
+ * message is echoed to the live console only when
+ * klog_console_echo(level, console_max) is true.
+ *
+ * The default console threshold is KLOG_INFO: bare kernel printf() is
+ * captured at KLOG_INFO, so boot progress and test markers still reach the
+ * (serial) console, while KLOG_DEBUG traces — per-I/O, per-tick and other
+ * runtime noise — stay in the ring only and can never corrupt a user TUI
+ * (e.g. a NetHack screen). Raise the threshold live with `dmesg -n <0-7>`.
+ *
+ * Convention: steady-state driver traces must use klog(KLOG_DEBUG, ...),
+ * never bare printf; real failures use klog(KLOG_ERR, ...).
+ */
+#define KLOG_EMERG  0
+#define KLOG_ALERT  1
+#define KLOG_CRIT   2
+#define KLOG_ERR    3
+#define KLOG_WARN   4
+#define KLOG_NOTICE 5
+#define KLOG_INFO   6
+#define KLOG_DEBUG  7
+
+#define KLOG_CONSOLE_DEFAULT KLOG_INFO
+
+/* Live-console echo decision: echo iff the message is at least as severe as
+ * the threshold. */
+static int klog_console_echo(int level, unsigned char console_max)
+{
+    return level <= (int)console_max;
+}
+
 /* Sized to fit under the 4 MiB user-ELF kernel ceiling: the ring is static BSS
  * (~10 KiB at these settings). Tune up only after freeing kernel memory. */
 #define KLOG_LINE_MAX 96

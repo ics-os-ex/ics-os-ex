@@ -1,28 +1,23 @@
 /*
  * klog.h — kernel log (dmesg-style) public interface.
  *
- * First version: a timestamped ring buffer that captures kernel printf()
- * output, plus a `dmesg` console command and a live console log-level
- * threshold. User-space console output is NOT captured (only kernel printf),
- * which is the first step toward segregating kernel and user logs.
+ * A timestamped ring buffer that captures kernel printf() output, plus a
+ * `dmesg` console command and a live console log-level threshold.
+ * User-space console output is NOT captured (only kernel printf), which is
+ * the first step toward segregating kernel and user logs.
  *
- * Severity follows syslog convention: 0 is the most severe, KLOG_DEBUG the
- * least. A message is always buffered. It is echoed to the live console only
- * if its level is <= klog_console_max (i.e. at least as severe as the
- * threshold). Default threshold = KLOG_DEBUG, so everything echoes (current
- * behavior is preserved).
+ * Severity and the console-echo policy live in klog_ring.h (host-testable):
+ * a message is always buffered, and is echoed to the live console only if
+ * klog_console_echo(level, klog_console_max) is true. Default threshold =
+ * KLOG_INFO: bare printf() (captured at KLOG_INFO) still echoes, while
+ * KLOG_DEBUG traces stay in the ring only — they must never corrupt a user
+ * TUI. Steady-state runtime traces must use klog(KLOG_DEBUG, ...), real
+ * failures klog(KLOG_ERR, ...).
  */
 #ifndef KLOG_H
 #define KLOG_H
 
-#define KLOG_EMERG  0
-#define KLOG_ALERT  1
-#define KLOG_CRIT   2
-#define KLOG_ERR    3
-#define KLOG_WARN   4
-#define KLOG_NOTICE 5
-#define KLOG_INFO   6
-#define KLOG_DEBUG  7
+#include "klog_ring.h"
 
 /* Initialize the ring (call early in boot, before the console is busy). */
 void klog_init(void);

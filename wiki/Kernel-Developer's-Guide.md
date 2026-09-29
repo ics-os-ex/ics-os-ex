@@ -606,9 +606,37 @@ The target writes `/tmp/icsos-ext4-e2fsck.log` and
  a blank tty. Boot starts the console and waits for `CONSOLE_READY` before
  the xHCI hotplug/CDC pump thread. `make test-consolemux-unit` covers
  status truncation, hist/view mapping, and mux letters. USB CDC-ACM console
- (Pico gadget) is `make test-cdcacm-unit` plus `make test-usb-cdc-console`.
+  (Pico gadget) is `make test-cdcacm-unit` plus `make test-usb-cdc-console`.
 
- # 4. Source Code Directory Structure
+ ## 3.7 Kernel logging (klog/dmesg)
+
+ Kernel log lives in `ics-os/kernel/console/klog.{c,h}` plus the pure-C ring
+ (`klog_ring.h`, host-tested by `make test-klog-unit`). Every kernel
+ `printf()` is captured as one timestamped ring record (96 records, ~10 KiB
+ BSS); user-space console output is not captured. The `dmesg` console
+ command dumps the ring (`dmesg` = all, `dmesg -l <0-7>` = level filter,
+ `dmesg -n <0-7>` = set the console echo threshold, `dmesg -c` = clear).
+ `make test-klog` boots and exercises `dmesg`.
+
+ Severity follows syslog convention (0 = KLOG_EMERG most severe, 7 =
+ KLOG_DEBUG least). Policy, in `klog_ring.h`:
+
+ - A message is **always buffered**; it is echoed to the live console only
+   when `klog_console_echo(level, console_max)` holds.
+ - The **default console threshold is KLOG_INFO** (`KLOG_CONSOLE_DEFAULT`).
+   Bare `printf()` is captured at KLOG_INFO, so boot progress and serial
+   test markers keep working. KLOG_DEBUG messages are dmesg-only.
+ - **Steady-state driver traces** (per-I/O, per-tick — e.g. `usb: cache
+   synchronized`) must use `klog(KLOG_DEBUG, ...)`, never bare `printf`, or
+   they corrupt a running user TUI (this is why the threshold exists).
+ - Real failures use `klog(KLOG_ERR, ...)` (or bare printf) so they still
+   reach the console.
+
+ The threshold can be raised to KLOG_DEBUG live (`dmesg -n 7`) when
+ debugging. Do not raise `KLOG_CONSOLE_DEFAULT` above KLOG_INFO without
+ updating the policy tests in `tests/klog_unit.c`.
+
+  # 4. Source Code Directory Structure
 Top level directories.
 
 | **Directory** | **Description** |

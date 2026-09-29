@@ -3,8 +3,9 @@
   Description: Host unit tests for the kernel-log ring buffer
   (kernel/console/klog_ring.h). The ring is pure C with no kernel dependencies,
   so this runs on the host: init/empty, append, per-record metadata (tick/
-  level), wrap-around eviction with the capacity cap, text truncation, and
-  clear.
+  level), wrap-around eviction with the capacity cap, text truncation, clear,
+  and the console-echo policy (default threshold keeps KLOG_DEBUG off the
+  live console).
 */
 #include <stdio.h>
 #include <string.h>
@@ -30,7 +31,7 @@ int main(void)
     klog_ring_t r;
     unsigned int i;
 
-    printf("TAP version 13\n1..19\n");
+    printf("TAP version 13\n1..24\n");
 
     /* --- init / empty -------------------------------------------------- */
     klog_ring_init(&r);
@@ -93,6 +94,24 @@ int main(void)
     klog_ring_clear(&r);
     check("clear: count returns to 0", klog_ring_count(&r) == 0u);
     check("clear: oldest is -1 again", klog_ring_oldest(&r) == -1);
+
+    /* --- console echo policy ------------------------------------------ */
+    /* Regression: the default threshold must keep KLOG_DEBUG out of the
+     * live console (it corrupted user TUIs, e.g. "usb: cache synchronized"
+     * mid-NetHack) while bare printf (KLOG_INFO) still echoes. */
+    check("policy: default console threshold is KLOG_INFO",
+          KLOG_CONSOLE_DEFAULT == KLOG_INFO);
+    check("policy: KLOG_DEBUG is NOT echoed at the default threshold",
+          !klog_console_echo(KLOG_DEBUG, KLOG_CONSOLE_DEFAULT));
+    check("policy: bare printf (KLOG_INFO) IS echoed at the default threshold",
+          klog_console_echo(KLOG_INFO, KLOG_CONSOLE_DEFAULT));
+    check("policy: NOTICE/WARN/ERR are echoed at the default threshold",
+          klog_console_echo(KLOG_NOTICE, KLOG_CONSOLE_DEFAULT) &&
+          klog_console_echo(KLOG_WARN, KLOG_CONSOLE_DEFAULT) &&
+          klog_console_echo(KLOG_ERR, KLOG_CONSOLE_DEFAULT));
+    check("policy: threshold KLOG_DEBUG echoes everything (dmesg -n 7)",
+          klog_console_echo(KLOG_DEBUG, KLOG_DEBUG) &&
+          klog_console_echo(KLOG_EMERG, KLOG_DEBUG));
 
     (void)g_n;
     return g_ok ? 0 : 1;
