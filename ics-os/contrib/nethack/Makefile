@@ -12,7 +12,8 @@
 # base/etc/termcap; NetHack's built-in termcap reader (tclib.c) loads it.
 #
 # The game's data files (dat/*) and the player's saves live in HACKDIR
-# (config.h: /nethack); `install` copies the dat tree there.
+# (config.h: /icsos/nethack — every OS root mounts at /icsos); `install`
+# copies the dat tree there.
 include ../../sdk/app.mk
 
 NAME=nethack
@@ -31,12 +32,17 @@ HACKDIR := /icsos/nethack
 NH_CFLAGS=$(subst -std=gnu89,-std=gnu99,$(APP_CFLAGS))
 # -nostdinc: only the SDK headers are visible (freestanding). NetHack's own
 # headers are resolved from the vendored src/include tree.
-CFLAGS=$(NH_CFLAGS) -nostdinc -I$(SDK)/include -I$(SRC)/include
+# -MMD -MP: emit header-dependency files so edits to headers (notably
+# config.h, which bakes HACKDIR into the binary) force a recompile.  Without
+# this, an up-to-date nethack.exe silently keeps stale objects built against
+# an older config.h.
+DEPFLAGS=-MMD -MP
+CFLAGS=$(NH_CFLAGS) -nostdinc -I$(SDK)/include -I$(SRC)/include $(DEPFLAGS)
 # The SDK support libraries must be compiled WITHOUT NetHack's include dir:
 # NetHack's headers (e.g. its own sys/types.h, regex.h) would shadow the SDK's
 # and break the SDK sources.  The SDK sources only ever include <...> headers,
 # so restricting them to the SDK include tree is exactly what they need.
-SDK_CFLAGS=$(NH_CFLAGS) -nostdinc -I$(SDK)/include
+SDK_CFLAGS=$(NH_CFLAGS) -nostdinc -I$(SDK)/include $(DEPFLAGS)
 SDK_SRC=$(SDK)/tccsdk.c $(SDK)/posix.c $(SDK)/libtcc1.c $(SDK)/crt1.c
 SDK_OBJ=$(patsubst %.c,$(OBJDIR)/sdk-%.o,$(notdir $(SDK_SRC)))
 LIBS=$(SDK_OBJ)
@@ -101,6 +107,10 @@ $(OBJDIR)/sdk-%.o: $(SDK)/%.c $(OBJDIR)/.stage
 
 $(EXE): $(OBJS) $(SDK_OBJ)
 	$(CC) $(CFLAGS) $(APP_LDFLAGS) -o $@ $(OBJS) $(LIBS)
+
+# Header dependencies from -MMD (see DEPFLAGS).
+DEPS=$(OBJS:.o=.d) $(SDK_OBJ:.o=.d)
+-include $(DEPS)
 
 # The nhdat DLB resource (NetHack's single packed data file) is prebuilt on the
 # host (makedefs + dgn_comp + make_dlb, see dlb.lst) and shipped at

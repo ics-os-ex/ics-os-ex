@@ -37,9 +37,9 @@ HOSTG_RTFLAGS := -m64 -std=gnu89 -w -nostdlib -fno-builtin -static -ffreestandin
 vmdex:
 	make -C kernel/
 
-.PHONY: usb-uefi usb-etcher test-usb-uefi-gpt test-vbox-uefi-gpt test-vbox-uefi-gpt-bios test-bochs-uefi-gpt test-usb-cdc-pico test-nethack
+.PHONY: usb-uefi usb-etcher n150-dist test-usb-uefi-gpt test-vbox-uefi-gpt test-vbox-uefi-gpt-bios test-bochs-uefi-gpt test-usb-cdc-pico test-nethack
 .PHONY: test-screenshot
-.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-netdhcp-unit test-net-stress test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-memcorrupt test-asloop test-fork test-fork-switch-gap test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-selfhost-cert-usb test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-vtcolor-unit test-vtcolor-guest test-vtcolor-xhci test-vim-xhci test-nethack-xhci test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-termcap-unit test-ttycanon-unit test-usbdbg-unit test-rtwfw-unit test-rtwphy-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-netdhcp-unit test-net-stress test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-memcorrupt test-asloop test-fork test-fork-switch-gap test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-selfhost-cert-usb test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-vtcolor-unit test-vtcolor-guest test-vtcolor-xhci test-vim-xhci test-nethack-xhci test-nethack-mmap-xhci test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-termcap-unit test-ttycanon-unit test-usbdbg-unit test-rtwfw-unit test-rtwphy-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -314,6 +314,15 @@ usb-etcher: usb-uefi
 	@echo "Etcher image: $$(pwd)/ics-os-uefi.img"
 	@echo "Etcher zip:   $$(pwd)/ics-os-uefi.img.zip"
 	@echo "Toolchain:    gcc cc1 as ld ar objcopy make tcc (+ SDK .o + ldscripts)"
+
+# One-command Intel N150 distribution: build + Etcher zip, then boot-validate on
+# the N150-equivalent firmware path (OVMF + q35 xHCI) before you flash hardware,
+# then print sha256 + dd/Etcher instructions. Pass args through, e.g.:
+#   make n150-dist ARGS="--no-verify"      (skip the OVMF boot)
+#   make n150-dist ARGS="--size 256"       (256 MiB image)
+n150-dist:
+	@chmod +x scripts/mk-n150-dist.sh
+	@scripts/mk-n150-dist.sh $(ARGS)
 
 # Host-built GCC toolchain pieces the distribution ships: the cc1 compiler
 # proper, the thin gcc driver, and the five SDK runtime objects the driver
@@ -1514,17 +1523,26 @@ test-vim-xhci: usb-uefi
 apps/nethack.exe: contrib/nethack/Makefile
 	$(MAKE) -C contrib/nethack install
 
+# The committed nethack.exe must have HACKDIR "/icsos/nethack" baked in: every
+# OS root (FAT thumb drive, UEFI ESP, CD-ROM) mounts at /icsos, so a bare
+# `nethack` launch (no -d) must chdir() there.  A stale binary with the old
+# "/nethack" default dies at startup with "Cannot chdir to /nethack."
+# (regression: the 11b23aa rebuild baked in "/nethack").
+nethack-hackdir-check: apps/nethack.exe
+	@strings apps/nethack.exe | grep -qx '/icsos/nethack' || \
+		{ echo "nethack-hackdir-check FAIL: no /icsos/nethack HACKDIR in nethack.exe; rebuild with: make -C contrib/nethack install"; exit 1; }
+
 test-nethack: kernel/Kernel64.bin apps/nethack.exe base/nethack/nhdat base/nethack/engrave base/nethack/sysconf base/etc/termcap
+	@$(MAKE) nethack-hackdir-check
 	@echo "Building Multiboot2 ISO for NetHack character-creation test..."
 	@rm -rf /tmp/icsos-nethack-iso
 	@mkdir -p /tmp/icsos-nethack-iso/boot/grub /tmp/icsos-nethack-iso/apps /tmp/icsos-nethack-iso/etc /tmp/icsos-nethack-iso/nethack
 	@cp kernel/Kernel64.bin /tmp/icsos-nethack-iso/vmdex
 	@cp apps/nethack.exe /tmp/icsos-nethack-iso/apps/nethack.exe
-	# The committed nethack.exe has HACKDIR "/icsos/nethack" baked in, so its
-	# data (nhdat, sysconf, symbols, options, help, ...) must live in a
-	# /nethack/ directory on the CD (which mounts at /icsos).  We also pass
-	# "-d /icsos/nethack" on the command line so the data dir does not depend
-	# on the compiled-in default.
+	# The nethack data (nhdat, sysconf, symbols, options, help, ...) lives in
+	# /nethack/ on the CD (which mounts at /icsos).  The game runs from the
+	# writable RAM disk ("nethack -d /ramdisk/nethack") because the CD root is
+	# read-only and NetHack's USE_FCNTL locker needs to create the lock file.
 	@cp base/nethack/nhdat /tmp/icsos-nethack-iso/nethack/nhdat
 	# engrave is a filesystem random-text data file (not packed in nhdat);
 	# dlb_fopen() falls back to fopen_datafile() so the game reads it from the
@@ -1599,13 +1617,17 @@ test-nethack: kernel/Kernel64.bin apps/nethack.exe base/nethack/nhdat base/netha
 
 # Same NetHack smoke test on the main distribution (GPT + FAT32 ESP) thumbdrive
 # booted over q35 xHCI + OVMF. The dist ships /apps/nethack.exe and the data
-# files under /nethack/; cd there first so NetHack's bare-path opens
-# (sysconf/nhdat/...) resolve against the inherited workdir.
+# files under /nethack/ on the ESP (OS path /icsos/nethack). The launch is the
+# bare `nethack` a user types at the shell prompt — no `cd`, no `-d` — so the
+# test exercises the compiled-in HACKDIR default. Regression: the binary once
+# shipped with HACKDIR "/nethack" while every root mounts at /icsos, so chdir()
+# failed and the child died with "Cannot chdir to /nethack."
 test-nethack-xhci: usb-uefi apps/nethack.exe
+	@$(MAKE) nethack-hackdir-check
 	@echo "Testing NetHack on xHCI UEFI thumbdrive..."
 	@test -n "$(OVMF_FD)" || { echo "OVMF firmware not found (install ovmf)."; exit 1; }
 	@rm -f /tmp/icsos-nethack-xhci-autoexec.bat
-	@printf '%s\n' 'cd /icsos/nethack' 'nethack -d /icsos/nethack' 'reboot' > /tmp/icsos-nethack-xhci-autoexec.bat
+	@printf '%s\n' 'nethack' 'reboot' > /tmp/icsos-nethack-xhci-autoexec.bat
 	@cp --sparse=always ics-os-uefi.img /tmp/icsos-nethack-xhci.img
 	@mcopy -o -i "/tmp/icsos-nethack-xhci.img@@$$((2048 * 512))" /tmp/icsos-nethack-xhci-autoexec.bat ::autoexec.bat
 	@mcopy -o -i "/tmp/icsos-nethack-xhci.img@@$$((2048 * 512))" apps/nethack.exe ::/apps/nethack.exe
@@ -1619,9 +1641,48 @@ test-nethack-xhci: usb-uefi apps/nethack.exe
 	@grep -aq "GPT_DETECT usb0" /tmp/icsos-nethack-xhci.log
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-nethack-xhci.log
 	@grep -aq "NetHack, Copyright 1985-2023" /tmp/icsos-nethack-xhci.log
+	# Bare launch must chdir() to the baked-in HACKDIR; the 11b23aa regression
+	# died here before printing the banner.
+	@! grep -aq "Cannot chdir to" /tmp/icsos-nethack-xhci.log
 	@! grep -aq "Unable to open SYSCF_FILE" /tmp/icsos-nethack-xhci.log
 	@! grep -aq "panic\|GPF\|Page fault" /tmp/icsos-nethack-xhci.log
 	@echo "test-nethack-xhci PASS"
+
+# Replicate the mmap (vfs_mapfile + dex32_loader) executable load path on the
+# xHCI UEFI thumbdrive.  Forces execp_load to skip elf64_stream_load via the
+# `execp-mmap` cmdline fault hook, proving the mmap path maps and runs a valid
+# ELF64.  Regression for the N150 "unidentified executable format" defect: the
+# mmap path loads nethack here, so the N150 failure is a bad file/read, not the
+# loader.
+test-nethack-mmap-xhci: usb-uefi apps/nethack.exe
+	@echo "Testing NetHack mmap load path on xHCI UEFI thumbdrive..."
+	@test -n "$(OVMF_FD)" || { echo "OVMF firmware not found (install ovmf)."; exit 1; }
+	@rm -f /tmp/icsos-nethack-mmap.img /tmp/icsos-nethack-mmap-grub.cfg /tmp/icsos-nethack-mmap-autoexec.bat
+	@printf '%s\n' 'nethack' 'reboot' > /tmp/icsos-nethack-mmap-autoexec.bat
+	@cp --sparse=always ics-os-uefi.img /tmp/icsos-nethack-mmap.img
+	@mcopy -i "/tmp/icsos-nethack-mmap.img@@$$((2048 * 512))" ::/boot/grub/grub.cfg -o /tmp/icsos-nethack-mmap-grub.cfg
+	@sed -i 's@^    multiboot2 /vmdex$$@    multiboot2 /vmdex execp-mmap@' /tmp/icsos-nethack-mmap-grub.cfg
+	@mcopy -o -i "/tmp/icsos-nethack-mmap.img@@$$((2048 * 512))" /tmp/icsos-nethack-mmap-grub.cfg ::/boot/grub/grub.cfg
+	@mcopy -o -i "/tmp/icsos-nethack-mmap.img@@$$((2048 * 512))" /tmp/icsos-nethack-mmap-grub.cfg ::/grub.cfg
+	@mcopy -o -i "/tmp/icsos-nethack-mmap.img@@$$((2048 * 512))" vmdex ::/vmdex
+	@mcopy -o -i "/tmp/icsos-nethack-mmap.img@@$$((2048 * 512))" apps/nethack.exe ::/apps/nethack.exe
+	@mcopy -o -i "/tmp/icsos-nethack-mmap.img@@$$((2048 * 512))" /tmp/icsos-nethack-mmap-autoexec.bat ::autoexec.bat
+	@(for i in $(shell seq 1 250); do printf '\n'; sleep 0.4; done; sleep 8) | \
+		timeout 150 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
+		-machine q35 -bios $(OVMF_FD) \
+		-drive if=none,id=stick,format=raw,file=/tmp/icsos-nethack-mmap.img \
+		-device qemu-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,drive=stick \
+		> /tmp/icsos-nethack-mmap.log 2>&1 || true
+	@grep -aq "ICS-OS: cmdline=execp-mmap" /tmp/icsos-nethack-mmap.log
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-nethack-mmap.log
+	# The mmap path must be taken, map a valid ELF64, and nethack must run.
+	@grep -aq "execp: loading /icsos/apps/nethack.exe.*\[mmap\]" /tmp/icsos-nethack-mmap.log
+	@grep -aq "elf64: parsing /icsos/apps/nethack.exe" /tmp/icsos-nethack-mmap.log
+	@grep -aq "NetHack, Copyright 1985-2023" /tmp/icsos-nethack-mmap.log
+	@! grep -aq "unidentified executable format" /tmp/icsos-nethack-mmap.log
+	@! grep -aq "panic\|GPF\|Page fault" /tmp/icsos-nethack-mmap.log
+	@echo "test-nethack-mmap-xhci PASS"
 
 # Targeted test for the "process restart from entry point" bug.
 # If the bug is present, the startup marker appears multiple times.
