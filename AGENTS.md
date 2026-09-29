@@ -90,11 +90,17 @@ Useful individual targets (from `ics-os/`):
 | `test-fatwrite-coop` | Same writers under `coop-smp` (user processes on APs, no timer preemption of a running user tool — the self-host closure's scheduling regime); asserts no `CRITHANG`/`WATCHDOG`, so it fails on a lock hang rather than on a missing success marker |
 | `test-fork` | COW fork ABI/isolation, fast path, text protection, OOM, inherited fd, exit/wait, and delayed reaping |
 | `test-fork-matrix` | COW fork pressure gate on `-smp 1/2/4/8` |
+| `test-fork-switch-gap` | `fault-switch-gap` cmdline holds the scheduler choose→switch window open until the chosen fork child self-exits; asserts `SWITCH-GAP-INJECT child-exited` + `SWITCH-DYING-REFUSED` and no `FORK-FRAME-BAD`/`GPF64` (regression for re-running `fork_child_return` on a DYING PCB) |
+| `test-restart` | Fork/wait process-restart regression (Multiboot2 ISO, TCG 2 vCPU): a parent forks a counting child and `waitpid`s; asserts `RESTART_TEST_CHILD_STARTUP` appears exactly once and `RESTART_TEST_PASS` is reached; no GPF/PF |
+| `test-restart-xhci` | Same fork/wait reproducer on the xHCI q35 UEFI thumbdrive — the platform where `smp_have_rdtscp` is 0 and IRQ-entry CPU-id falls back to the GS base; asserts `RESTART_TEST_CHILD_STARTUP` count 1 + `RESTART_TEST_PASS` (regression for the user-IRQ staying on the user stack and `schedule_from_timer` skipping the switch) |
 | `test-make` | In-OS TinyCC builds GNU make 3.82 onto `/work`; `make -f t.mk` spawns `hello.exe` (`MAKE_PASS`) |
 | `test-bintools` | In-OS GNU binutils: `as` assembles, `ar` archives, `ld` links a default-script ELF64, then it execs (`AS_PASS`/`AR_PASS`/`LD_PASS`/`BINTOOLS_PASS`) |
 | `test-vim` | FEAT_TINY vim ELF64 TUI; non-interactive `vim --version` prints the real banner + exits cleanly |
 | `test-dup` | Runtime `dup(2)` (`0xC5`) self-test: dup'd tty fd allocable+closable; dup'd file fd write read back through the original (`DUPT_PASS`) |
 | `test-nethack` | NetHack 3.6.7 TTY smoke test: loads `nethack.exe` from the CD, finds `termcap`, reaches the copyright banner and `Who are you?` prompt, and exits cleanly; no GPF/PF |
+| `test-termtest` | Terminal-stack self-test: canonical/raw `termios` round-trip, `TIOCGWINSZ` 25x80, monotonic clock, zero-timeout `select`/`poll`, end-to-end DSR-6 (`CSI 6 n` → `CSI row;col R`), relative cursor motion, edge clamping, DECSC/DECRST (`ESC 7`/`ESC 8`), huge `SU` clamping, and OSC `ST` termination with embedded CSI on both framebuffer and serial-backed ttys |
+| `test-screenshot` | In-OS `screenshot` builtin captures the active GOP/VBE framebuffer to a binary PPM file on the FAT root; host readback validates `P6`, geometry, and exact byte count |
+| `test-htop` | ICS-OS `htop` monitor: `--version`, `--selftest`, non-interactive `--frame`, and `--dump` using `sys_icsos_proc_list`/`sys_icsos_sysinfo`/`sys_icsos_kill`; asserts `HTOP_SELFTEST_PASS`, `HTOP_PASS`, `HTOP_DUMP_OK`, and no `HTOP_FAIL` |
 | `test-partition-unit` | Host-native TAP unit tests for partition-layer logic: IEEE CRC-32 vectors/chunking and ATA LBA28/LBA48 capacity decode (`tests/partition_unit.c`) |
 | `test-fbconsole-unit` | Host-native TAP for GOP/VBE pitch, late map, PAT-WC, 80x25 origin, and per-axis zoom (`tests/fbconsole_geom_unit.c`) |
 | `test-kbdleds-unit` | Host-native TAP for i8042 boot-stage Caps/Num/Scroll encoding (`tests/kbd_boot_leds_unit.c`) |
@@ -113,6 +119,7 @@ Useful individual targets (from `ics-os/`):
 | `test-netdns-unit` | Host-native TAP for DNS query build / A-record parse (`tests/net_dns_unit.c`) |
 | `test-usbdbg-unit` | Host-native TAP for the CDC debug RPC line parser, KEYS hex, SCREEN dump, PPM size, and ICSOS_VER bind/STATUS stamps (`tests/usb_debug_unit.c`) |
 | `test-ttycanon-unit` | Host-native TAP for canonical tty read remainder (`tests/tty_canon_unit.c`) |
+| `test-termcap-unit` | Host-native TAP for SDK termcap `tgetent`/`tgetstr`/`tgoto`/`tparam`/`tputs` expansion (`tests/termcap_unit.c`) |
 | `test-pciscan-unit` | Host-native TAP for PCI slot function-count (empty slots skip fn 1-7) and Wi-Fi/network class helpers (`tests/pci_scan_unit.c`) |
 | `test-rtwfw-unit` | Host-native TAP for RTL8821C firmware header validation (`tests/rtw_fw_hdr_unit.c`) |
 | `test-bridge-console-unit` | Host-native TAP for the ESP32 debug-bridge LCD line buffer (`tests/bridge_console_unit.c`) |

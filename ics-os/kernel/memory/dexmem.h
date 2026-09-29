@@ -25,9 +25,18 @@
 */
 
 
+#ifndef _DEXMEM_H_
+#define _DEXMEM_H_
+
 /*This constants define the selector values used by DEX */
 #include "types.h"
 #include "memory/memlayout.h"
+#include "memory/vma.h"
+
+/* Forward decl so this header is self-contained when a TU (e.g. scheduler.c)
+   includes it without startup/multiboot.h.  `mmap` is the typedef for
+   struct _mmap defined in startup/multiboot.h. */
+struct _mmap;
 
 #ifdef __x86_64__
 #define LINEAR_SEL     0x10
@@ -211,7 +220,7 @@ WORD addgdt(DWORD base,DWORD limit,BYTE attb1,BYTE attb2);
 void clearpagetable(DWORD *pagetable);
 void *commit(DWORD virtualaddr,DWORD pages);
 void *commitb(DWORD virtualaddr,int amt,DWORD *pagecount);
-DWORD mem_detectmemory(mmap *grub_meminfo , int size );
+DWORD mem_detectmemory(struct _mmap *grub_meminfo , int size );
 void dex32copyblock(DWORD vdest,DWORD vsource,DWORD pages,DWORD *pagedir);
 void *dex32_commitblock(DWORD virtualaddr,int amt,
     DWORD *pagecount,DWORD *pagedir,DWORD attb);
@@ -226,6 +235,10 @@ void *dex32_reserveblock(DWORD virtualaddr,int amt,
     DWORD *pagecount,DWORD *pagedir,DWORD attb);
 void *dex32_reserve(DWORD virtualaddr,DWORD pages,DWORD *pagedir,DWORD attb);
 void *dex32_sbrk(unsigned int amt);
+/* mmap/munmap/mprotect/msync syscall handlers.  They take the DEX int 0x30
+   ABI (five pointer-width api_arg_t values); mmap receives a pointer to a
+   struct mmap_args in a0 and returns the mapped base (success) or a negative
+   errno (failure) as api_arg_t. */
 void *dex32_mmap(unsigned long length, unsigned long flags,
                  unsigned long a3, unsigned long a4, unsigned long a5);
 int dex32_munmap(unsigned long addr, unsigned long length,
@@ -270,7 +283,55 @@ void userpd_cow_stats(u64 *faults, u64 *copies, u64 *fastpaths,
 void userpd_free(u64 *pml4);
 int userpd_is_private(const void *pml4);
 int userpd_used(void);
+
+/* The VMA type (vm_area), VMA_MAX and the mmap_args block live in memory/vma.h
+   (included above) so process.h can store the VMA table without pulling this
+   header-resident global-state file into every TU. */
+
+struct _PCB386;
+
+/* Find the VMA containing va, or NULL. */
+vm_area *vm_area_find(const struct _PCB386 *p, unsigned long va);
+/* Reserve a VA range and record a VMA.  Returns the start address or 0.
+   When `fixed` is set the map is placed at `hint` (MAP_FIXED, replacing any
+   existing mapping there); otherwise the anonymous bump allocator
+   (mmap_brk) chooses the address and `hint` is ignored.  `prot`/`flags` are
+   the raw mmap() values; `file`/`foff` back a file map (NULL = anonymous). */
+unsigned long vm_area_alloc(struct _PCB386 *p, unsigned long length,
+                            unsigned long prot, unsigned long flags,
+                            void *file, unsigned long foff,
+                            unsigned long hint, int fixed);
+/* Remove VMAs overlapping [start,end): unmap pages, flush dirty shared
+   pages to their files, and drop the file refs.  Returns 0 on success. */
+int vm_area_remove(struct _PCB386 *p, unsigned long start, unsigned long end);
+/* Change the protection of the present pages in [start,end).  Returns 0 on
+   success, -1 if the range is not fully covered by VMAs of this process. */
+int vm_area_set_prot(struct _PCB386 *p, unsigned long start, unsigned long end,
+                     unsigned long prot);
+/* Handle a not-present fault at va inside one of the process's VMAs: load
+   the backing page (file data or zero), map it with the VMA's protection.
+   Returns 1 handled, 0 if va is not inside a VMA (caller keeps its policy),
+   -1 on out-of-memory. */
+int vm_area_fault(struct _PCB386 *p, unsigned long va, unsigned fault_info);
+/* Copy the VMA table from parent to child at fork, taking a fresh file ref
+   for the child on each file-backed VMA.  Returns 0 on success. */
+int vm_area_fork(const struct _PCB386 *parent, struct _PCB386 *child);
+/* Flush every dirty MAP_SHARED page of the process to its file and drop all
+   VMA file refs.  Called at process exit before its PML4 is freed. */
+void vm_area_exit(struct _PCB386 *p);
+/* Flush the dirty MAP_SHARED pages of one VMA in [start,end) to its file.
+   `msync` syscall entry: returns 0 on success, -1 if the range is not a
+   mapped shared region. */
+int vm_area_msync(struct _PCB386 *p, unsigned long start, unsigned long end);
 #endif
+
+/* mmap-adjacent syscall handlers (registered in dexapi/dex32API.c).  All take
+   the five-slot api_arg_t ABI and return the mapped address / 0 on success or
+   a negative errno as api_arg_t on failure. */
+void *dex32_mprotect(unsigned long addr, unsigned long length,
+                     unsigned long prot, unsigned long a3, unsigned long a4);
+void *dex32_msync(unsigned long addr, unsigned long length,
+                  unsigned long flags, unsigned long a3, unsigned long a4);
 DWORD *mempop();
 void mempush(DWORD mem);
 DWORD obtainpage();
@@ -285,9 +346,11 @@ void setgdt(WORD sel,DWORD base,DWORD limit,BYTE attb1,BYTE attb2);
 void setgdtentry(DWORD index,void *base,gdtentry *t,DWORD limit,
            BYTE attb1,BYTE attb2);
 
-void mem_interpretmemory(mmap *map,int size);
+void mem_interpretmemory(struct _mmap *map,int size);
 void dex32_stopints(DWORD *flags);
 void dex32_restoreints(DWORD flags);
 void setpageattb(DWORD *pagedir,DWORD vaddr,DWORD attb);
 void *dex32_setpageattb(DWORD virtualaddr,DWORD pages,DWORD *pagedir,DWORD pattb);
 void *dex32_setpageattbblock(DWORD virtualaddr,int amt,DWORD *pagecount,DWORD *pagedir,DWORD attb);
+
+#endif /* _DEXMEM_H_ */

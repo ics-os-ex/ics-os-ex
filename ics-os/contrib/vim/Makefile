@@ -24,7 +24,7 @@ OBJDIR := $(STAGE)/obj
 # level above the SDK's default gnu89.
 VIM_CFLAGS=$(subst -std=gnu89,-std=gnu99,$(APP_CFLAGS))
 CFLAGS=$(VIM_CFLAGS) -nostdinc -I$(SDK)/include -I$(STAGE) -I$(STAGE)/proto -DHAVE_CONFIG_H
-LIBS=$(SDK)/tccsdk.c $(SDK)/posix.c $(SDK)/libtcc1.c $(SDK)/crt1.c
+LIBS=$(SDK)/tccsdk.c $(SDK)/posix.c $(SDK)/termcap.c $(SDK)/libtcc1.c $(SDK)/crt1.c
 
 # Core editor sources (the OBJ_COMMON list from vim's Makefile). Optional
 # subsystems (GUI, hardcopy, spell, sixel/kitty/cairo, sockets, terminal) are
@@ -53,7 +53,7 @@ VIM_C = \
 VIM_OBJS = $(patsubst %.c,$(OBJDIR)/%.o,$(VIM_C))
 
 # Stage the source tree once (re-run when the config or sources change).
-$(STAGE)/.stage: config.icsos.h icsos_stub.c $(VIM_SRC)/vim.h
+$(STAGE)/.stage: config.icsos.h icsos_stub.c pathdef.c $(VIM_SRC)/vim.h
 	rm -rf $(STAGE)
 	mkdir -p $(OBJDIR) $(STAGE)/auto
 	cp -a $(VIM_SRC)/*.c $(VIM_SRC)/*.h $(STAGE)/

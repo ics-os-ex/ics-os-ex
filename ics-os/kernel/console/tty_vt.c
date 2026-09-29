@@ -16,8 +16,11 @@
 #include "../dextypes.h"
 #include "tty.h"
 #include "dex_DDL.h"
+#include "../hardware/vga/fbconsole.h"
+#include "vt_color.h"
 
 extern void Dex32UpdateCursor(DEX32_DDL_INFO *dev, int y, int x);
+extern void dd_swaptohardware(DEX32_DDL_INFO *dev);
 extern void serial_putc(char c);
 extern void outportb(unsigned int port, unsigned char value);
 extern void *memset(void *s, int c, unsigned int n);
@@ -26,9 +29,31 @@ extern void *memmove(void *d, const void *s, unsigned int n);
 extern void *malloc(unsigned int n);
 extern void free(void *p);
 
-enum { VT_S_GROUND = 0, VT_S_ESC, VT_S_CSI, VT_S_OSC };
+enum { VT_S_GROUND = 0, VT_S_ESC, VT_S_CSI, VT_S_OSC, VT_S_OSC_ESC };
 
 #define VT_SCREEN_SIZE (VT_COLS * VT_ROWS * 2)
+
+static int vt_hw_live(const tty_t *t)
+{
+    return t && t->ddl && t->ddl == ActiveDDL &&
+           t->ddl->active && !t->ddl->bufmode;
+}
+
+static void vt_refresh(tty_t *t)
+{
+    if (t && t->ddl && t->ddl->bufmode)
+       dd_swaptohardware(t->ddl);
+    if (vt_hw_live(t) && fbconsole_active())
+       fbconsole_screen_refresh();
+}
+
+static void vt_clear_buffer(unsigned char *s, int attr)
+{
+    int i;
+    memset(s, ' ', VT_SCREEN_SIZE);
+    for (i = 1; i < VT_SCREEN_SIZE; i += 2)
+       s[i] = (unsigned char)attr;
+}
 
 static unsigned char *vt_screen(tty_t *t)
 {
@@ -37,11 +62,13 @@ static unsigned char *vt_screen(tty_t *t)
 
 static void vt_putcell(tty_t *t, int x, int y, char c, int attr)
 {
-   unsigned char *s = vt_screen(t);
-   if (x < 0 || x >= VT_COLS || y < 0 || y >= VT_ROWS)
-      return;
-   s[(y * VT_COLS + x) * 2] = (unsigned char)c;
-   s[(y * VT_COLS + x) * 2 + 1] = (unsigned char)attr;
+    unsigned char *s = vt_screen(t);
+    if (x < 0 || x >= VT_COLS || y < 0 || y >= VT_ROWS)
+       return;
+    s[(y * VT_COLS + x) * 2] = (unsigned char)c;
+    s[(y * VT_COLS + x) * 2 + 1] = (unsigned char)attr;
+    if (vt_hw_live(t) && fbconsole_active())
+       fbconsole_cell_render(x, y, (unsigned char)c, (unsigned char)attr);
 }
 
 static void vt_clear_rect(tty_t *t, int x1, int y1, int x2, int y2, int attr)
@@ -68,9 +95,10 @@ static void vt_scroll_up(tty_t *t, int top, int bot, int attr)
    if (top > bot)
       return;
    memmove(s + top * VT_COLS * 2,
-           s + (top + 1) * VT_COLS * 2,
-           (rows - 1) * VT_COLS * 2);
-   vt_clear_rect(t, 0, bot, VT_COLS - 1, bot, attr);
+            s + (top + 1) * VT_COLS * 2,
+            (rows - 1) * VT_COLS * 2);
+    vt_clear_rect(t, 0, bot, VT_COLS - 1, bot, attr);
+    vt_refresh(t);
 }
 
 static void vt_scroll_down(tty_t *t, int top, int bot, int attr)
@@ -81,10 +109,11 @@ static void vt_scroll_down(tty_t *t, int top, int bot, int attr)
    if (bot >= VT_ROWS) bot = VT_ROWS - 1;
    if (top > bot)
       return;
-   memmove(s + (top + 1) * VT_COLS * 2,
-           s + top * VT_COLS * 2,
-           (rows - 1) * VT_COLS * 2);
-   vt_clear_rect(t, 0, top, VT_COLS - 1, top, attr);
+  memmove(s + (top + 1) * VT_COLS * 2,
+            s + top * VT_COLS * 2,
+            (rows - 1) * VT_COLS * 2);
+    vt_clear_rect(t, 0, top, VT_COLS - 1, top, attr);
+    vt_refresh(t);
 }
 
 static void vt_cursor_clamp(tty_t *t)
@@ -101,34 +130,36 @@ static void vt_cursor_sync(tty_t *t)
    Dex32UpdateCursor((DEX32_DDL_INFO *)t->ddl, t->ddl->cury, t->ddl->curx);
 }
 
-/* Move down one line honoring the scroll region (VT "index" behavior). */
-static void vt_index(tty_t *t, int attr)
+/* Move down one line honoring the scroll region (VT "index" behavior).
+   Newly exposed rows are filled with the default rendition, not the current
+   SGR, so a colored SGR active at scroll time does not paint a band. */
+static void vt_index(tty_t *t)
 {
-   vt_state_t *v = &t->vt;
-   if (t->ddl->cury == v->stb_bot)
-      vt_scroll_up(t, v->stb_top, v->stb_bot, attr);
-   else if (t->ddl->cury < VT_ROWS - 1)
-      t->ddl->cury++;
-   vt_cursor_sync(t);
+    vt_state_t *v = &t->vt;
+    if (t->ddl->cury == v->stb_bot)
+       vt_scroll_up(t, v->stb_top, v->stb_bot, VT_DEFAULT_ATTR);
+    else if (t->ddl->cury < VT_ROWS - 1)
+       t->ddl->cury++;
+    vt_cursor_sync(t);
 }
 
-static void vt_reverse_index(tty_t *t, int attr)
+static void vt_reverse_index(tty_t *t)
 {
-   vt_state_t *v = &t->vt;
-   if (t->ddl->cury == v->stb_top)
-      vt_scroll_down(t, v->stb_top, v->stb_bot, attr);
-   else if (t->ddl->cury > 0)
-      t->ddl->cury--;
-   vt_cursor_sync(t);
+    vt_state_t *v = &t->vt;
+    if (t->ddl->cury == v->stb_top)
+       vt_scroll_down(t, v->stb_top, v->stb_bot, VT_DEFAULT_ATTR);
+    else if (t->ddl->cury > 0)
+       t->ddl->cury--;
+    vt_cursor_sync(t);
 }
 
 static void vt_putchar(tty_t *t, char c, int attr)
 {
    int x = t->ddl->curx;
-   if (x >= VT_COLS) {
-      x = 0;
-      vt_index(t, attr);
-   }
+    if (x >= VT_COLS) {
+       x = 0;
+       vt_index(t);
+    }
    vt_putcell(t, x, t->ddl->cury, c, attr);
    t->ddl->curx = x + 1;
    if (t->ddl->curx >= VT_COLS)
@@ -136,79 +167,16 @@ static void vt_putchar(tty_t *t, char c, int attr)
    vt_cursor_sync(t);
 }
 
-/* Parse "n1;n2;..." into vals; returns count. -1 on malformed input. */
-static int vt_parse_params(char *s, int *vals, int max)
-{
-   int n = 0, cur = -1, i;
-   for (i = 0; s[i] && n < max; i++) {
-      if (s[i] >= '0' && s[i] <= '9') {
-         if (cur < 0)
-            cur = 0;
-         cur = cur * 10 + (s[i] - '0');
-      } else if (s[i] == ';') {
-         vals[n++] = cur < 0 ? 0 : cur;
-         cur = -1;
-      } else {
-         return -1;
-      }
-   }
-   vals[n++] = cur < 0 ? 0 : cur;
-   return n;
-}
-
+/* Apply an SGR parameter string to the current cell attribute. The parse +
+   attribute math (including 256-color / truecolor) live in vt_color.c so the
+   host-native TAP exercises the exact kernel logic. */
 static void vt_apply_sgr(tty_t *t, char *params)
 {
-   vt_state_t *v = &t->vt;
-   int vals[16], n, i;
-   n = vt_parse_params(params, vals, 16);
-   if (n <= 0)
-      return;
-   for (i = 0; i < n; i++) {
-      int p = vals[i];
-      switch (p) {
-      case 0:
-         v->sgr = 0x07;
-         break;
-      case 1:
-         v->sgr = (v->sgr & 0xF0) | 0x0F;
-         break;
-      case 4:
-         v->sgr |= 0x80;
-         break;
-      case 7: {
-         int fg = v->sgr & 0x0F, bg = (v->sgr >> 4) & 0x0F;
-         v->sgr = (v->sgr & 0x80) | (fg << 4) | bg;
-         break;
-      }
-      case 21: case 22:
-         v->sgr = (v->sgr & 0xF0) | (v->sgr & 0x07);
-         break;
-      case 24:
-         v->sgr &= ~0x80;
-         break;
-      case 27: {
-         int fg = v->sgr & 0x0F, bg = (v->sgr >> 4) & 0x0F;
-         v->sgr = (v->sgr & 0x80) | fg | (bg << 4);
-         break;
-      }
-      case 39:
-         v->sgr = (v->sgr & 0xF0) | 0x07;
-         break;
-      case 49:
-         v->sgr &= 0x0F;
-         break;
-      default:
-         if (p >= 30 && p <= 37)
-            v->sgr = (v->sgr & 0xF0) | (p - 30);
-         else if (p >= 40 && p <= 47)
-            v->sgr = (v->sgr & 0x0F) | ((p - 40) << 4);
-         else if (p >= 90 && p <= 97)
-            v->sgr = (v->sgr & 0xF0) | (p - 90 + 8);
-         else if (p >= 100 && p <= 107)
-            v->sgr = (v->sgr & 0x0F) | ((p - 100 + 8) << 4);
-         break;
-      }
-   }
+    int vals[32], n;
+    n = vt_parse_params(params, vals, 32);
+    if (n <= 0)
+       return;
+    t->vt.sgr = vt_sgr_apply(t->vt.sgr, vals, n);
 }
 
 /* Format a non-negative integer into dst (no leading zeros); return len. */
@@ -222,79 +190,92 @@ static int vt_fmt_num(char *dst, int val)
    return i;
 }
 
- /* Respond to DSR-6 by injecting CSI row;col R into the tty input queue. */
-static void vt_dsr_response(tty_t *t)
-{
-    char buf[24];
-    int row = t->ddl->cury + 1, col = t->ddl->curx + 1, i = 0, j;
-    buf[i++] = 0x1B; buf[i++] = '[';
-    i += vt_fmt_num(buf + i, row);
-    buf[i++] = ';';
-    i += vt_fmt_num(buf + i, col);
-    buf[i++] = 'R';
+/* Respond to DSR-6 by injecting CSI row;col R into the tty input queue. */
+ static void vt_dsr_response(tty_t *t)
+ {
+     char buf[24];
+     int row, col, i = 0, j;
+     if (t->flags & TTY_SERIAL) {
+        row = t->vt.sery + 1;
+        col = t->vt.serx + 1;
+     } else {
+        row = t->ddl->cury + 1;
+        col = t->ddl->curx + 1;
+     }
+     buf[i++] = 0x1B; buf[i++] = '[';
+     i += vt_fmt_num(buf + i, row);
+     buf[i++] = ';';
+     i += vt_fmt_num(buf + i, col);
+     buf[i++] = 'R';
     for (j = 0; j < i; j++)
-       tty_inject(t, buf[j]);
- }
+         tty_inject(t, buf[j]);
+   }
 
 static void vt_ris(tty_t *t)
 {
-   vt_state_t *v = &t->vt;
-   v->state = VT_S_GROUND;
-   v->sgr = 0x07;
-   v->stb_top = 0;
-   v->stb_bot = VT_ROWS - 1;
-   v->savx = v->savy = 0;
-   v->savsgr = 0x07;
-   vt_screen_clear(v, t->ddl, 0x07);
-   t->ddl->curx = 0;
-   t->ddl->cury = 0;
-   t->ddl->attb = 0x07;
-   vt_cursor_sync(t);
+    vt_state_t *v = &t->vt;
+    v->state = VT_S_GROUND;
+    v->sgr = 0x07;
+    v->stb_top = 0;
+    v->stb_bot = VT_ROWS - 1;
+    v->savx = v->savy = 0;
+    v->savsgr = 0x07;
+    if (v->alt) {
+       v->alt = 0;
+       memcpy(vt_screen(t), t->ddl->mem_ptr, VT_SCREEN_SIZE);
+    }
+    vt_screen_clear(v, t->ddl, 0x07);
+    t->ddl->curx = 0;
+    t->ddl->cury = 0;
+    t->ddl->attb = 0x07;
+    vt_cursor_sync(t);
+    vt_refresh(t);
 }
 
 static void vt_alt_enter(tty_t *t, int savecursor, int clear)
 {
-   vt_state_t *v = &t->vt;
-   if (v->alt)
-      return;
-   if (!v->altbuf) {
-      v->altbuf = (unsigned char *)malloc(VT_SCREEN_SIZE);
-      if (!v->altbuf)
-         return;
-   }
-   if (savecursor) {
-      v->savx = t->ddl->curx;
-      v->savy = t->ddl->cury;
-      v->savsgr = v->sgr;
-   }
-   memcpy(v->altbuf, vt_screen(t), VT_SCREEN_SIZE);
-   if (clear)
-      vt_screen_clear(v, t->ddl, v->sgr);
-   v->alt = 1;
+    vt_state_t *v = &t->vt;
+    if (v->alt)
+       return;
+    if (t->ddl->bufmode)
+       dd_swaptohardware(t->ddl);
+    if (savecursor) {
+       v->savx = t->ddl->curx;
+       v->savy = t->ddl->cury;
+       v->savsgr = v->sgr;
+    }
+    /* Save the primary screen in the DDL memory buffer and make the
+       alternate screen the live DDL shadow so framebuffer refreshes show it. */
+    memcpy(t->ddl->mem_ptr, vt_screen(t), VT_SCREEN_SIZE);
+     if (clear)
+        vt_clear_buffer(vt_screen(t), VT_DEFAULT_ATTR);
+     v->alt = 1;
+    vt_refresh(t);
 }
 
-static void vt_alt_exit(tty_t *t, int restorecursor)
+void vt_alt_exit(tty_t *t, int restorecursor)
 {
-   vt_state_t *v = &t->vt;
-   if (!v->alt || !v->altbuf)
-      return;
-   v->alt = 0;
-   memcpy(vt_screen(t), v->altbuf, VT_SCREEN_SIZE);
-   if (restorecursor) {
-      t->ddl->curx = v->savx;
-      t->ddl->cury = v->savy;
-      v->sgr = v->savsgr;
-   }
-   vt_cursor_sync(t);
+    vt_state_t *v = &t->vt;
+    if (!v->alt)
+       return;
+    v->alt = 0;
+    memcpy(vt_screen(t), t->ddl->mem_ptr, VT_SCREEN_SIZE);
+    if (restorecursor) {
+       t->ddl->curx = v->savx;
+       t->ddl->cury = v->savy;
+       v->sgr = v->savsgr;
+    }
+    vt_cursor_sync(t);
+    vt_refresh(t);
 }
 
 static void vt_csi_dispatch(tty_t *t, char final)
 {
-   vt_state_t *v = &t->vt;
-   char params[24];
-   int n = v->csi_n;
-   int vals[16];
-   int cnt, p0, p1, private;
+    vt_state_t *v = &t->vt;
+    char params[48];
+    int n = v->csi_n;
+    int vals[32];
+    int cnt, p0, p1, private;
 
    private = (n > 0 && v->csi[0] == '?') ? 1 : 0;
    if (private) {
@@ -359,33 +340,38 @@ static void vt_csi_dispatch(tty_t *t, char final)
       vt_cursor_sync(t);
       break;
    case 'J':
-      switch (p0) {
-      case 0:
-         vt_clear_rect(t, t->ddl->curx, t->ddl->cury, VT_COLS - 1, t->ddl->cury, v->sgr);
-         vt_clear_rect(t, 0, t->ddl->cury + 1, VT_COLS - 1, VT_ROWS - 1, v->sgr);
-         break;
-      case 1:
-         vt_clear_rect(t, 0, 0, VT_COLS - 1, t->ddl->cury - 1, v->sgr);
-         vt_clear_rect(t, 0, t->ddl->cury, t->ddl->curx, t->ddl->cury, v->sgr);
-         break;
-      default:
-         vt_screen_clear(v, t->ddl, v->sgr);
-         break;
-      }
-      break;
-   case 'K':
-      switch (p0) {
-      case 0:
-         vt_clear_rect(t, t->ddl->curx, t->ddl->cury, VT_COLS - 1, t->ddl->cury, v->sgr);
-         break;
-      case 1:
-         vt_clear_rect(t, 0, t->ddl->cury, t->ddl->curx, t->ddl->cury, v->sgr);
-         break;
-      default:
-         vt_clear_rect(t, 0, t->ddl->cury, VT_COLS - 1, t->ddl->cury, v->sgr);
-         break;
-      }
-      break;
+       switch (p0) {
+       case 0:
+          vt_clear_rect(t, t->ddl->curx, t->ddl->cury, VT_COLS - 1, t->ddl->cury, v->sgr);
+          vt_clear_rect(t, 0, t->ddl->cury + 1, VT_COLS - 1, VT_ROWS - 1, v->sgr);
+          break;
+       case 1:
+          vt_clear_rect(t, 0, 0, VT_COLS - 1, t->ddl->cury - 1, v->sgr);
+          vt_clear_rect(t, 0, t->ddl->cury, t->ddl->curx, t->ddl->cury, v->sgr);
+          break;
+       case 2:
+          vt_screen_clear(v, t->ddl, v->sgr);
+          vt_refresh(t);
+          break;
+       default:
+          break;
+       }
+        break;
+    case 'K':
+       switch (p0) {
+       case 0:
+          vt_clear_rect(t, t->ddl->curx, t->ddl->cury, VT_COLS - 1, t->ddl->cury, v->sgr);
+          break;
+       case 1:
+          vt_clear_rect(t, 0, t->ddl->cury, t->ddl->curx, t->ddl->cury, v->sgr);
+          break;
+       case 2:
+          vt_clear_rect(t, 0, t->ddl->cury, VT_COLS - 1, t->ddl->cury, v->sgr);
+          break;
+       default:
+          break;
+       }
+       break;
    case '@': {
       int x = t->ddl->curx, y = t->ddl->cury;
       unsigned char *s = vt_screen(t);
@@ -393,10 +379,11 @@ static void vt_csi_dispatch(tty_t *t, char final)
       unsigned char *dst = s + (y * VT_COLS + x) * 2;
       if (count > VT_COLS - x)
          count = VT_COLS - x;
-      memmove(dst + count * 2, dst, (VT_COLS - x - count) * 2);
-      vt_clear_rect(t, x, y, x + count - 1, y, v->sgr);
-      break;
-   }
+     memmove(dst + count * 2, dst, (VT_COLS - x - count) * 2);
+       vt_clear_rect(t, x, y, x + count - 1, y, v->sgr);
+       vt_refresh(t);
+       break;
+    }
    case 'P': {
       int x = t->ddl->curx, y = t->ddl->cury;
       unsigned char *s = vt_screen(t);
@@ -404,10 +391,11 @@ static void vt_csi_dispatch(tty_t *t, char final)
       unsigned char *dst = s + (y * VT_COLS + x) * 2;
       if (count > VT_COLS - x)
          count = VT_COLS - x;
-      memmove(dst, dst + count * 2, (VT_COLS - x - count) * 2);
-      vt_clear_rect(t, VT_COLS - count, y, VT_COLS - 1, y, v->sgr);
-      break;
-   }
+    memmove(dst, dst + count * 2, (VT_COLS - x - count) * 2);
+       vt_clear_rect(t, VT_COLS - count, y, VT_COLS - 1, y, v->sgr);
+       vt_refresh(t);
+       break;
+    }
    case 'X': {
       int count = p0 <= 0 ? 1 : p0;
       vt_clear_rect(t, t->ddl->curx, t->ddl->cury,
@@ -421,12 +409,13 @@ static void vt_csi_dispatch(tty_t *t, char final)
          break;
       if (count > v->stb_bot - y + 1)
          count = v->stb_bot - y + 1;
-      memmove(s + (y + count) * VT_COLS * 2,
-              s + y * VT_COLS * 2,
-              (v->stb_bot - y + 1 - count) * VT_COLS * 2);
-      vt_clear_rect(t, 0, y, VT_COLS - 1, y + count - 1, v->sgr);
-      break;
-   }
+memmove(s + (y + count) * VT_COLS * 2,
+                s + y * VT_COLS * 2,
+                (v->stb_bot - y + 1 - count) * VT_COLS * 2);
+        vt_clear_rect(t, 0, y, VT_COLS - 1, y + count - 1, VT_DEFAULT_ATTR);
+        vt_refresh(t);
+        break;
+     }
    case 'M': {
       int y = t->ddl->cury, count = p0 <= 0 ? 1 : p0;
       unsigned char *s = vt_screen(t);
@@ -434,22 +423,29 @@ static void vt_csi_dispatch(tty_t *t, char final)
          break;
       if (count > v->stb_bot - y + 1)
          count = v->stb_bot - y + 1;
-      memmove(s + y * VT_COLS * 2,
-              s + (y + count) * VT_COLS * 2,
-              (v->stb_bot - y + 1 - count) * VT_COLS * 2);
-      vt_clear_rect(t, 0, v->stb_bot - count + 1, VT_COLS - 1, v->stb_bot, v->sgr);
-      break;
-   }
-   case 'S':
-      if (p0 <= 0) p0 = 1;
-      while (p0-- > 0)
-         vt_scroll_up(t, v->stb_top, v->stb_bot, v->sgr);
-      break;
-   case 'T':
-      if (p0 <= 0) p0 = 1;
-      while (p0-- > 0)
-         vt_scroll_down(t, v->stb_top, v->stb_bot, v->sgr);
-      break;
+ memmove(s + y * VT_COLS * 2,
+                s + (y + count) * VT_COLS * 2,
+                (v->stb_bot - y + 1 - count) * VT_COLS * 2);
+        vt_clear_rect(t, 0, v->stb_bot - count + 1, VT_COLS - 1, v->stb_bot, VT_DEFAULT_ATTR);
+        vt_refresh(t);
+        break;
+     }
+   case 'S': {
+       int span = v->stb_bot - v->stb_top + 1;
+       if (p0 <= 0) p0 = 1;
+       if (p0 > span) p0 = span;
+       while (p0-- > 0)
+           vt_scroll_up(t, v->stb_top, v->stb_bot, VT_DEFAULT_ATTR);
+        break;
+     }
+    case 'T': {
+        int span = v->stb_bot - v->stb_top + 1;
+        if (p0 <= 0) p0 = 1;
+        if (p0 > span) p0 = span;
+        while (p0-- > 0)
+           vt_scroll_down(t, v->stb_top, v->stb_bot, VT_DEFAULT_ATTR);
+        break;
+     }
    case 'm':
       vt_apply_sgr(t, params);
       break;
@@ -543,51 +539,244 @@ void vt_screen_clear(vt_state_t *v, struct _dex32_direct_device_hdl *ddl, int at
 
 void vt_cursor_set_visible(struct _dex32_direct_device_hdl *ddl, int visible)
 {
-   (void)ddl;
-   /* VGA CRTC cursor scan lines: index 0x0A = start, 0x0C = end.
-      Setting the start to 0x18 (out of range) hides the hardware
-      cursor; 0x0C..0x0E restores the normal half-height cursor. */
-   if (!visible) {
-      outportb(0x3D4, 0x0A);
-      outportb(0x3D5, 0x18);
-      outportb(0x3D4, 0x0C);
-      outportb(0x3D5, 0x18);
-   } else {
-      outportb(0x3D4, 0x0A);
-      outportb(0x3D5, 0x0C);
-      outportb(0x3D4, 0x0C);
-      outportb(0x3D5, 0x0E);
-   }
+    if (!ddl)
+       return;
+    /* VGA CRTC cursor scan lines are only valid on a real 0xB8000 text
+       console. A GOP/VBE framebuffer has no VGA CRTC; those ports can
+       hang or reset the PCH, so use the software block cursor instead. */
+    if ((unsigned long)ddl->hdw_ptr != 0xB8000UL) {
+       fbconsole_cursor_visible(visible);
+       return;
+    }
+    if (!visible) {
+       outportb(0x3D4, 0x0A);
+       outportb(0x3D5, 0x18);
+       outportb(0x3D4, 0x0C);
+       outportb(0x3D5, 0x18);
+    } else {
+       outportb(0x3D4, 0x0A);
+       outportb(0x3D5, 0x0C);
+       outportb(0x3D4, 0x0C);
+       outportb(0x3D5, 0x0E);
+    }
+}
+
+static void vt_serial_clamp(vt_state_t *v)
+{
+    if (v->serx < 0) v->serx = 0;
+    if (v->serx >= VT_COLS) v->serx = VT_COLS - 1;
+    if (v->sery < 0) v->sery = 0;
+    if (v->sery >= VT_ROWS) v->sery = VT_ROWS - 1;
+}
+
+static int vt_csi_serial_params(vt_state_t *v, char *params, int *vals)
+{
+    int n = v->csi_n;
+    int private, cnt;
+
+    private = (n > 0 && v->csi[0] == '?') ? 1 : 0;
+    if (private) {
+       n--;
+       if (n > 0)
+          memcpy(params, v->csi + 1, n);
+    } else if (n > 0) {
+       memcpy(params, v->csi, n);
+    }
+    params[n < (int)sizeof(params) ? n : (int)sizeof(params) - 1] = 0;
+
+    cnt = vt_parse_params(params, vals, 16);
+    if (cnt < 0)
+       cnt = 0;
+    return cnt;
+}
+
+/* Serial ttys pass bytes through to COM1, but they still track a lightweight
+   cursor model so DSR-6 and basic cursor-position queries work in headless
+   serial tests. */
+static void vt_serial_feed(tty_t *t, int c)
+{
+    vt_state_t *v = &t->vt;
+
+   switch (v->state) {
+    case VT_S_OSC:
+        if (c == 0x07)
+           v->state = VT_S_GROUND;
+        else if (c == 0x1B)
+           v->state = VT_S_OSC_ESC;
+        return;
+
+    case VT_S_OSC_ESC:
+        if (c != 0x1B)
+           v->state = VT_S_GROUND;
+        return;
+
+    case VT_S_ESC:
+        if (c == '[') {
+           v->state = VT_S_CSI;
+           v->csi_n = 0;
+        } else if (c == ']') {
+           v->state = VT_S_OSC;
+        } else if (c == '7') {
+           v->savx = v->serx;
+           v->savy = v->sery;
+           v->state = VT_S_GROUND;
+        } else if (c == '8') {
+           v->serx = v->savx;
+           v->sery = v->savy;
+           vt_serial_clamp(v);
+           v->state = VT_S_GROUND;
+        } else {
+           v->state = VT_S_GROUND;
+        }
+        return;
+
+    case VT_S_CSI:
+       if (c == 0x1B) {
+          v->state = VT_S_ESC;
+          return;
+       }
+      if (c >= 0x40 && c <= 0x7E) {
+           char params[48];
+           int vals[32], cnt, p0, p1;
+           cnt = vt_csi_serial_params(v, params, vals);
+          p0 = cnt > 0 ? vals[0] : 0;
+          p1 = cnt > 1 ? vals[1] : 0;
+          switch ((char)c) {
+          case 'H': case 'f':
+             v->sery = (p0 <= 0 ? 1 : p0) - 1;
+             v->serx = (p1 <= 0 ? 1 : p1) - 1;
+             break;
+          case 'A':
+             if (p0 <= 0) p0 = 1;
+             v->sery -= p0;
+             break;
+          case 'B': case 'e':
+             if (p0 <= 0) p0 = 1;
+             v->sery += p0;
+             break;
+          case 'C':
+             if (p0 <= 0) p0 = 1;
+             v->serx += p0;
+             break;
+          case 'D':
+             if (p0 <= 0) p0 = 1;
+             v->serx -= p0;
+             break;
+          case 'E':
+             if (p0 <= 0) p0 = 1;
+             v->sery += p0;
+             v->serx = 0;
+             break;
+          case 'F':
+             if (p0 <= 0) p0 = 1;
+             v->sery -= p0;
+             v->serx = 0;
+             break;
+          case 'G': case '`':
+             v->serx = (p0 <= 0 ? 1 : p0) - 1;
+             break;
+          case 'd':
+              v->sery = (p0 <= 0 ? 1 : p0) - 1;
+              break;
+           case 's':
+              v->savx = v->serx;
+              v->savy = v->sery;
+              break;
+           case 'u':
+              v->serx = v->savx;
+              v->sery = v->savy;
+              break;
+           case 'n':
+              if (p0 == 6)
+                 vt_dsr_response(t);
+              break;
+          default:
+             break;
+          }
+          vt_serial_clamp(v);
+          v->state = VT_S_GROUND;
+          return;
+       }
+       if (c >= 0x20 && c <= 0x3F) {
+          if (v->csi_n < (int)sizeof(v->csi) - 1)
+             v->csi[v->csi_n++] = (char)c;
+       } else {
+          v->state = VT_S_GROUND;
+       }
+       return;
+
+    default:
+       break;
+    }
+
+    if (c == 0x1B) {
+       v->state = VT_S_ESC;
+       return;
+    }
+    if (c == '\r') {
+       v->serx = 0;
+       return;
+    }
+    if (c == '\n') {
+       v->sery++;
+       vt_serial_clamp(v);
+       return;
+    }
+    if (c == '\b') {
+       if (v->serx > 0)
+          v->serx--;
+       return;
+    }
+    if (c == '\t') {
+       while (v->serx < VT_COLS && (v->serx & 7) != 0)
+          v->serx++;
+       vt_serial_clamp(v);
+       return;
+    }
+    if (c < 0x20)
+       return;
+    if (v->serx >= VT_COLS) {
+       v->serx = 0;
+       v->sery++;
+    }
+    v->serx++;
+    vt_serial_clamp(v);
 }
 
 void vt_feed(tty_t *t, int c)
 {
-   vt_state_t *v;
-   if (!t)
-      return;
-   if (t->flags & TTY_SERIAL) {
-      serial_putc((char)c);
-      return;
-   }
+    vt_state_t *v;
+    if (!t)
+       return;
+    if (t->flags & TTY_SERIAL) {
+       serial_putc((char)c);
+       vt_serial_feed(t, c);
+       return;
+    }
    if (!t->ddl)
       return;
    v = &t->vt;
 
    switch (v->state) {
-   case VT_S_OSC:
-      if (c == 0x07)
-         v->state = VT_S_GROUND;
-      else if (c == 0x1B)
-         v->state = VT_S_ESC;
-      return;
+    case VT_S_OSC:
+       if (c == 0x07)
+          v->state = VT_S_GROUND;
+       else if (c == 0x1B)
+          v->state = VT_S_OSC_ESC;
+       return;
 
-   case VT_S_ESC:
-      if (c == '[') {
-         v->state = VT_S_CSI;
-         v->csi_n = 0;
-      } else if (c == ']') {
-         v->state = VT_S_OSC;
-      } else if (c == '7') {
+    case VT_S_OSC_ESC:
+       if (c != 0x1B)
+          v->state = VT_S_GROUND;
+       return;
+
+    case VT_S_ESC:
+       if (c == '[') {
+          v->state = VT_S_CSI;
+          v->csi_n = 0;
+       } else if (c == ']') {
+          v->state = VT_S_OSC;
+       } else if (c == '7') {
          v->savx = t->ddl->curx;
          v->savy = t->ddl->cury;
          v->savsgr = v->sgr;
@@ -598,9 +787,9 @@ void vt_feed(tty_t *t, int c)
          v->sgr = v->savsgr;
          v->state = VT_S_GROUND;
          vt_cursor_sync(t);
-      } else if (c == 'M') {
-         vt_reverse_index(t, v->sgr);
-         v->state = VT_S_GROUND;
+     } else if (c == 'M') {
+          vt_reverse_index(t);
+          v->state = VT_S_GROUND;
       } else if (c == 'c') {
          vt_ris(t);
       } else if (c != 0x1B) {
@@ -638,9 +827,9 @@ void vt_feed(tty_t *t, int c)
    case 0x1B:
       v->state = VT_S_ESC;
       return;
-   case '\n':
-      vt_index(t, v->sgr);
-      return;
+  case '\n':
+       vt_index(t);
+       return;
    case '\r':
       t->ddl->curx = 0;
       vt_cursor_sync(t);
@@ -656,11 +845,32 @@ void vt_feed(tty_t *t, int c)
       vt_cursor_sync(t);
       return;
    case '\a':
-      return;
-   default:
-      if (c < 0x20)
-         return;
-      vt_putchar(t, (char)c, v->sgr);
-      return;
-   }
+       return;
+    default:
+       if (c < 0x20)
+          return;
+       vt_putchar(t, (char)c, v->sgr);
+       return;
+    }
+}
+
+/* In-kernel probe for the `colortest` builtin: feeds a CSI byte stream
+   through the real DDL vt_feed path into a scratch vt_state and returns the
+   resulting sgr. A zeroed dummy DDL is borrowed only to select the DDL (not
+   serial) path; pure SGR sequences never reach vt_putchar, so nothing is
+   rendered. */
+int vt_sgr_probe(const char *seq)
+{
+    static struct _dex32_direct_device_hdl dummy;
+    tty_t t;
+    const char *p;
+
+    memset(&dummy, 0, sizeof(dummy));
+    memset(&t, 0, sizeof(t));
+    t.flags = 0;                 /* not TTY_SERIAL -> DDL vt_feed path */
+    t.ddl = &dummy;
+    vt_init(&t.vt);
+    for (p = seq; *p; p++)
+        vt_feed(&t, (unsigned char)*p);
+    return (int)t.vt.sgr;
 }

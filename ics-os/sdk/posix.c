@@ -25,6 +25,7 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/poll.h>
+#include <sys/icsos.h>
 #include <sys/socket.h>
 #include <net/if.h>
 #include <regex.h>
@@ -67,6 +68,8 @@ extern void exit(int status);
 #define FXN_GETDENTS 0xB4
 #define FXN_MMAP     0xB6
 #define FXN_MUNMAP   0xB7
+#define FXN_MPROTECT 0xB8
+#define FXN_MSYNC    0xB9
 #define FXN_TCGETATTR 0xC0
 #define FXN_TCSETATTR 0xC1
 #define FXN_TCFUSH    0xC2
@@ -84,6 +87,9 @@ extern void exit(int status);
 #define FXN_RECVFROM 0xCE
 #define FXN_NETCFG   0xCF
 #define FXN_DUP2     0xD0
+#define FXN_ICSOS_PROCLIST 0xD1
+#define FXN_ICSOS_SYSINFO  0xD2
+#define FXN_ICSOS_KILL     0xD3
 #define FXN_DELAY 0x9B
 #define FXN_PRECISTIME 0x96
 
@@ -316,140 +322,60 @@ int rename(const char *oldpath, const char *newpath)
    return r ? 0 : -1;
 }
 
-struct sdk_mm_map {
-   struct sdk_mm_map *next;
-   char *orig;
-   char *base;
-   size_t length;
-   size_t page_count;
-   unsigned long *free_pages;
-};
+/* mmap/munmap/mprotect/msync are thin wrappers over the kernel's VMA-backed
+   implementation (kernel/memory/dexmem.c).  The kernel owns the VA window
+   (disjoint from the sbrk malloc arena), the page tables, the lazy file-backed
+   demand loads, and the MAP_SHARED write-back.  mmap() passes its six
+   arguments by pointer in a struct mmap_args because they do not fit the
+   5-register DEX int 0x30 ABI. */
 
-static struct sdk_mm_map *sdk_mm_maps;
-
-static int
-sdk_mm_all_free(const struct sdk_mm_map *m)
-{
-   size_t i;
-   for (i = 0; i < m->page_count; i++)
-      if (!(m->free_pages[i >> 6] & (1UL << (i & 63))))
-         return 0;
-   return 1;
-}
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset)
 {
-   size_t page = 4096;
-   size_t pages;
-   size_t rlen;
-   size_t bitmap_words;
-   char *orig;
-   char *base;
-   struct sdk_mm_map *m;
-   ssize_t n;
-   (void)addr;
-   (void)prot;
+    struct mmap_args a;
+    long r;
 
-   if (length == 0)
-      return MAP_FAILED;
+    if (length == 0)
+       return MAP_FAILED;
 
-   /* Anonymous maps go through the kernel so they live in a VA window
-      disjoint from the sbrk malloc arena (required by GCC's zone GC). */
-   if ((flags & MAP_ANONYMOUS) || fd < 0) {
-      void *p = (void *)dexsdk_systemcall(FXN_MMAP, (long)length, (long)flags, 0, 0, 0);
-      if (!p || p == (void *)(long)-1)
-         return MAP_FAILED;
-      return p;
-   }
+    a.addr = (unsigned long)addr;
+    a.length = (unsigned long)length;
+    a.prot = (unsigned long)prot;
+    a.flags = (unsigned long)flags;
+    a.fd = (fd < 0) ? (unsigned long)-1 : (unsigned long)fd;
+    a.offset = (unsigned long)offset;
 
-   pages = (length + page - 1) / page;
-   rlen = pages * page;
-   orig = (char *)malloc(rlen + page);
-   if (!orig)
-      return MAP_FAILED;
-   base = (char *)((((size_t)orig + page - 1) & ~(size_t)(page - 1)));
-
-   if ((flags & MAP_ANONYMOUS) || fd < 0)
-      memset(base, 0, rlen);
-   else {
-      n = pread(fd, base, rlen, offset);
-      if (n < 0) {
-         free(orig);
-         return MAP_FAILED;
-      }
-      if ((size_t)n < rlen)
-         memset(base + n, 0, rlen - (size_t)n);
-   }
-
-   bitmap_words = (pages + 63) / 64;
-   m = (struct sdk_mm_map *)malloc(sizeof(*m));
-   if (!m) {
-      free(orig);
-      return MAP_FAILED;
-   }
-   m->free_pages = (unsigned long *)malloc(bitmap_words * sizeof(unsigned long));
-   if (!m->free_pages) {
-      free(m);
-      free(orig);
-      return MAP_FAILED;
-   }
-   memset(m->free_pages, 0, bitmap_words * sizeof(unsigned long));
-   m->next = sdk_mm_maps;
-   m->orig = orig;
-   m->base = base;
-   m->length = rlen;
-   m->page_count = pages;
-   sdk_mm_maps = m;
-   return base;
+    r = ics_sys(FXN_MMAP, (long)&a, 0, 0, 0, 0);
+    if (r < 0)
+       return MAP_FAILED;
+    return (void *)r;
 }
 
 int munmap(void *addr, size_t length)
 {
-   char *a = (char *)addr;
-   char *end;
-   struct sdk_mm_map *m;
-   struct sdk_mm_map *prev;
-   size_t first;
-   size_t last;
-   size_t i;
+    long r;
 
-   if (length == 0)
-      return 0;
+    if (length == 0)
+       return 0;
 
-   if (dexsdk_systemcall(FXN_MUNMAP, (long)addr, (long)length, 0, 0, 0) == 0)
-      return 0;
-
-   end = a + length;
-
-   m = sdk_mm_maps;
-   prev = 0;
-   while (m) {
-      if (a >= m->base && end <= m->base + m->length) {
-         first = (size_t)(a - m->base) / 4096;
-         last = (size_t)(end - 1 - m->base) / 4096;
-         for (i = first; i <= last; i++)
-            m->free_pages[i >> 6] |= (1UL << (i & 63));
-         if (sdk_mm_all_free(m)) {
-            if (prev)
-               prev->next = m->next;
-            else
-               sdk_mm_maps = m->next;
-            free(m->free_pages);
-            free(m->orig);
-            free(m);
-         }
-         return 0;
-      }
-      prev = m;
-      m = m->next;
-   }
-   return -1;
+    r = ics_sys(FXN_MUNMAP, (long)addr, (long)length, 0, 0, 0);
+    return (r < 0) ? -1 : 0;
 }
 
 int mprotect(void *addr, size_t len, int prot)
 {
-   (void)addr; (void)len; (void)prot;
-   return 0;
+    long r;
+
+    r = ics_sys(FXN_MPROTECT, (long)addr, (long)len, (long)prot, 0, 0);
+    return (r < 0) ? -1 : 0;
+}
+
+int msync(void *addr, size_t length, int flags)
+{
+    long r;
+
+    r = ics_sys(FXN_MSYNC, (long)addr, (long)length, (long)flags, 0, 0);
+    return (r < 0) ? -1 : 0;
 }
 
 double ldexp(double x, int exp)
@@ -1769,13 +1695,59 @@ int atexit(void (*fn)(void))
    return 0;
 }
 
+int icsos_proc_list(struct icsos_procinfo *buf, int max)
+{
+   long r;
+   if (max < 0) {
+      errno = EINVAL;
+      return -1;
+   }
+   r = (long)dexsdk_systemcall(FXN_ICSOS_PROCLIST, (long)buf, max, 0, 0, 0);
+   if (r < 0) {
+      errno = (int)(-r);
+      return -1;
+   }
+   return (int)r;
+}
+
+int icsos_sysinfo(struct icsos_sysinfo *info)
+{
+   if (!info) {
+      errno = EINVAL;
+      return -1;
+   }
+   return (int)ics_sys(FXN_ICSOS_SYSINFO, (long)info, 0, 0, 0, 0);
+}
+
+int icsos_kill(int pid, int sig)
+{
+   if (pid <= 0) {
+      errno = ESRCH;
+      return -1;
+   }
+   if (sig < 0 || sig > 255) {
+      errno = EINVAL;
+      return -1;
+   }
+   return (int)ics_sys(FXN_ICSOS_KILL, pid, sig, 0, 0, 0);
+}
+
 int kill(int pid, int sig)
 {
-   if (pid == getpid() || pid <= 0) {
-      _exit(sig ? (128 + (sig & 127)) : 1);
+   if (pid == getpid()) {
+      if (sig == 0)
+         return 0;
+      _exit(128 + (sig & 127));
    }
-   (void)sig;
-   return 0;
+   if (pid <= 0) {
+      errno = ESRCH;
+      return -1;
+   }
+   if (sig < 0 || sig > 255) {
+      errno = EINVAL;
+      return -1;
+   }
+   return icsos_kill(pid, sig);
 }
 
 int fcntl(int fd, int cmd, ...)
@@ -2740,73 +2712,120 @@ FILE *freopen(const char *path, const char *mode, FILE *stream)
     return 0;
 }
 
-/* fscanf: minimal scanf for the file/line reading NetHack's topten readentry()
-   performs.  Supports %s (whitespace-delimited token), %d (signed int) and
-   %c (single char) with width, and literal characters in the format.
+/* fscanf: minimal scanf for the FILE-based scanning NetHack performs (the
+   DLB directory in dlb.c readlibdir() and the topten scoreboard in topten.c).
+   Supports %s (whitespace-delimited token), %d/%u (int), %ld/%lu (long), and
+   %c (single char), each with an optional width and length modifier, plus
+   literal characters in the format.  A one-char pushback keeps the stream
+   positioned correctly so a literal (e.g. the space in "%c%s %ld") matches
+   the character that terminated the previous conversion.
    Returns the number of conversions (EOF => EOF). */
 int fscanf(FILE *f, const char *fmt, ...)
 {
     va_list ap;
     int matched = 0;
     int c;
+    int pushback = -1; /* one-char pushback so conversions don't eat a
+                          trailing separator the format still expects.  It is
+                          flushed into the stream via ungetc() on every return
+                          so a char pushed back at the end of one fscanf() call
+                          (e.g. the 'n' handling byte left by a trailing "\n"
+                          literal) survives into the next call - the FILE buffer
+                          is the only place such a char can persist. */
+#define fsgetc() (pushback >= 0 ? (c = pushback, pushback = -1) : (c = fgetc(f)))
+#define fspurk(ch) (pushback = (ch))
     if (!f || !fmt) return -1;
     va_start(ap, fmt);
     while (*fmt) {
         if (*fmt != '%') {
-            /* literal: skip leading whitespace in input, then match char */
-            do { c = fgetc(f); if (c == EOF) { va_end(ap); return matched; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
-            if (c != *fmt) { va_end(ap); return matched; }
+            if (*fmt == ' ' || *fmt == '\t' || *fmt == '\n' || *fmt == '\r') {
+                /* whitespace literal: consumes any run of whitespace in the
+                   input (scanf semantics); push back the first non-space so
+                   the next conversion sees it. */
+                do { fsgetc();                if (c == EOF) { va_end(ap); goto fscout; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+                if (c != EOF) fspurk(c);
+            } else {
+                /* non-whitespace literal: skip leading whitespace, then match */
+                do { fsgetc(); if (c == EOF) { va_end(ap); goto fscout; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+                if (c != *fmt) { fspurk(c); va_end(ap); goto fscout; }
+            }
             fmt++;
             continue;
         }
         fmt++;
+        /* optional assignment suppression (*) */
+        int suppress = 0;
+        if (*fmt == '*') { suppress = 1; fmt++; }
         /* optional width */
         int width = 0;
         while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+        /* optional length modifier (l for long, h/z ignored for value width) */
+        int islong = 0;
+        if (*fmt == 'l') { islong = 1; fmt++; if (*fmt == 'l') fmt++; }
+        else if (*fmt == 'h' || *fmt == 'z') { fmt++; }
         switch (*fmt) {
         case 's': {
             int n = 0;
-            char *dst = va_arg(ap, char *);
+            char *dst = suppress ? 0 : va_arg(ap, char *);
             /* skip whitespace */
-            do { c = fgetc(f); if (c == EOF) { va_end(ap); return matched; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+            do { fsgetc(); if (c == EOF) { va_end(ap); goto fscout; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
             while (c != EOF && c != ' ' && c != '\t' && c != '\n' && c != '\r' && (width == 0 || n < width)) {
                 if (dst && (n < 255)) dst[n] = (char)c;
                 n++;
-                c = fgetc(f);
+                fsgetc();
             }
+            if (c != EOF) fspurk(c); /* put back the terminating separator */
             if (dst) dst[n > 255 ? 255 : n] = 0;
             matched++;
             break;
         }
-        case 'd': {
-            int sign = 1, v = 0, got = 0;
-            int *dst = va_arg(ap, int *);
-            do { c = fgetc(f); if (c == EOF) { va_end(ap); return matched; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
-            if (c == '-') { sign = -1; c = fgetc(f); }
-            else if (c == '+') c = fgetc(f);
-            while (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); got++; c = fgetc(f); }
-            if (!got) { va_end(ap); return matched; }
-            if (dst) *dst = sign * v;
+        case 'd':
+        case 'u': {
+            int sign = 1, got = 0;
+            long v = 0;
+            do { fsgetc(); if (c == EOF) { va_end(ap); goto fscout; } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+            if (c == '-' && *fmt == 'd') { sign = -1; fsgetc(); }
+            else if (c == '+') fsgetc();
+            while (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); got++; fsgetc(); }
+            if (c != EOF) fspurk(c); /* put back the first non-digit */
+            if (!got) { va_end(ap); goto fscout; }
+            v *= sign;
+            if (!suppress) {
+                if (islong) {
+                    long *dst = va_arg(ap, long *);
+                    if (dst) *dst = v;
+                } else {
+                    int *dst = va_arg(ap, int *);
+                    if (dst) *dst = (int)v;
+                }
+            }
             matched++;
             break;
         }
         case 'c': {
-            char *dst = va_arg(ap, char *);
-            c = fgetc(f);
-            if (c == EOF) { va_end(ap); return matched; }
+            char *dst = suppress ? 0 : va_arg(ap, char *);
+            fsgetc();
+            if (c == EOF) { va_end(ap); goto fscout; }
             if (dst) *dst = (char)c;
             matched++;
             break;
         }
         default:
             /* unsupported conversion: skip one char, count as matched */
-            if (fgetc(f) == EOF) { va_end(ap); return matched; }
+            fsgetc();
+            if (c == EOF) { va_end(ap); goto fscout; }
+            fspurk(c);
             matched++;
             break;
         }
         fmt++;
     }
     va_end(ap);
+fscout:
+#undef fsgetc
+#undef fspurk
+    if (pushback >= 0)
+        ungetc(pushback, f); /* persist a trailing pushed-back char across calls */
     return matched;
 }
 

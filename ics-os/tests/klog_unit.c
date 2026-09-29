@@ -63,8 +63,12 @@ int main(void)
     check("wrap: oldest advanced to slot 5", klog_ring_oldest(&r) == 5);
     check("wrap: slot 5 holds the first surviving record (r5)",
           strcmp(klog_ring_at(&r, 5u)->text, "r5") == 0);
-    check("wrap: slot just before head holds the newest (r132)",
-          strcmp(klog_ring_at(&r, 4u)->text, "r132") == 0);
+    {
+        char newest[24];
+        sprintf(newest, "r%u", KLOG_COUNT + 4u);
+        check("wrap: slot just before head holds the newest",
+              strcmp(klog_ring_at(&r, 4u)->text, newest) == 0);
+    }
     check("wrap: a middle slot is intact (r6)",
           strcmp(klog_ring_at(&r, 6u)->text, "r6") == 0);
     check("wrap: tick follows its record",

@@ -262,31 +262,41 @@ long sys_ttyselect(long nfds, long rfds, long wfds, long efds, long tvp)
    }
 
    for (;;) {
-      count = 0;
-  for (fd = 0; fd < lim; fd++) {
-          if (rset && k_fd_bit(rset, fd)) {
-             if (posix_fd_selectable(fd, 0))
-                count++;
-             else
+       count = 0;
+   for (fd = 0; fd < lim; fd++) {
+           if (rset && k_fd_bit(rset, fd)) {
+              if (posix_fd_selectable(fd, 0))
+                 count++;
+           }
+           if (wset && k_fd_bit(wset, fd)) {
+              if (posix_fd_selectable(fd, 1))
+                 count++;
+           }
+        }
+       if (count) {
+          for (fd = 0; fd < lim; fd++) {
+             if (rset && k_fd_bit(rset, fd) && !posix_fd_selectable(fd, 0))
                 k_fd_clr(rset, fd);
-          }
-          if (wset && k_fd_bit(wset, fd)) {
-             if (posix_fd_selectable(fd, 1))
-                count++;
-             else
+             if (wset && k_fd_bit(wset, fd) && !posix_fd_selectable(fd, 1))
                 k_fd_clr(wset, fd);
           }
+          return count;
        }
-      if (count)
-         return count;
-      if (current_process && current_process->pending_sig == SIGINT) {
-         current_process->pending_sig = 0;
-         return -K_EINTR;
-      }
-      if (deadline >= 0) {
-         if (getprecisetime() >= deadline)
-            return 0;
-      }
-      taskswitch();
-   }
+       if (current_process && current_process->pending_sig == SIGINT) {
+          current_process->pending_sig = 0;
+          return -K_EINTR;
+       }
+       if (deadline >= 0) {
+          if (getprecisetime() >= deadline) {
+             for (fd = 0; fd < lim; fd++) {
+                if (rset && k_fd_bit(rset, fd))
+                   k_fd_clr(rset, fd);
+                if (wset && k_fd_bit(wset, fd))
+                   k_fd_clr(wset, fd);
+             }
+             return 0;
+          }
+       }
+       taskswitch();
+    }
 }

@@ -53,6 +53,9 @@ void fbconsole_clear_screen(void);
 /* Move the on-screen block cursor; restores the cell it leaves. */
 void fbconsole_cursor_to(int x, int y);
 
+/* Show or hide the on-screen block cursor at its current cell. */
+void fbconsole_cursor_visible(int visible);
+
 /* Guest selftest: absolute pixel, glyph, and cursor checks. Prints
    FBCONSOLE_PASS / FBCONSOLE_FAIL on the serial console. Leaves live GOP
    blitting on when COM1 is absent (laptop panel); leaves it off when COM1

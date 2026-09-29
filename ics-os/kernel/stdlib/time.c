@@ -1,3 +1,5 @@
+#include "../cpu/smp.h"
+
 DWORD time_count = 0,  //used to store the number of seconds since dex was booted
 aux_time2=0;   //since the OS has the timer set to interrupt 200 times a second
                //an auxillary counter is required so that it increments time_count
@@ -457,7 +459,12 @@ void time_incrementtime()
          };
 
    ticks++;
-    time_incrementtime();
+    {
+       int tid = smp_cpu_id();
+       if (tid >= 0 && tid < MAX_CPUS)
+          cpus[tid].ticks++;
+    }
+     time_incrementtime();
     selfhost_spin_watchdog();
     
     /* Floppy motor timeout and PIC EOI are BSP-only. APs use the LAPIC. */

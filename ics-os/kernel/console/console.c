@@ -29,6 +29,10 @@
 #include "klog.h"
 #include "../process/sync.h"
 #include "../net/wifi.h"
+#include "../hardware/vga/fbconsole.h"
+#include "../iomgr/iosched.h"
+
+extern int serial_com1_present(void);
 
 /* COM2 shell (shell2) line-discipline echo flag. Telnet clients typically
    perform local echo themselves, so echo defaults ON but can be disabled with
@@ -296,7 +300,12 @@ int user_execp(char *fname, DWORD mode, char *params){
        dex32_child_faulted = child_status != 0;
 
        fg_setmykeyboard(getprocessid());
-       if (dex32_child_faulted) {
+        {
+           tty_t *t = tty_fg();
+           if (t && t->vt.alt)
+              vt_alt_exit(t, 1);
+        }
+        if (dex32_child_faulted) {
           printf("execp: child faulted\n");
           return 0;
        }
@@ -823,6 +832,94 @@ void console_partitions()
         printf("No partitioned disks.\n");
 }
 
+static int console_screenshot(const char *path)
+{
+    unsigned w, h, x, y, yy, rows, cr = 32;
+    unsigned char hdr[32], *buf, *p, r, g, b;
+    file_PCB *f;
+    int n, ok = 1;
+
+    if (!fbconsole_geom(&w, &h, 0) || !w || !h) {
+        printf("SCREENSHOT_FAIL no-framebuffer path=%s\n", path);
+        return 0;
+    }
+    if (h < cr)
+        cr = h;
+    buf = (unsigned char *)malloc(w * cr * 3u);
+    f = openfilex(path, FILE_WRITE);
+    if (!buf || !f) {
+        if (buf)
+           free(buf);
+        printf("SCREENSHOT_FAIL alloc path=%s\n", path);
+        return 0;
+    }
+    n = sprintf((char *)hdr, "P6\n%u %u\n255\n", w, h);
+    if (n <= 0 || fwrite((char *)hdr, 1, n, f) != n)
+        ok = 0;
+    for (y = 0; ok && y < h; y += cr) {
+        rows = h - y < cr ? h - y : cr;
+        p = buf;
+        for (yy = 0; yy < rows; yy++) {
+            for (x = 0; x < w; x++) {
+                if (!fbconsole_rgb_at(x, y + yy, &r, &g, &b)) {
+                    ok = 0;
+                    break;
+                }
+                p[0] = r; p[1] = g; p[2] = b; p += 3;
+            }
+            if (!ok)
+                break;
+        }
+        if (ok && fwrite((char *)buf, 1, (int)(w * rows * 3u), f) != (int)(w * rows * 3u))
+            ok = 0;
+    }
+    if (fclose(f))
+        ok = 0;
+    free(buf);
+    if (ok)
+        iomgr_flushmgr();
+    if (ok)
+        printf("SCREENSHOT_OK path=%s width=%u height=%u\n", path, w, h);
+    else
+        printf("SCREENSHOT_FAIL write path=%s\n", path);
+    return ok;
+}
+
+/* Drive the real VT SGR parser (DDL vt_feed path) on scratch state and verify
+   the resulting cell attribute. Integration complement to the host TAP in
+   tests/vt_color_unit.c: proves the CSI dispatch + vt_feed byte path maps
+   256-color and truecolor SGR onto the 16-color palette, independent of
+   whether the live console tty is serial- or DDL-backed. */
+static void console_colortest(void)
+{
+    int ok = 1;
+    int sgr;
+
+    sgr = vt_sgr_probe("\033[0m");
+    if (sgr != 0x07) { ok = 0; printf("COLORTEST_FAIL reset sgr=0x%x\n", sgr); }
+
+    sgr = vt_sgr_probe("\033[38;5;196m");      /* 256 fg: pure red -> palette 4 */
+    if ((sgr & 0x0F) != 4) { ok = 0; printf("COLORTEST_FAIL fg256 sgr=0x%x\n", sgr); }
+
+    sgr = vt_sgr_probe("\033[48;5;21m");       /* 256 bg: blue -> palette 1 */
+    if (((sgr >> 4) & 0x0F) != 1) { ok = 0; printf("COLORTEST_FAIL bg256 sgr=0x%x\n", sgr); }
+
+    sgr = vt_sgr_probe("\033[38;2;255;0;0m");  /* 24 fg: red -> palette 4 */
+    if ((sgr & 0x0F) != 4) { ok = 0; printf("COLORTEST_FAIL fg24 sgr=0x%x\n", sgr); }
+
+    sgr = vt_sgr_probe("\033[48;2;0;170;170m"); /* 24 bg: cyan -> palette 3 */
+    if (((sgr >> 4) & 0x0F) != 3) { ok = 0; printf("COLORTEST_FAIL bg24 sgr=0x%x\n", sgr); }
+
+    sgr = vt_sgr_probe("\033[91m");            /* bright fg red -> palette 12 */
+    if ((sgr & 0x0F) != 12) { ok = 0; printf("COLORTEST_FAIL fg9 sgr=0x%x\n", sgr); }
+
+    sgr = vt_sgr_probe("\033[101m");           /* bright bg red -> palette 12 */
+    if (((sgr >> 4) & 0x0F) != 12) { ok = 0; printf("COLORTEST_FAIL bg10 sgr=0x%x\n", sgr); }
+
+    if (ok)
+        printf("COLORTEST_OK vt=256+truecolor\n");
+}
+
 /* ==================================================================
    console_execute(const char *str):
    * This command is used to execute a console string.
@@ -1052,10 +1149,17 @@ int console_execute(const char *str){
           else
              printf("dmesg: usage: dmesg -l <0-7>\n");
        } else {
-          klog_dump(-1);
-       }
-    }else
-    if (strcmp(u,"cpuid") == 0){        //-- Displays CPU information.
+           klog_dump(-1);
+        }
+     }else
+     if (strcmp(u,"screenshot") == 0){   //-- Save the framebuffer as PPM. Args: [path]
+         char *p = strtok(0," ");
+         console_screenshot(p ? p : "/icsos/screenshot.ppm");
+      }else
+      if (strcmp(u,"colortest") == 0){    //-- Drive the VT SGR parser; verify 256/truecolor mapping.
+         console_colortest();
+      }else
+     if (strcmp(u,"cpuid") == 0){        //-- Displays CPU information.
       hardware_cpuinfo mycpu;
       hardware_getcpuinfo(&mycpu);
       hardware_printinfo(&mycpu);
@@ -1450,20 +1554,20 @@ int console_execute(const char *str){
            f = openfilex("/ramdisk/cc1probe.s", FILE_READ);
            if (f) {
               vfs_stat info;
-              static char cc1win[4104];
-              char cc1prev[8];
-              int cc1prevlen = 0;
-              int has_text = 0, has_func = 0;
-              int nr;
-              fstat(f, &info);
-              memset(cc1prev, 0, sizeof(cc1prev));
-              if (info.st_size < 4096) {
-                 printf("CC1_TEST_FAIL output size %lu\n", (unsigned long)info.st_size);
-                 ok = 0;
-              } else {
-                 while (!(has_text && has_func)) {
-                    int wlen;
-                    nr = (int)fread(cc1win + cc1prevlen, 1, 4096, f);
+              static char cc1win[2056];
+               char cc1prev[8];
+               int cc1prevlen = 0;
+               int has_text = 0, has_func = 0;
+               int nr;
+               fstat(f, &info);
+               memset(cc1prev, 0, sizeof(cc1prev));
+               if (info.st_size < 4096) {
+                  printf("CC1_TEST_FAIL output size %lu\n", (unsigned long)info.st_size);
+                  ok = 0;
+               } else {
+                  while (!(has_text && has_func)) {
+                     int wlen;
+                     nr = (int)fread(cc1win + cc1prevlen, 1, 2048, f);
                     if (nr <= 0)
                        break;
                     wlen = cc1prevlen + nr;
@@ -1790,16 +1894,19 @@ void console_main(){
    {
       int tflags = TTY_ECHO | TTY_ICANON | TTY_ISIG;
       struct _dex32_direct_device_hdl *tdl = (struct _dex32_direct_device_hdl *)myddl;
-      /* Headless oracle: when there is no real VGA framebuffer (a QEMU
-         -nographic boot, or a laptop with no VGA), the DDL's hardware
-         pointer is a malloc'd shadow buffer, not 0xB8000.  In that case the
-         console tty must be serial-backed so full-screen applications
-         (e.g. NetHack, which writes to the tty rather than the serial log)
-         are visible on the serial console.  vt_feed() routes TTY_SERIAL
-         bytes straight to COM1; a real VGA console keeps the DDL path. */
-      if (myddl && (myddl->hdw_ptr == 0 || (void *)myddl->hdw_ptr != (void *)0xB8000))
-         tflags |= TTY_SERIAL;
-      tty_t *t = tty_alloc(tdl, tflags);
+      /* Headless oracle: when there is no legacy VGA text console, the DDL's
+          hardware pointer is a malloc'd shadow buffer, not 0xB8000.  If a
+          real COM1 is present, the console tty must be serial-backed so
+          full-screen applications (e.g. NetHack, which writes to the tty
+          rather than the serial log) are visible on the serial console.
+          vt_feed() routes TTY_SERIAL bytes straight to COM1; a real VGA
+          console keeps the DDL path.  A COM1-less GUI/framebuffer boot must
+          not be serial-backed: TTY_SERIAL would send key echo to a missing
+          UART and make tty_read() poll an absent 16550 receiver. */
+       if (serial_com1_present() &&
+            myddl && (myddl->hdw_ptr == 0 || (void *)myddl->hdw_ptr != (void *)0xB8000))
+           tflags |= TTY_SERIAL;
+       tty_t *t = tty_alloc(tdl, tflags);
       tty_set_fg(t);
       tty_attach_proc(current_process, t);
       if (myfg && myfg != (fg_processinfo *)-1)

@@ -10,9 +10,9 @@
 #define KLOG_RING_H
 
 /* Sized to fit under the 4 MiB user-ELF kernel ceiling: the ring is static BSS
- * (~13 KiB at these settings). Tune up only after freeing kernel memory. */
+ * (~10 KiB at these settings). Tune up only after freeing kernel memory. */
 #define KLOG_LINE_MAX 96
-#define KLOG_COUNT    128
+#define KLOG_COUNT    96
 
 typedef struct {
     unsigned int   tick;   /* ticks at the moment the record was written */

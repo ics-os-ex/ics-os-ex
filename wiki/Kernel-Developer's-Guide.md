@@ -326,12 +326,16 @@ look for `RTL8821CE_PROBE_OK` / `POWER_OK` / `EFUSE_OK` / `FW_OK` / `MAC_OK` /
 file-backed BB/RF tables (`RTL8821CE_PHY_TABLES_TODO`).
 `make test-cdcacm-unit`, `make test-usbdbg-unit`,
 `make test-xhcipolicy-unit`, `make test-ttycanon-unit`,
+`make test-termcap-unit`, `make test-termtest`,
 `make test-usb-cdc-console` (both attach orders), and
 `make test-usb-cdc-pico` (real Pico via QEMU `usb-host`; SKIP if unplugged)
 are the gates.
 Canonical `read()` keeps unread line bytes (`tty_canon.h`); a 1-byte
 userland `read` used to drop the rest of `ls`. DDL output applies ONLCR
-so `\n` returns to column 0.
+so `\n` returns to column 0. `test-termtest` now covers DSR-6, relative
+cursor motion, edge clamping, DECSC/DECRST, bounded `SU`, and OSC `ST`
+termination; serial-backed ttys use a lightweight cursor model that
+supports the same DSR/save/restore subset rather than full VT emulation.
 
 The current USB compatibility path uses `kernel/hardware/dma.h` to validate its
 identity-mapped bus addresses against alignment, overflow, the 32-bit DMA mask,
@@ -568,9 +572,29 @@ The target writes `/tmp/icsos-ext4-e2fsck.log` and
  not light until an HID driver exists; Intel laptop internals are
  usually i8042.
  `make test-boot`, `make test-usb-uefi`, `make test-usb-uefi-gpt`, and
- `make test-ide-thumbdrive` all assert `FBCONSOLE_PASS` and cover the GRUB
- paths (BIOS VBE, UEFI GOP on MBR FAT, UEFI GOP on GPT ESP, embedded
- i386-pc core).
+  `make test-ide-thumbdrive` all assert `FBCONSOLE_PASS` and cover the GRUB
+  paths (BIOS VBE, UEFI GOP on MBR FAT, UEFI GOP on GPT ESP, embedded
+  i386-pc core).
+
+  The `screenshot` console command captures the active linear framebuffer as
+  a binary PPM file. It streams 32-row chunks, so kernel memory use stays
+  small even for a large GOP. `make test-screenshot` validates the guest
+  `SCREENSHOT_OK` marker plus host-side PPM header, geometry, and exact
+  byte-count readback. The FAT writer also keeps a per-volume sequential
+  write pointer so repeated appends do not re-walk the cluster chain from
+  the first cluster on every call.
+
+   The `htop` userland monitor (`ics-os/contrib/htop/`) uses the safe
+   process-observability syscalls `0xD1` (`sys_icsos_proc_list`), `0xD2`
+   (`sys_icsos_sysinfo`), and `0xD3` (`sys_icsos_kill`). `icsos_proc_list`
+   returns a bounded snapshot of PID, name, state, priority, CPU, CPU ticks,
+   and RSS pages. `icsos_sysinfo` reports CPU count, uptime, total CPU ticks,
+   and frame totals/free counts. `icsos_kill` is restricted: signal `0` is an
+   existence check, signals `1..15` request termination of user non-thread
+   processes, signals `>=16` are no-ops, and kernel/non-thread targets return
+   `EPERM`. `make test-htop` runs `--version`, `--selftest`, `--frame`, and
+   `--dump` headlessly and asserts `HTOP_SELFTEST_PASS`, `HTOP_PASS`, and
+   `HTOP_DUMP_OK`.
 
  The tmux-style multiplexer (`console/foreground.c`, `console_mux.h`)
  paints a blue status bar on row 24. The painter stops at NUL; a previous

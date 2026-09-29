@@ -758,7 +758,16 @@ int elf_loadmodule(char *module_name,char *elf_image,
   This avoids allocating the whole image (e.g. an 18 MiB cc1.exe) in the kernel
   heap.  It returns a process id on success, or 0 if the file is not an
   ELF64 executable or the stream load fails.
+
+  Segment file bytes are fetched in ELF64_STREAM_CHUNK-size batches (one
+  fseek+fread per chunk, not per 4KiB page): per-page VFS reads multiply
+  the filesystem's per-call cost (volume lock, FAT cluster-chain walk,
+  block-I/O submit/wait) by the page count and dominate load time on every
+  storage backend (ISO9660/CD, FAT/USB, virtio).  128KiB matches the
+  block-cache's PC_MAX_IO so a cold batch maps to a single device transfer.
 */
+#define ELF64_STREAM_CHUNK 0x20000ULL
+
 int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
                       PCB386 *parent)
 {
@@ -778,6 +787,8 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
   unsigned long long v, fsz, msz, off, va, x, dstoff, len, avail;
   unsigned long long fileoff;
   char pagebuf[4096];
+  char *chunk = 0;
+  unsigned long long chunk_fileoff = 0, chunk_len = 0;
   unsigned long pgdone = 0;
   int ret = 0;
 
@@ -902,6 +913,8 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
                       pagedir, PG_WR | PG_USER);
    addmemusage(&memptr, userheap, pages);
 
+   chunk = (char *)malloc((unsigned int)ELF64_STREAM_CHUNK);
+
    for (phi = 0; mapok && phi < (int)eh64->e_phnum; phi++) {
       if (ph64[phi].p_type == PT_LOAD && ph64[phi].p_memsz > 0) {
          v = ph64[phi].p_vaddr;
@@ -926,21 +939,54 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
             if (len > avail)
                len = avail;
             fileoff = off + (x - v);
-            if (fseek(f, (long)fileoff, SEEK_SET) != 0) {
-               printf("elf64-stream: fseek fail %s off=%llu\n",
-                      module_name, fileoff);
-               mapok = 0;
-               break;
+            if (chunk) {
+               /* Batched path: refetch only when [fileoff,fileoff+len)
+                  leaves the cached chunk.  Within a PT_LOAD the file
+                  offsets are contiguous, so one 128KiB fetch serves 32
+                  pages. */
+               if (fileoff < chunk_fileoff ||
+                   fileoff + len > chunk_fileoff + chunk_len) {
+                  unsigned long long want = ELF64_STREAM_CHUNK;
+                  if (fsize < fileoff + want)
+                     want = fsize - fileoff;
+                  if (want < len)
+                     want = len;
+                  if (fseek(f, (long)fileoff, SEEK_SET) != 0) {
+                     printf("elf64-stream: fseek fail %s off=%llu\n",
+                            module_name, fileoff);
+                     mapok = 0;
+                     break;
+                  }
+                  if (fread(chunk, (size_t)want, 1, f) != (int)want) {
+                     printf("elf64-stream: fread fail %s off=%llu len=%llu\n",
+                            module_name, fileoff,
+                            (unsigned long long)want);
+                     mapok = 0;
+                     break;
+                  }
+                  chunk_fileoff = fileoff;
+                  chunk_len = want;
+               }
+               memcpy((char *)KDIRECT((u64)(uintptr)fr) + dstoff,
+                      chunk + (fileoff - chunk_fileoff),
+                      (unsigned long)len);
+            } else {
+               /* Heap-exhausted fallback: original per-page read. */
+               if (fseek(f, (long)fileoff, SEEK_SET) != 0) {
+                  printf("elf64-stream: fseek fail %s off=%llu\n",
+                         module_name, fileoff);
+                  mapok = 0;
+                  break;
+               }
+               if (fread(pagebuf, (size_t)len, 1, f) != (int)len) {
+                  printf("elf64-stream: fread fail %s off=%llu len=%llu\n",
+                         module_name, fileoff, (unsigned long long)len);
+                  mapok = 0;
+                  break;
+               }
+               memcpy((char *)KDIRECT((u64)(uintptr)fr) + dstoff, pagebuf,
+                      (unsigned long)len);
             }
-            /* One fseek+fread per page: len <= 4096 covers the whole page. */
-            if (fread(pagebuf, (size_t)len, 1, f) != (int)len) {
-               printf("elf64-stream: fread fail %s off=%llu len=%llu\n",
-                      module_name, fileoff, (unsigned long long)len);
-               mapok = 0;
-               break;
-            }
-            memcpy((char *)KDIRECT((u64)(uintptr)fr) + dstoff, pagebuf,
-                   (unsigned long)len);
             if ((++pgdone & 0x7FUL) == 0) {
                /* SIGINT == 2; abort a wedged USB-root stream load. */
                if (current_process && current_process->pending_sig == 2) {
@@ -954,6 +1000,8 @@ int elf64_stream_load(char *module_name, int mode, char *p, char *workdir,
          }
       }
    }
+   if (chunk)
+      free(chunk);
    if (!mapok) {
       printf("elf64-stream: copy fail %s\n", module_name);
       userpd_free(upml4);

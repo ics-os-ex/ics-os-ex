@@ -14,6 +14,7 @@ QEMU_MEM=128M
 SMP_CPUS?=4
 SMP_MATRIX?=1 2 4 8
 FORK_CPUS?=2
+FORK_CMDLINE?=
 FORK_MATRIX?=1 2 4 8
 QEMU_NET=-net nic,model=rtl8139 -net none
 # QEMU can load the 32-bit multiboot kernel the same way GRUB does.
@@ -37,7 +38,8 @@ vmdex:
 	make -C kernel/
 
 .PHONY: usb-uefi usb-etcher test-usb-uefi-gpt test-vbox-uefi-gpt test-vbox-uefi-gpt-bios test-bochs-uefi-gpt test-usb-cdc-pico test-nethack
-.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-netdhcp-unit test-net-stress test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-memcorrupt test-asloop test-fork test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-selfhost-cert-usb test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-ttycanon-unit test-usbdbg-unit test-rtwfw-unit test-rtwphy-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
+.PHONY: test-screenshot
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-netdhcp-unit test-net-stress test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-memcorrupt test-asloop test-fork test-fork-switch-gap test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-selfhost-cert-usb test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-vtcolor-unit test-vtcolor-guest test-vtcolor-xhci test-vim-xhci test-nethack-xhci test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-termcap-unit test-ttycanon-unit test-usbdbg-unit test-rtwfw-unit test-rtwphy-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -78,6 +80,14 @@ test-fbconsole-unit:
 	@mkdir -p /tmp/icsos-tests
 	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/fbconsole_geom_unit.c -o /tmp/icsos-tests/fbconsole_geom_unit
 	@/tmp/icsos-tests/fbconsole_geom_unit
+
+# VT 256/truecolor -> 16 palette mapping and SGR state machine (the exact code
+# linked into the kernel). Regression: color apps (vim/nethack) stay monochrome
+# when the termcap lacks Co, and "38;5;n"/"38;2;r;g;b" SGR is dropped.
+test-vtcolor-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/vt_color_unit.c kernel/console/vt_color.c -o /tmp/icsos-tests/vt_color_unit
+	@/tmp/icsos-tests/vt_color_unit
 
 # LCD line buffer used by extras/ics-esp32-serial-bridge (Waveshare ESP32-S3
 # debug bridge). Compiles the shared C source so the tested logic is exactly
@@ -131,6 +141,11 @@ test-rtwphy-unit:
 	@mkdir -p /tmp/icsos-tests
 	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/rtw_phy_unit.c -o /tmp/icsos-tests/rtw_phy_unit
 	@/tmp/icsos-tests/rtw_phy_unit
+
+test-termcap-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -Itests/termcap_host tests/termcap_unit.c sdk/termcap.c -o /tmp/icsos-tests/termcap_unit
+	@/tmp/icsos-tests/termcap_unit
 
 test-ttycanon-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -472,6 +487,74 @@ test-ide-thumbdrive: usb
 	@! grep -aq "no root filesystem mounted" /tmp/icsos-ide-thumbdrive.log
 	@! grep -aq "General Protection fault" /tmp/icsos-ide-thumbdrive.log
 	@echo "test-ide-thumbdrive PASS"
+
+# In-OS framebuffer capture: the `screenshot` builtin writes the active GOP/VBE
+# panel to a binary PPM file on the writable FAT root. Host readback validates
+# the PPM header, geometry, and exact byte count.
+test-screenshot: usb
+	@echo "Testing in-OS framebuffer screenshot..."
+	@rm -f /tmp/icsos-screenshot.ppm /tmp/icsos-screenshot-autoexec.bat
+	@cp --sparse=always ics-os-usb.img /tmp/icsos-screenshot.img
+	@printf '%s\n' '@echo off' 'screenshot /icsos/screenshot.ppm' 'reboot' \
+		> /tmp/icsos-screenshot-autoexec.bat
+	@mcopy -o -i "/tmp/icsos-screenshot.img@@$$((2048 * 512))" /tmp/icsos-screenshot-autoexec.bat ::autoexec.bat
+	@-timeout 180 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
+		-drive file=/tmp/icsos-screenshot.img,format=raw,if=ide -boot c \
+		< /dev/null > /tmp/icsos-screenshot.log 2>&1
+	@grep -aq "serial console ready" /tmp/icsos-screenshot.log
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-screenshot.log
+	@grep -aq "FBCONSOLE_PASS" /tmp/icsos-screenshot.log
+	@grep -aq "SCREENSHOT_OK path=/icsos/screenshot.ppm width=[1-9][0-9]* height=[1-9][0-9]*" /tmp/icsos-screenshot.log
+	@! grep -aq "SCREENSHOT_FAIL" /tmp/icsos-screenshot.log
+	@! grep -aq "General Protection fault" /tmp/icsos-screenshot.log
+	@mcopy -i "/tmp/icsos-screenshot.img@@$$((2048 * 512))" ::SCREENSH.PPM /tmp/icsos-screenshot.ppm
+	@python3 -c 'import pathlib,re,sys;d=pathlib.Path("/tmp/icsos-screenshot.ppm").read_bytes();m=re.match(rb"P6\n([1-9][0-9]*) ([1-9][0-9]*)\n255\n",d);w,h=(int(m.group(1)),int(m.group(2))) if m else (0,0);assert d[:2]==b"P6" and m and len(d)==m.end()+w*h*3 and w<=8192 and h<=8192, "screenshot: bad PPM"'
+	@echo "test-screenshot PASS"
+
+# In-guest VT color path: boots the USB image, runs the `colortest` builtin,
+# which drives the real DDL vt_feed SGR parser and verifies 256-color and
+# truecolor SGR map onto the 16-color palette. tty-mode independent (scratch
+# DDL probe), so it does not require a framebuffer console.
+test-vtcolor-guest: usb
+	@echo "Testing in-guest VT 256/truecolor SGR mapping..."
+	@rm -f /tmp/icsos-vtcolor-autoexec.bat
+	@cp --sparse=always ics-os-usb.img /tmp/icsos-vtcolor.img
+	@printf '%s\n' '@echo off' 'colortest' 'reboot' > /tmp/icsos-vtcolor-autoexec.bat
+	@mcopy -o -i "/tmp/icsos-vtcolor.img@@$$((2048 * 512))" /tmp/icsos-vtcolor-autoexec.bat ::autoexec.bat
+	@-timeout 180 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
+		-drive file=/tmp/icsos-vtcolor.img,format=raw,if=ide -boot c \
+		< /dev/null > /tmp/icsos-vtcolor.log 2>&1
+	@grep -aq "serial console ready" /tmp/icsos-vtcolor.log
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-vtcolor.log
+	@grep -aq "COLORTEST_OK vt=256+truecolor" /tmp/icsos-vtcolor.log
+	@! grep -aq "COLORTEST_FAIL" /tmp/icsos-vtcolor.log
+	@! grep -aq "General Protection fault" /tmp/icsos-vtcolor.log
+	@echo "test-vtcolor-guest PASS"
+
+# In-guest VT color path on the main distribution (GPT + FAT32 ESP) thumbdrive
+# booted over q35 xHCI + OVMF UEFI -- the real flashable product layout. Runs
+# the same `colortest` builtin as test-vtcolor-guest; the xHCI/FAT root is the
+# variable under test (GPT_DETECT usb0 + USB mass-storage root mount).
+test-vtcolor-xhci: usb-uefi
+	@echo "Testing in-guest VT 256/truecolor SGR on xHCI UEFI thumbdrive..."
+	@test -n "$(OVMF_FD)" || { echo "OVMF firmware not found (install ovmf)."; exit 1; }
+	@rm -f /tmp/icsos-vtcolor-xhci-autoexec.bat
+	@cp --sparse=always ics-os-uefi.img /tmp/icsos-vtcolor-xhci.img
+	@printf '%s\n' '@echo off' 'colortest' 'reboot' > /tmp/icsos-vtcolor-xhci-autoexec.bat
+	@mcopy -o -i "/tmp/icsos-vtcolor-xhci.img@@$$((2048 * 512))" /tmp/icsos-vtcolor-xhci-autoexec.bat ::autoexec.bat
+	@-timeout 90 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
+		-machine q35 -bios $(OVMF_FD) \
+		-drive if=none,id=stick,format=raw,file=/tmp/icsos-vtcolor-xhci.img \
+		-device qemu-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,drive=stick \
+		< /dev/null > /tmp/icsos-vtcolor-xhci.log 2>&1
+	@grep -aq "GPT_DETECT usb0" /tmp/icsos-vtcolor-xhci.log
+	@grep -aq "serial console ready" /tmp/icsos-vtcolor-xhci.log
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-vtcolor-xhci.log
+	@grep -aq "COLORTEST_OK vt=256+truecolor" /tmp/icsos-vtcolor-xhci.log
+	@! grep -aq "COLORTEST_FAIL" /tmp/icsos-vtcolor-xhci.log
+	@! grep -aq "General Protection fault" /tmp/icsos-vtcolor-xhci.log
+	@echo "test-vtcolor-xhci PASS"
 
 # UEFI thumbdrive boot: OVMF loads EFI/BOOT/BOOTX64.EFI from the USB stick,
 # then the kernel re-detects the USB mass-storage device and mounts it as root.
@@ -1337,23 +1420,51 @@ test-termtest: kernel/Kernel64.bin apps/termtest.exe
 	@! grep -aq "TERMTEST_FAIL" /tmp/icsos-termtest.log
 	@echo "test-termtest PASS"
 
+apps/htop.exe: contrib/htop/htop.c contrib/htop/Makefile
+	$(MAKE) -C contrib/htop install
+
+test-htop: kernel/Kernel64.bin apps/htop.exe
+	@$(MAKE) -C kernel all
+	@echo "Building Multiboot2 ISO for htop..."
+	@rm -rf /tmp/icsos-htop-iso
+	@mkdir -p /tmp/icsos-htop-iso/boot/grub /tmp/icsos-htop-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-htop-iso/vmdex
+	@cp apps/htop.exe /tmp/icsos-htop-iso/apps/htop.exe
+	@printf '%s\n' 'htop --version' 'htop --selftest' 'htop --frame' 'htop --dump' 'reboot' \
+		> /tmp/icsos-htop-iso/autoexec.bat
+	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
+		> /tmp/icsos-htop-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-htop.iso /tmp/icsos-htop-iso >/dev/null 2>&1
+	@echo "Running htop test (TCG)..."
+	@-timeout 60 $(QEMU_X64) -nographic -no-reboot -m 256M \
+		-cdrom /tmp/icsos-htop.iso -boot d \
+		< /dev/null > /tmp/icsos-htop.log 2>&1
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-htop.log
+	@grep -aq "htop 0.1 (ICS-OS)" /tmp/icsos-htop.log
+	@grep -aq "HTOP_SELFTEST_PASS" /tmp/icsos-htop.log
+	@grep -aq "HTOP_PASS" /tmp/icsos-htop.log
+	@grep -aq "HTOP_DUMP_OK" /tmp/icsos-htop.log
+	@! grep -aq "HTOP_FAIL" /tmp/icsos-htop.log
+	@echo "test-htop PASS"
+
 # vim (FEAT_TINY) smoke test: `vim --version` must print the banner and exit
 # cleanly, proving the ELF64 TUI loader + tty/dup stack run a real editor.
-apps/vim.exe: contrib/vim/Makefile contrib/vim/config.icsos.h
+apps/vim.exe: contrib/vim/Makefile contrib/vim/config.icsos.h contrib/vim/pathdef.c contrib/vim/defaults.vim
 	$(MAKE) -C contrib/vim install
 
 test-vim: kernel/Kernel64.bin apps/vim.exe
 	@echo "Building Multiboot2 ISO for vim smoke test..."
 	@rm -rf /tmp/icsos-vim-iso
-	@mkdir -p /tmp/icsos-vim-iso/boot/grub /tmp/icsos-vim-iso/apps
+	@mkdir -p /tmp/icsos-vim-iso/boot/grub /tmp/icsos-vim-iso/apps /tmp/icsos-vim-iso/share/vim/runtime
 	@cp kernel/Kernel64.bin /tmp/icsos-vim-iso/vmdex
 	@cp apps/vim.exe /tmp/icsos-vim-iso/apps/vim.exe
+	@cp contrib/vim/defaults.vim /tmp/icsos-vim-iso/share/vim/runtime/defaults.vim
 	@printf '%s\n' 'vimtest' 'reboot' > /tmp/icsos-vim-iso/autoexec.bat
 	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
 		> /tmp/icsos-vim-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-vim.iso /tmp/icsos-vim-iso >/dev/null 2>&1
 	@echo "Running vim --version smoke test (TCG)..."
-	@-timeout 55 $(QEMU_X64) -nographic -no-reboot -m 256M \
+	@-timeout 120 $(QEMU_X64) -nographic -no-reboot -m 512M \
 		-cdrom /tmp/icsos-vim.iso -boot d \
 		< /dev/null > /tmp/icsos-vim.log 2>&1
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-vim.log
@@ -1363,27 +1474,63 @@ test-vim: kernel/Kernel64.bin apps/vim.exe
 	@! grep -aq "VIM_RUN_FAIL" /tmp/icsos-vim.log
 	@echo "test-vim PASS"
 
-# NetHack 3.6.7 smoke test: boot the game and verify it reaches the interactive
-# character-creation screen (the copyright banner), which requires the TTY
-# windowing system, the termcap library, and the nhdat DLB resource (data,
-# dungeon, oracles, rumors, symbols, options, ...) to all load successfully.
+# Same vim --version smoke test, but on the main distribution (GPT + FAT32 ESP)
+# thumbdrive booted over q35 xHCI + OVMF. The dist image ships /apps/vim.exe;
+# only the autoexec is swapped to drive the vimtest builtin.
+test-vim-xhci: usb-uefi
+	@echo "Testing vim --version on xHCI UEFI thumbdrive..."
+	@test -n "$(OVMF_FD)" || { echo "OVMF firmware not found (install ovmf)."; exit 1; }
+	@rm -f /tmp/icsos-vim-xhci-autoexec.bat
+	@cp --sparse=always ics-os-uefi.img /tmp/icsos-vim-xhci.img
+	@printf '%s\n' 'vimtest' 'reboot' > /tmp/icsos-vim-xhci-autoexec.bat
+	@mcopy -o -i "/tmp/icsos-vim-xhci.img@@$$((2048 * 512))" /tmp/icsos-vim-xhci-autoexec.bat ::autoexec.bat
+	@-timeout 90 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
+		-machine q35 -bios $(OVMF_FD) \
+		-drive if=none,id=stick,format=raw,file=/tmp/icsos-vim-xhci.img \
+		-device qemu-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,drive=stick \
+		< /dev/null > /tmp/icsos-vim-xhci.log 2>&1
+	@grep -aq "GPT_DETECT usb0" /tmp/icsos-vim-xhci.log
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-vim-xhci.log
+	@grep -aq "vimtest: running" /tmp/icsos-vim-xhci.log
+	@grep -aq "VIM - Vi IMproved" /tmp/icsos-vim-xhci.log
+	@grep -aq "9.2" /tmp/icsos-vim-xhci.log
+	@! grep -aq "VIM_RUN_FAIL" /tmp/icsos-vim-xhci.log
+	@echo "test-vim-xhci PASS"
+
+# NetHack 3.6.7 smoke test: boot the game, create a character, and drive it to
+# the first level ("<name>, welcome to NetHack!"), which requires the TTY
+# windowing system, the termcap library, and the data resources (the nhdat DLB
+# plus the filesystem random-text file `engrave`) to all load successfully.
 #
 # Data layout (NetHack has CHDIR/NOCWD_ASSUMPTIONS/VAR_PLAYGROUND undefined, so
 # it opens "nhdat" as a bare relative path against the process cwd, which the
 # kernel sets to the vfs root "/"):
 #   /nhdat        -- the packed DLB resource (built by make_dlb from dat/*)
+#   /engrave      -- random engravings; a filesystem data file (NOT in nhdat),
+#                    read via dlb_fopen()'s fopen_datafile() fallback
 #   /etc/termcap  -- the xterm termcap entry (tclib.c default TERMCAP)
 #   /apps/nethack.exe
 apps/nethack.exe: contrib/nethack/Makefile
 	$(MAKE) -C contrib/nethack install
 
-test-nethack: kernel/Kernel64.bin apps/nethack.exe base/nethack/nhdat base/nethack/sysconf base/etc/termcap
-	@echo "Building Multiboot2 ISO for NetHack smoke test..."
+test-nethack: kernel/Kernel64.bin apps/nethack.exe base/nethack/nhdat base/nethack/engrave base/nethack/sysconf base/etc/termcap
+	@echo "Building Multiboot2 ISO for NetHack character-creation test..."
 	@rm -rf /tmp/icsos-nethack-iso
 	@mkdir -p /tmp/icsos-nethack-iso/boot/grub /tmp/icsos-nethack-iso/apps /tmp/icsos-nethack-iso/etc /tmp/icsos-nethack-iso/nethack
 	@cp kernel/Kernel64.bin /tmp/icsos-nethack-iso/vmdex
 	@cp apps/nethack.exe /tmp/icsos-nethack-iso/apps/nethack.exe
+	# The committed nethack.exe has HACKDIR "/icsos/nethack" baked in, so its
+	# data (nhdat, sysconf, symbols, options, help, ...) must live in a
+	# /nethack/ directory on the CD (which mounts at /icsos).  We also pass
+	# "-d /icsos/nethack" on the command line so the data dir does not depend
+	# on the compiled-in default.
 	@cp base/nethack/nhdat /tmp/icsos-nethack-iso/nethack/nhdat
+	# engrave is a filesystem random-text data file (not packed in nhdat);
+	# dlb_fopen() falls back to fopen_datafile() so the game reads it from the
+	# data dir.  It is xcrypt-obfuscated (generated by gen_engrave from
+	# contrib/nethack/src/dat/engrave.txt) and must be staged like nhdat.
+	@cp base/nethack/engrave /tmp/icsos-nethack-iso/nethack/engrave
 	@cp base/nethack/symbols /tmp/icsos-nethack-iso/nethack/symbols
 	@cp base/nethack/data.base /tmp/icsos-nethack-iso/nethack/data.base
 	@cp base/nethack/options /tmp/icsos-nethack-iso/nethack/options
@@ -1395,29 +1542,142 @@ test-nethack: kernel/Kernel64.bin apps/nethack.exe base/nethack/nhdat base/netha
 	@cp base/nethack/license /tmp/icsos-nethack-iso/nethack/license
 	@cp base/nethack/sysconf /tmp/icsos-nethack-iso/nethack/sysconf
 	@cp base/etc/termcap /tmp/icsos-nethack-iso/etc/termcap
-	@printf '%s\n' 'nethack' 'reboot' > /tmp/icsos-nethack-iso/autoexec.bat
+	# NetHack's USE_FCNTL locker opens the HLOCK "perm" file O_RDWR, so the
+	# data dir must be writable.  The CD-ROM root is read-only, so the game is
+	# staged onto the writable RAM disk (/ramdisk, 16 MiB) at boot and run from
+	# there.  Create the empty lock file now; it is copied to the RAM disk.
+	@: > /tmp/icsos-nethack-iso/nethack/perm
+	# The CD-ROM mounts at /icsos, so the ISO /nethack/ tree is /icsos/nethack/.
+	@printf '%s\n' \
+		'mkdir /ramdisk/nethack' \
+		'cp /icsos/nethack/nhdat /ramdisk/nethack/nhdat' \
+		'cp /icsos/nethack/engrave /ramdisk/nethack/engrave' \
+		'cp /icsos/nethack/sysconf /ramdisk/nethack/sysconf' \
+		'cp /icsos/nethack/options /ramdisk/nethack/options' \
+		'cp /icsos/nethack/symbols /ramdisk/nethack/symbols' \
+		'cp /icsos/nethack/perm /ramdisk/nethack/perm' \
+		'cp /icsos/nethack/data.base /ramdisk/nethack/data.base' \
+		'cp /icsos/nethack/help /ramdisk/nethack/help' \
+		'cp /icsos/nethack/hh /ramdisk/nethack/hh' \
+		'cp /icsos/nethack/wizhelp /ramdisk/nethack/wizhelp' \
+		'cp /icsos/nethack/history /ramdisk/nethack/history' \
+		'cp /icsos/nethack/quest.txt /ramdisk/nethack/quest.txt' \
+		'cp /icsos/nethack/license /ramdisk/nethack/license' \
+		'nethack -d /ramdisk/nethack' \
+		'reboot' > /tmp/icsos-nethack-iso/autoexec.bat
 	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
 		> /tmp/icsos-nethack-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-nethack.iso /tmp/icsos-nethack-iso >/dev/null 2>&1
-	@echo "Running NetHack smoke test (TCG)..."
-	# NetHack's TTY window system prints a "Hit return to continue:" prompt
-	# (wintty.c getret()/xwaitforspace) whenever a raw_printf message appears
-	# (e.g. the read-only-CD "cannot write scoreboard" warning) and after the
-	# copyright banner, then blocks waiting for a newline on stdin.  The kernel
-	# COM1 tty is TTY_SERIAL-backed in headless (-nographic) mode, so bytes
-	# piped into QEMU stdin are routed to the foreground tty.  We feed a long
-	# stream of newlines to dismiss every prompt and let NetHack advance to the
-	# interactive player-selection screen, then hold for a few seconds so the
-	# screen (and the flushed copyright banner) are captured before the
-	# timeout kills QEMU.
-	@(for i in $(shell seq 1 200); do printf '\n'; sleep 0.4; done; sleep 8) | \
-		timeout 120 $(QEMU_X64) -nographic -no-reboot -m 256M \
+	@echo "Running NetHack character-creation test (TCG)..."
+	# Drive a new character to the first level and assert the game actually
+	# started.  NetHack's TTY window prompts, in order:
+	#   (1) the multi-line copyright banner (a raw_printf, so the TTY layer
+	#       may also emit a "Hit return to continue" newline gate);
+	#   (2) "Who are you?" -> a character name (getline: one line);
+	#   (3) "Let NetHack pick for you? [ynaq]?" -> 'a' auto-picks
+	#       role/race/gender/alignment, skips the confirmation, and drops the
+	#       player into the dungeon.
+	# Once inside, the game prints "<name>, welcome to NetHack!  You are a ..."
+	# (allmain.c), which we assert on to prove a character was created and the
+	# first level started.  The kernel COM1 tty is TTY_SERIAL-backed in
+	# headless (-nographic) mode, so bytes piped into QEMU stdin are routed to
+	# the foreground tty.
+	@( sleep 30; \
+	   printf '\n'; sleep 3; \
+	   printf 'Tester\n'; sleep 5; \
+	   printf 'a'; sleep 8; \
+	   for i in $(shell seq 1 12); do printf '\n'; sleep 0.5; done; \
+	   sleep 15 ) | \
+		timeout 150 $(QEMU_X64) -nographic -no-reboot -m 256M \
 		-cdrom /tmp/icsos-nethack.iso -boot d \
 		> /tmp/icsos-nethack.log 2>&1 || true
 	@grep -aq "Root mount \[OK\]" /tmp/icsos-nethack.log
 	@grep -aq "NetHack, Copyright 1985-2023" /tmp/icsos-nethack.log
+	@grep -aq "welcome to NetHack!" /tmp/icsos-nethack.log
 	@! grep -aq "panic\|GPF\|Page fault" /tmp/icsos-nethack.log
 	@echo "test-nethack PASS"
+
+# Same NetHack smoke test on the main distribution (GPT + FAT32 ESP) thumbdrive
+# booted over q35 xHCI + OVMF. The dist ships /apps/nethack.exe and the data
+# files under /nethack/; cd there first so NetHack's bare-path opens
+# (sysconf/nhdat/...) resolve against the inherited workdir.
+test-nethack-xhci: usb-uefi apps/nethack.exe
+	@echo "Testing NetHack on xHCI UEFI thumbdrive..."
+	@test -n "$(OVMF_FD)" || { echo "OVMF firmware not found (install ovmf)."; exit 1; }
+	@rm -f /tmp/icsos-nethack-xhci-autoexec.bat
+	@printf '%s\n' 'cd /icsos/nethack' 'nethack -d /icsos/nethack' 'reboot' > /tmp/icsos-nethack-xhci-autoexec.bat
+	@cp --sparse=always ics-os-uefi.img /tmp/icsos-nethack-xhci.img
+	@mcopy -o -i "/tmp/icsos-nethack-xhci.img@@$$((2048 * 512))" /tmp/icsos-nethack-xhci-autoexec.bat ::autoexec.bat
+	@mcopy -o -i "/tmp/icsos-nethack-xhci.img@@$$((2048 * 512))" apps/nethack.exe ::/apps/nethack.exe
+	@(for i in $(shell seq 1 250); do printf '\n'; sleep 0.4; done; sleep 8) | \
+		timeout 150 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
+		-machine q35 -bios $(OVMF_FD) \
+		-drive if=none,id=stick,format=raw,file=/tmp/icsos-nethack-xhci.img \
+		-device qemu-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,drive=stick \
+		> /tmp/icsos-nethack-xhci.log 2>&1 || true
+	@grep -aq "GPT_DETECT usb0" /tmp/icsos-nethack-xhci.log
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-nethack-xhci.log
+	@grep -aq "NetHack, Copyright 1985-2023" /tmp/icsos-nethack-xhci.log
+	@! grep -aq "Unable to open SYSCF_FILE" /tmp/icsos-nethack-xhci.log
+	@! grep -aq "panic\|GPF\|Page fault" /tmp/icsos-nethack-xhci.log
+	@echo "test-nethack-xhci PASS"
+
+# Targeted test for the "process restart from entry point" bug.
+# If the bug is present, the startup marker appears multiple times.
+apps/restarttest.exe: contrib/restarttest/restarttest.c contrib/restarttest/Makefile
+	$(MAKE) -C contrib/restarttest install
+
+test-restart: kernel/Kernel64.bin apps/restarttest.exe
+	@echo "Building Multiboot2 ISO for restart test..."
+	@rm -rf /tmp/icsos-restart-iso
+	@mkdir -p /tmp/icsos-restart-iso/boot/grub /tmp/icsos-restart-iso/apps
+	@cp kernel/Kernel64.bin /tmp/icsos-restart-iso/vmdex
+	@cp apps/restarttest.exe /tmp/icsos-restart-iso/apps/restarttest.exe
+	@printf '%s\n' 'restarttest' 'reboot' > /tmp/icsos-restart-iso/autoexec.bat
+	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
+		> /tmp/icsos-restart-iso/boot/grub/grub.cfg
+	@grub-mkrescue -o /tmp/icsos-restart.iso /tmp/icsos-restart-iso >/dev/null 2>&1
+	@echo "Running restart test (TCG, 2 vCPUs)..."
+	@-timeout 60 $(QEMU_X64) -smp 2 -nographic -no-reboot -m 256M \
+		-cdrom /tmp/icsos-restart.iso -boot d \
+		< /dev/null > /tmp/icsos-restart.log 2>&1
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-restart.log
+	@STARTUP_COUNT=$$(grep -c "RESTART_TEST_CHILD_STARTUP" /tmp/icsos-restart.log 2>/dev/null || echo 0); \
+	echo "RESTART_TEST_CHILD_STARTUP count: $$STARTUP_COUNT"; \
+	if [ "$$STARTUP_COUNT" -gt 1 ] 2>/dev/null; then \
+		echo "FAIL: RESTART_TEST_CHILD_STARTUP appeared $$STARTUP_COUNT times (process is being restarted from entry point)"; \
+		exit 1; \
+	fi
+	@grep -aq "RESTART_TEST_PASS" /tmp/icsos-restart.log
+	@echo "test-restart PASS"
+
+# xHCI version of the restart test - reproduces the bug in the xHCI environment.
+test-restart-xhci: usb-uefi apps/restarttest.exe
+	@echo "Testing restart on xHCI UEFI thumbdrive..."
+	@test -n "$(OVMF_FD)" || { echo "OVMF firmware not found (install ovmf)."; exit 1; }
+	@rm -f /tmp/icsos-restart-xhci-autoexec.bat
+	@printf '%s\n' 'restarttest' 'reboot' > /tmp/icsos-restart-xhci-autoexec.bat
+	@cp --sparse=always ics-os-uefi.img /tmp/icsos-restart-xhci.img
+	@mcopy -o -i "/tmp/icsos-restart-xhci.img@@$$((2048 * 512))" /tmp/icsos-restart-xhci-autoexec.bat ::autoexec.bat
+	@mcopy -o -i "/tmp/icsos-restart-xhci.img@@$$((2048 * 512))" apps/restarttest.exe ::/apps/restarttest.exe
+	@(for i in $(shell seq 1 250); do printf '\n'; sleep 0.4; done; sleep 8) | \
+		timeout 150 $(QEMU_X64) -display none -serial stdio -no-reboot -m $(UEFI_MEM) -smp 2 \
+		-machine q35 -bios $(OVMF_FD) \
+		-drive if=none,id=stick,format=raw,file=/tmp/icsos-restart-xhci.img \
+		-device qemu-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,drive=stick \
+		> /tmp/icsos-restart-xhci.log 2>&1 || true
+	@grep -aq "GPT_DETECT usb0" /tmp/icsos-restart-xhci.log
+	@grep -aq "Root mount \[OK\]" /tmp/icsos-restart-xhci.log
+	@STARTUP_COUNT=$$(grep -c "RESTART_TEST_CHILD_STARTUP" /tmp/icsos-restart-xhci.log 2>/dev/null || echo 0); \
+	echo "RESTART_TEST_CHILD_STARTUP count: $$STARTUP_COUNT"; \
+	if [ "$$STARTUP_COUNT" -gt 1 ] 2>/dev/null; then \
+		echo "FAIL: RESTART_TEST_CHILD_STARTUP appeared $$STARTUP_COUNT times (process is being restarted from entry point)"; \
+		exit 1; \
+	fi
+	@grep -aq "RESTART_TEST_PASS" /tmp/icsos-restart-xhci.log
+	@echo "test-restart-xhci PASS"
 
 # dup(2) syscall self-test: proves the kernel dup() (0xC5) works at runtime
 # (tty fd clone + write THROUGH the new fd), not merely that vim links it.
@@ -1729,7 +1989,7 @@ test-fork: kernel/Kernel64.bin apps/forktest.exe
 	@cp kernel/Kernel64.bin /tmp/icsos-fork-iso/vmdex
 	@cp apps/forktest.exe /tmp/icsos-fork-iso/apps/forktest.exe
 	@printf '%s\n' 'forktest' 'forkoomtest' 'reboot' > /tmp/icsos-fork-iso/autoexec.bat
-	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex; boot }' \
+	@printf '%s\n' 'set timeout=0' 'menuentry "ics" { multiboot2 /vmdex $(FORK_CMDLINE); boot }' \
 		> /tmp/icsos-fork-iso/boot/grub/grub.cfg
 	@grub-mkrescue -o /tmp/icsos-fork.iso /tmp/icsos-fork-iso >/dev/null 2>&1
 	@truncate -s 64M /tmp/icsos-fork-work.img
@@ -1760,6 +2020,17 @@ test-fork: kernel/Kernel64.bin apps/forktest.exe
 	@! grep -aq "General Protection Fault\|DOUBLE FAULT" /tmp/icsos-fork.log
 	@test $$(grep -ac "Page fault (" /tmp/icsos-fork.log) -le 1
 	@echo "test-fork FORK_CPUS=$(FORK_CPUS) PASS"
+
+# Fault injection: "fault-switch-gap" holds the scheduler's choose->switch window
+# open until the chosen, never-run fork child self-exits under a nested timer
+# switch.  ps_switchto() must refuse the now-DYING PCB; switching into it re-ran
+# fork_child_return over the child's exit stack (64-byte-shifted iretq frame).
+test-fork-switch-gap: kernel/Kernel64.bin apps/forktest.exe
+	@$(MAKE) --no-print-directory test-fork FORK_CPUS=1 FORK_CMDLINE=fault-switch-gap
+	@grep -aq "SWITCH-GAP-INJECT child-exited" /tmp/icsos-fork.log
+	@grep -aq "SWITCH-DYING-REFUSED switch" /tmp/icsos-fork.log
+	@! grep -aq "FORK-FRAME-BAD\|FORK-FRAME-PREBAD\|GPF64" /tmp/icsos-fork.log
+	@echo "test-fork-switch-gap PASS"
 
 test-fork-matrix: kernel/Kernel64.bin apps/forktest.exe
 	@set -e; for cpus in $(FORK_MATRIX); do \

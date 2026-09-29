@@ -271,6 +271,60 @@ int vfs_directwrite(char *buf, int itemsize, int n, file_PCB* fhandle)
     return 0;
 };
 
+/* Offset-based read: read up to nbytes at file offset `off` into buf, leaving
+   fhandle->ptrlow untouched.  Serialized on fhandle->io_busy (outer) then
+   vfs_busy (inner, via vfs_directread) -- the same order sys_read/sys_write
+   use, so no AB-BA against the buffered path.  Returns bytes actually read
+   (0 at/past EOF).  Guards off >= size before calling vfs_directread so the
+   EOF clamp never underflows. */
+int vfs_read_at(file_PCB *fhandle, DWORD off, char *buf, int nbytes)
+{
+    int read = 0;
+    if (!fhandle || !buf || nbytes <= 0 || !fhandle->ptr)
+        return 0;
+    if (off >= fhandle->ptr->size)
+        return 0;
+    if (nbytes > 0x7FFFFFFF)
+        nbytes = 0x7FFFFFFF;
+    sync_entercrit(&fhandle->io_busy);
+    {
+        DWORD saved = fhandle->ptrlow;
+        if (off >= fhandle->ptr->size) {
+            /* size may have shrunk between the unlocked check and the lock */
+        } else {
+            fhandle->ptrlow = off;
+            read = vfs_directread(buf, 1, nbytes, fhandle);
+        }
+        fhandle->ptrlow = saved;
+    }
+    sync_leavecrit(&fhandle->io_busy);
+    return read;
+};
+
+/* Offset-based write: write nbytes at file offset `off` from buf, leaving
+   fhandle->ptrlow untouched.  May extend the file (addsectors) when the write
+   reaches past the current size -- the correct semantic for a MAP_SHARED write
+   back.  Returns bytes written (0 on error / unsupported fs). */
+int vfs_write_at(file_PCB *fhandle, DWORD off, const char *buf, int nbytes)
+{
+    int written = 0;
+    if (!fhandle || !buf || nbytes <= 0 || !fhandle->ptr)
+        return 0;
+    if (nbytes > 0x7FFFFFFF)
+        nbytes = 0x7FFFFFFF;
+    sync_entercrit(&fhandle->io_busy);
+    {
+        DWORD saved = fhandle->ptrlow;
+        fhandle->ptrlow = off;
+        written = vfs_directwrite(buf, 1, nbytes, fhandle);
+        /* vfs_directwrite advances ptrlow; restore it so a mapping's write-back
+           does not perturb the fd's logical position for later I/O. */
+        fhandle->ptrlow = saved;
+    }
+    sync_leavecrit(&fhandle->io_busy);
+    return written;
+};
+
 /***********************************************************************************
  * vfs_readchar - This function handles buffered reads. Unlike vfs_directwrite (Although this function
  * uses directread internally), vfs_readchar is optimized for single character reads,

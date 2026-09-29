@@ -1,6 +1,318 @@
 # Development blog
 
+## 2026-09-28 (Manila, UTC+8)
+
+### 21:26 — Main repo moved to `github.com/ics-os-ex/ics-os-ex`
+
+**Current problem / activity:** user declared the org repo the main repository;
+all future pushes go there.
+
+- `ics-os-v2` was 11 commits ahead of `org/ics-os-v2` (0 behind); fast-forward
+  push `1adde08..fedfa91` to `github.com:ics-os-ex/ics-os-ex.git` succeeded.
+- `git branch` upstream retargeted: `ics-os-v2` now tracks `org/ics-os-v2`
+  (was `ex/ics-os-v2` on `jedld/ics-os-ex`). Plain `git push` from this branch
+  now lands on the org repo.
+- Remotes kept: `org` = new main repo, `ex` = `jedld/ics-os-ex` (old), `jedld`
+  = `jedld/ics-os`, `origin` = `srg-ics-uplb/ics-os` (fork source).
+- Earlier today also: root-caused the `boot-dist.sh` `Failed to get "write"
+  lock` — a test harness was holding the shared `ics-os-uefi.img`; fixed by
+  running autoexec-mutating tests on `--sparse=always` /tmp copies
+  (`fedfa91`).
+
+### 21:10 — `FORK-FRAME-BAD` root-caused: voluntary switch into a DYING fork child
+
+**Current problem / activity:** intermittent `test-fork` failure (`FORK-FRAME-BAD`
+/ `FORK-FRAME-PREBAD`; on committed HEAD it shows as `GPF64 TSS-bad` at the
+`iretq` in `fork_child_return`). Reproduces on HEAD too, so it is not from the
+in-progress mmap work.
+
+- The "64-byte shifted" frame was decoded from the dump as a complete `int 0x30`
+  frame based at `F-64`: saved `rax=3` (exit), `rbx=0x4d` (status 77), return
+  into `dex_exit`. `0x401946` is the generic SDK syscall stub return, not a
+  fork-only address. At the same recursion depth the `_exit→exit→dex_exit→stub`
+  chain is exactly 64 bytes deeper than `fork→stub`, so the writer was the
+  victim child itself: its own exit stack.
+- A `ps_switchto` probe caught `SWITCH-DYING` from `taskswitch→schedule_from_timer`
+  with `prev`=parent. Race: `scheduler()` claims the child and restores IF; on the
+  voluntary (waitpid) path a timer before `ps_switchto`'s `cli` runs the child
+  nested to `self_exit_current` (it never yields, so `ctx.rip` stays
+  `fork_child_return`), which marks it DYING and releases `on_cpu`. The outer
+  call then switches to the stale choice and re-runs `fork_child_return` over
+  the exit stack.
+- Fix: `schedule_from_timer` keeps IF=0 from the choice to `ps_switchto`
+  (`context_switch` already saves prev with IF=1); `ps_switchto` and
+  `ps_switchto_load_only` refuse a DYING non-prev PCB under the claim
+  (`SWITCH-DYING-REFUSED`, counter `ps_switch_dying_refusals`).
+- Regression: `make test-fork-switch-gap` boots with `fault-switch-gap`, which
+  holds the choose→switch gap open until the chosen child self-exits. Guard
+  disabled: `FORK-FRAME-BAD` on the first injection (pid 21) and a hang. Guard
+  enabled: 16 injections, `SWITCH-DYING-REFUSED`, PASS.
+- Earlier "freed page" readings in this investigation were a `0xFFF000` mask
+  artifact (fixed to `0x000FFFFFFFFF000`).
+- Removed the investigation diagnostics (clone snapshot ring, read-only frame
+  write probe, `PREBAD`/`PREWALK`, `FORK-FRAME-*`, `COW401946`, the
+  `fork_child_return` frame check in `irqwrap.S`). Kept the `SWITCH-DYING-REFUSED`
+  counter and the `fault-switch-gap` hook. The `.bootpt` section split stays:
+  the kernel BSS still collides with the 4MiB user window without it.
+- Cleaned tree: `test-fork` (1 vCPU) 6/6, `test-fork-switch-gap`,
+  `test-fork-matrix`, `test-restart`, `test-stress-user-smp`, `test-spawn`,
+  `test-integration`, `test-posixio` all PASS. `test-fatwrite-coop` remains
+  flaky (separate open issue, see 20:26).
+
+### 20:26 — fatwrite-coop still open after claim-release and adopt guard
+
+**Current problem / activity:** Cooperative FAT writers still fault under
+`coop-smp`. `on_cpu` now drops only in `context_load_release` after RSP
+moves, a leftover timer does not reload the task it is still on, and
+page-fault/#UD paths adopt a PCB only when `on_cpu` is already this CPU.
+
+Five `make test-fatwrite-coop` runs: 2 pass, 3 fail. Failures are
+`GPF64` at `scheduler`'s `ret` with `frsp=0x230` (pid 21, pid 22) and
+`UD64` into the middle of `context_switch` (`rip=0x100477`) and into
+`cpus[]` (`rip=0x3ee922`) on `fatwr.exe`, `task_mgr`, and `cpu_idle`.
+Not closed.
+
+### 05:40 — `test-nethack` engrave gap closed: staged xcrypt-obfuscated `engrave` data file
+**Current problem / activity:** The 04:20 entry left a non-blocking gap — the guest log printed `Can't open 'engrave' file.` → `Program in disorder!` because `engrave` was not one of the 13 `nhdat` entries and was not staged on the writable RAM disk. Closed it by staging a correctly-formatted `engrave` data file that the game's `dlb_fopen()` filesystem fallback reads.
+
+- Chose between repacking `nhdat` with `engrave` vs. staging a filesystem file. Repacking needs the full host pipeline (`makedefs` + `dgn_comp` + `dlb`; the latter two need flex/bison) and risks perturbing the working 13-entry `nhdat`. Staging uses `dlb_fopen()`'s built-in `fopen_datafile()` fallback (confirmed in `src/src/dlb.c`) — a legitimate first-class path, not a hack — so staged the file.
+- Determined the exact on-disk format by extracting the known-good `epitaph` entry from the working `nhdat` with a small Python DLB parser (header `rev nentries strsize liboffset totalsize`; entries `<handling> <name> <offset>\n`). Confirmed: line 0 is the `Dont_Edit_Data` header, then `xcrypt()`-obfuscated phrases. Also confirmed a pre-existing makedefs quirk: the default content is written with no trailing newline, so it concatenates with the first phrase on line 1 (a position-dependent `xcrypt` mismatch on the tail — identical in `epitaph`, so not a regression I introduced).
+- Wrote `contrib/nethack/gen_engrave.c`, a self-contained host tool that replicates `makedefs`' `do_rnd_access_file()` + `xcrypt()` + `fgetline()` byte-for-byte (the same production code that made the working `epitaph`), so the output is correct by construction. It reads `contrib/nethack/src/dat/engrave.txt` (48 phrases; `#`/blank lines skipped) and emits `base/nethack/engrave`.
+- Verified the generated file against the extracted `epitaph`: identical line-0 header, matching line-1 structure, and a clean `xcrypt` round-trip on the phrase lines (`Vlad was here`, `ad aerarium`). The tool reproduces the committed file byte-for-byte.
+- Wired into `test-nethack` (Makefile): added `base/nethack/engrave` to the prerequisites, a `cp` into the ISO `/nethack/` tree, and an autoexec line staging it to `/ramdisk/nethack/engrave`; documented the `/engrave` filesystem data file in the target's data-layout comment.
+- Verified: `make test-nethack` → **PASS**. The log now has **zero** `Can't open 'engrave'` and **zero** `Program in disorder` (both were emitted by `couldnt_open_file()` → `impossible()`), and `Hello Tester, welcome to NetHack!` is present. `engrave` is now read via the DLB filesystem fallback.
+- Current state: the NetHack test is fully clean — no data-file errors, a character is created, and the first level is reached.
+
+### 04:20 — `test-nethack` green: NetHack reaches first level (root cause: `DLB` disabled)
+**Current problem / activity:** `make test-nethack` hung/failed after character creation: `Cannot open dungeon description - "dungeon" file!` → `Program initialization has failed.`. The guest printed the copyright banner and the `Who are you?` / `Shall I pick … [ynaq]` prompts, then died when `init_dungeons()` → `dlb_fopen("dungeon")` returned NULL. Traced the packed-data path end to end and found the real cause.
+
+- First ruled out the SDK `fscanf` (which `readlibdir` uses to parse the `nhdat` DLB directory): fixed `%ld`/length modifiers, literal-whitespace handling, `%s` trailing-separator pushback, `%u`, `%*` suppression, and added a `fscout:` label that flushes the one-char pushback via `ungetc(pushback, f)` before returning. A host proxy (`/tmp/opencode/nhtest/fscantest5.c`) confirmed the fixed `fscanf` parses the real `nhdat` header (`rev=1 nentries=13 …`) and all 13 entries correctly.
+- Added temporary diagnostics in `contrib/nethack/src/src/dlb.c` (`open_library` / `dlb_fopen`) and a `===DLB_DBG===` `cat /ramdisk/nethack/dbg.txt` line in the `test-nethack` autoexec to capture guest state. Every variant (TTY `raw_printf`, direct `write(2, …)`, and a file `fopen("/ramdisk/nethack/dbg.txt","w")`) produced **no** output and **no** file — yet the game's own TTY output reached the serial. The tell: the compiled `dlb.o` was only **928 bytes with zero symbols** while `dlb.c` is a ~640-line file.
+- Root cause: `contrib/nethack/src/include/config.h` had `/* #define DLB */` commented out (stock NetHack default). The **entire** `dlb.c` implementation is wrapped in `#ifdef DLB`, so with `DLB` off it compiles to an empty object, `dlb_fopen("dungeon")` is never backed by the real DLB reader, and the packed `nhdat` (dungeon/data/oracles/…) is unreadable — hence the failure. The build already ships a prebuilt `nhdat` DLB resource, so `DLB` was simply never enabled.
+- Fix: enabled `#define DLB` in `contrib/nethack/src/include/config.h` (with a comment explaining the ICS-OS build ships a prebuilt `nhdat` and requires it). With `DLB` on, `dlb.c` compiles to a real object and the library opens.
+- Verified: `make -C contrib/nethack install` + `make test-nethack` → **PASS**. The guest log now shows `dlb_init` opening `nhdat`, parsing all 13 directory entries (Directory, data, dungeon, oracles, rumors, cmdhelp, opthelp, options, symbols, epitaph, quest.dat, wizhelp, keyhelp), the character being created (`Tester the Rhizotomist`), the level-1 map rendering, and `Hello Tester, welcome to NetHack!  You are a neutral female human Healer.` (first level reached).
+- Cleanup: removed all temporary `dlb.c` diagnostics (the `DBG*` `write(1/2, …)` probes, the `dbg.txt` file logging, and the `raw_printf`/`getcwd` forward decls) and the `===DLB_DBG===`/`cat` autoexec lines from the `test-nethack` Makefile target. Confirmed a clean build (`dlb.o` = 8120 bytes, 0 `DBG` strings) and a clean re-run (`test-nethack PASS`, no `DBG` in the log, `welcome to NetHack!` present).
+- Note (non-blocking): the log still prints a non-fatal `Can't open 'engrave' file.` → `Program in disorder!` because `engrave` is not one of the 13 `nhdat` entries and is not staged on the writable RAM disk. The game continues to level 1 and all `test-nethack` PASS criteria (root mount, copyright banner, `welcome to NetHack!`, no panic/GPF/PF) still hold. Closing it would mean either regenerating `nhdat` with the engrave table or staging an `engrave` file for the DLB filesystem fallback; tracked as a follow-up.
+- Current state: `test-nethack` is green and the tree is clean of diagnostics. The NetHack source tree (`contrib/nethack/src/`) is git-ignored; the fix persists through the tracked, rebuilt `apps/nethack.exe`. Pending the user's earlier "commit and push" request.
+
+### 03:19 — xHCI UEFI process-restart bug fixed: GS-base CPU-id fallback in IRQ_KSTACK_ENTER
+**Current problem / activity:** `make test-nethack-xhci` (and any xHCI q35 UEFI thumbdrive boot) hung: the user process (pid 20) was repeatedly restarted from its entry point and the parent's `RESTART_TEST_PASS` / the NetHack banner never appeared. Built a minimal `restarttest` reproducer (`test-restart-xhci`), traced the early-return in the timer scheduler, and fixed the IRQ-entry CPU-id detection.
+
+- Reproduced with a targeted binary (`contrib/restarttest/`, `apps/restarttest.exe`): a parent forks a child that counts to 5000 and exits; the parent `waitpid`s. On the xHCI q35 UEFI platform the child's `RESTART_TEST_CHILD_STARTUP` printed many times (the process kept re-entering its entry point) and the parent never reached `RESTART_TEST_PASS`.
+- Root cause: `smp_have_rdtscp` was 0 on this QEMU q35 UEFI platform (the CPUID RDTSCP probe in `smp_rdtscp_available()` returned 0). The `IRQ_KSTACK_ENTER` macro in `ics-os/kernel/irqwrap.S` used `rdtscp` to obtain the CPU id and, when `smp_have_rdtscp != 1`, jumped straight to `.Lkenter` — staying on the *interrupted* stack. For a user process that is the user stack, so `schedule_from_timer()` saw a user RSP and bailed via `leftover_timer_must_skip()`. The parent therefore spun in a tight `sys_waitpid()` loop with no context switch, and the child was repeatedly restarted from entry.
+- The C `smp_cpu_id()` already had a GS-base fallback (`smp_gs_local()`), but the assembly macro did not — that inconsistency was the bug.
+- Fix: in `IRQ_KSTACK_ENTER`, when `smp_have_rdtscp != 1`, read the GS-base MSR (`0xC0000101`, which `smp_gs_publish()` sets to `&cpus[id]`), compute `id = (gs_base - &cpus[0]) / sizeof(cpu_local)` (48), validate `id < MAX_CPUS`, and fall through to the normal kstack-switch path. If the GS base is not a valid `cpus[]` slot (e.g. very early boot, before `smp_gs_publish()`), the check fails and the macro safely stays on the current stack, preserving the old behavior.
+- Removed all temporary diagnostic probes added while tracing (FORK_CTX, TSW20, SFT1–5, SW20/SW20TAIL, SCH20, SC20, IDLESTEAL, OPEN20, CHDIR20, LOAD20, CTX_RESEED, KPROBE/KACC/TEP) and reverted the temporary BSS-guard bump back to `0x3FB000` (the VT-color / tty_vt feature fits under it).
+- Fixed the `test-restart` / `test-restart-xhci` Makefile pass/fail logic: the startup-marker count was computed across separate recipe lines (each its own shell) so the count always read empty; combined it into one shell and corrected `test-restart` to grep the real `RESTART_TEST_CHILD_STARTUP` marker.
+- Verified (all PASS): `test-restart-xhci` (count 1), `test-restart` (TCG, count 1), `test-nethack-xhci`, `test-vim-xhci`, `test-vtcolor-xhci`, `test-vtcolor-unit`, `test-vtcolor-guest`, `test-integration` (boot + SMP 4-CPU + exec).
+- Current state: the xHCI UEFI thumbdrive boots NetHack and the fork/wait reproducer to completion. The regression tests are in place and the tree is clean of diagnostics.
+
+## 2026-09-27 (Manila, UTC+8)
+
+### 01:28 — ELF64 stream loader batched: vim/nethack cold load 6.7x faster (52.3 s → 7.8 s)
+**Current problem / activity:** `vim` (2.3 MB) and `nethack` (3.8 MB) took ~52 s to load on a cold boot — far from the "instant" loads on the Linux host. Traced the ELF64 load path, found the per-page read bottleneck, batched the reads, resolved the resulting 4 MiB link-limit collision, and re-measured.
+
+- Root cause: `elf64_stream_load()` (`ics-os/kernel/module/elf_module.c`) issued one `fseek`+`fread` per 4 KiB page — 559 for vim, 944 for nethack. Each small read paid full VFS + filesystem + device-request overhead, so cold load ran ~93.5 ms/page. This is a shared software read path (not device-specific), consistent with the observed slow loads on the UEFI USB thumbdrive as well.
+- Fix: allocate one 128 KiB chunk (`ELF64_STREAM_CHUNK == PC_MAX_IO`) and refetch only when a page's `[fileoff, fileoff+len)` leaves the cached chunk; within a PT_LOAD the file offsets are contiguous, so one 128 KiB fetch serves 32 pages. A heap-exhausted fallback (`chunk == 0`) keeps the original per-page read; `free(chunk)` (guarded, since `free(NULL)` is not a no-op in this kheap) runs after the page loop on both success and error paths.
+- The 608 B of new `.text` pushed `.data` past the 0x1be000 `.bss` alignment boundary, bumping `bssEnd` to 0x3FA714 and tripping `ASSERT(bssEnd <= 0x3FA000)` in `lscript64.ld`. The 24 KiB guard gap is provably inert: `dexmem.c`'s frame allocator reserves the fixed `[MEM_KERNEL_LOAD, MEM_KERNEL_LIMIT=4MiB)` range regardless of `bssEnd`, so nothing ever uses `[bssEnd, 4MiB)`. Raised the guard to 16 KiB (`0x3FB000`) — matching the earlier RTL8821CE bump precedent — and corrected the stale `MEM_KERNEL_BSS_LIMIT` (was `0x3F0000`, already violated by HEAD) plus the "64 KiB slack" diagram text in `memlayout.h`.
+- Measurement (QEMU TCG, `-cdrom`, cold): vim load 52.3 s → 7.76 s (6.7x); per-page 93.5 ms → 13.4 ms. The residual ~10.6 ms/page cold is the emulated CD PIO transfer rate amortized over the batch — a device/emulation limit, not software. The warm (page-cache) floor is ~2.8 ms/page, the `userpd_map_page` frame alloc + 4 KiB zero + PTE write.
+- The FAT/USB path benefits the same way: `loadfile12EX2()` coalesces contiguous clusters into ≤32 KiB device requests, so batching cuts the I/O request count from ~700 (4 KiB) to ~72 (32 KiB). The in-memory FAT makes the cluster-chain walk cheap (array lookups), so it is not the cost.
+- `mmap` evaluation: not state-of-the-art. `dex32_mmap` (syscall 0xB6) is an anonymous bump allocator over `userpd_map_page`; `vfs_mapfile` mallocs+freads a kernel buffer; the 64-bit `pagefaulthandler` kills on any not-present user fault. There is no file-backed demand paging, VMA management, or COW.
+- Verified: `make -C kernel bzImage` links (bssEnd=0x3FA714 ≤ 0x3FB000); `make test-vim PASS`, `make test-exec PASS`, `make test-nethack PASS`.
+- Follow-ups (separate): propagate `readfile` failure in `vfs_directread`/`fat_openfileEX` (read errors are currently swallowed); consider a read-path sequential cursor in `loadfile12EX2` to remove the residual O(offset) chain walk; and a real file-backed demand-paging `mmap` if "state-of-the-art mmap" becomes a hard requirement.
+- Current state: the batched loader is green across the exec/vim/nethack gates. Ready for a focused commit if requested.
+
+## 2026-09-26 (Manila, UTC+8)
+
+### 23:43 — Kernel VT parser hardened and `test-termtest` expanded to pass
+**Current problem / activity:** The shared SDK termcap work was green, but the follow-up terminal hardening exposed two issues: the new `termtest` DECSC/DECRST stage timed out, and the headless serial lightweight cursor model did not support cursor save/restore. The current activity is fixing the serial VT model, hardening the DDL parser, expanding the guest terminal regression, rerunning the terminal/integration gates, and updating the docs.
+
+- Confirmed the QEMU `-nographic` console uses the serial tty path, so `vt_serial_feed()` must answer DSR-6 and support the same cursor save/restore subset used by the test.
+- Fixed a C string bug in `termtest.c`: `"\x1b7"` and `"\x1b8"` were single hexadecimal characters (`0x1B7` / `0x1B8`) because `7` and `8` are hex digits; the test now uses `"\0337"` and `"\0338"` for `ESC 7` / `ESC 8`.
+- Diagnosed the remaining timeout as a response-length mismatch: the serial model ignored save/restore, reported `CSI 1;1 R` after a restore, and `read_exact(7)` blocked waiting for the seventh byte.
+- Hardened `ics-os/kernel/console/tty_vt.c`:
+  - added `VT_S_OSC_ESC` so `ESC` inside an OSC string is consumed as part of `ST` termination instead of escaping into a new CSI parser;
+  - capped CSI parameter accumulation at `VT_PARAM_MAX`;
+  - ignored unknown `ED`/`EL` modes instead of falling through to clear-all;
+  - clamped `SU`/`SD` to the visible screen height;
+  - extended the serial lightweight cursor model with `ESC 7`/`ESC 8` and `CSI s`/`CSI u` save/restore so DSR-6 works after cursor restore in headless serial boots.
+- Expanded `ics-os/contrib/termtest/termtest.c` with relative cursor motion, screen-edge clamping, DECSC/DECRST, huge `SU` clamping, and an OSC `ST` termination case with embedded CSI.
+- Verified:
+  - `make test-termtest PASS`
+  - `make test-termcap-unit PASS`
+  - `make test-vim PASS`
+  - `make test-htop PASS`
+  - `make test-nethack PASS`
+  - `make test-integration PASS`
+- Updated `AGENTS.md`, `wiki/Kernel-Developer's-Guide.md`, `ics-os/docs/testing-and-qa-modernization-plan.md`, and the local reference indexes.
+- Current state: the terminal hardening work is green and ready for a focused commit if requested.
+
+### 03:20 — Shared SDK termcap module added and Vim termcap output fixed
+**Current problem / activity:** Vim terminal output was leaking literal termcap format characters because the old ICS-OS termcap shim used the wrong `tgetent()` argument order and a lossy `tgoto()` implementation. The current activity is replacing that shim with a standards-based shared SDK termcap module, adding host-native regression coverage, and validating the Vim build against the real termcap API.
+
+- Changed `ics-os/sdk/include/termcap.h` to the standard termcap API: `tgetent(char *buf, const char *id)`, `TCBUFSIZ 2048`, POSIX-style `tputs()`, and `tparam()`.
+- Added `ics-os/sdk/termcap.c`:
+  - loads `TERMCAP`, `/icsos/etc/termcap`, `/etc/termcap`, and built-in `xterm`/`vt100`/`dumb` entries;
+  - normalizes termcap files by removing comments, spaces, tabs, and backslash-newline continuations;
+  - decodes `tgetstr()` values into the caller-provided output buffer and advances the caller pointer, matching Vim's `tstrbuf`/`tp` usage;
+  - implements `tgoto()` through `tparam()` so `\E[%i%d;%dH` expands to the expected cursor sequence;
+  - strips leading numeric padding in `tputs()` and maps termcap `0200` back to NUL on output.
+- Removed the old Vim-specific termcap definitions from `ics-os/contrib/vim/icsos_stub.c` and linked `$(SDK)/termcap.c` into `vim.exe`.
+- Added `ics-os/tests/termcap_unit.c` and `make test-termcap-unit`:
+  - 32 TAP checks for `tgetent`, `tgetnum`, `tgetflag`, `tgetstr`, `tgoto`, `tparam`, `tputs`, file loading, unknown terms, and null-buffer behavior.
+- Verified:
+  - `make test-termcap-unit PASS`
+  - `make -C contrib/vim` succeeds
+  - `make test-vim PASS`
+  - `make test-termtest PASS`
+  - `make test-htop PASS`
+- Current state: the shared termcap module is in place and the Vim termcap regression is green. The remaining terminal work is hardening `kernel/console/tty_vt.c` CSI/escape parsing against the ECMA-48/VT100/xterm references and rerunning the broader terminal/full-screen regressions.
+
+### 02:45 — ICS-OS `htop` process/system monitor added and verified
+**Current problem / activity:** Implementing a lightweight native `htop` utility that exposes safe kernel process/system statistics to userland and can request termination of user processes, then validating it against the existing boot, SMP, process, terminal, and screenshot/FAT workstreams.
+
+- Added user-visible `struct icsos_procinfo` and `struct icsos_sysinfo` plus `icsos_proc_list()` / `icsos_sysinfo()` / `icsos_kill()` wrappers in `ics-os/sdk/include/sys/icsos.h` and `ics-os/sdk/posix.c`.
+- Added kernel implementations in `ics-os/kernel/process/process.c`:
+  - `0xD1 sys_icsos_proc_list`: bounded snapshot of PID, name, state, priority, CPU, CPU ticks, and RSS pages.
+  - `0xD2 sys_icsos_sysinfo`: CPU count, uptime, total CPU ticks, and frame totals/free counts.
+  - `0xD3 sys_icsos_kill`: safe kill semantics (`sig==0` existence check, `1..15` user non-thread termination, `>=16` no-op, kernel/non-thread `EPERM`).
+- Registered `0xD1`-`0xD3` in `ics-os/kernel/dexapi/dex32API.c` with `API_REQUIRE_INTS`.
+- Added per-CPU tick accounting in `ics-os/kernel/stdlib/time.c` so `cpu_ticks` and per-process CPU percentages are meaningful under SMP.
+- Added `ics-os/contrib/htop/` with an 80x25 TUI, `--version`, `--selftest`, `--frame`, and `--dump` modes, plus a `test-htop` target.
+- Updated SDK `kill()` to preserve self-kill, return `ESRCH` for non-positive PIDs, return `EINVAL` for invalid signals, and forward other PIDs to `icsos_kill()`.
+- Verified:
+  - `make test-htop PASS`
+  - `make test-integration PASS`
+  - `make test-termtest PASS`
+  - `make test-screenshot PASS`
+  - `make test-fatwrite PASS`
+  - `make test-fatwrite-coop PASS`
+  - `make test-fork PASS`
+  - `make test-stress-user-smp PASS`
+  - `make test-spawn PASS`
+- Diagnosed an initial `test-screenshot` timeout as a stale/partial `SCREENSH.PPM` state from a previously interrupted run; the `usb` target rebuilds the image cleanly, and the test timeout was raised from 120s to 180s for slow TCG/FAT write conditions.
+- Updated `AGENTS.md`, `wiki/Kernel-Developer's-Guide.md`, and `ics-os/docs/testing-and-qa-modernization-plan.md` for `test-htop` and the new process-observability ABI.
+- Current state: htop source, test target, and docs are in place; relevant regressions pass and the work is ready to commit.
+
+## 2026-09-25 (Manila, UTC+8)
+
+### 22:37 — `test-screenshot` made fast enough for QEMU by fixing FAT sequential writes
+**Current problem / activity:** The in-OS `screenshot` builtin and `make test-screenshot` were functionally in place, but FAT-root PPM writes took minutes because `writefile12EX2()` re-walked the file cluster chain from the first cluster for every row/chunk write and re-read BPB geometry on each call.
+
+- Added `screenshot` console builtin support in `kernel/console/console.c`:
+  - captures the active GOP/VBE framebuffer with `fbconsole_geom()` / `fbconsole_rgb_at()`;
+  - writes a binary PPM header plus 32-row chunks to keep kernel BSS small;
+  - calls `iomgr_flushmgr()` after `fclose()` so host readback is deterministic;
+  - prints `SCREENSHOT_OK` or `SCREENSHOT_FAIL` markers.
+- Fixed `make test-screenshot`:
+  - stages `autoexec.bat` with `mcopy -o`;
+  - reads back the FAT short name `::SCREENSH.PPM`;
+  - replaces the broken multi-line Python here-doc with a single `python3 -c` PPM validator.
+- Optimized the FAT write path in `kernel/filesystem/fat12.c`:
+  - computes `bytes_per_cluster` from the already-read BPB instead of calling `fat_getbytesperblock()` per write;
+  - adds a per-volume sequential-write pointer in `fatcache_ent` so consecutive appends start at the expected cluster instead of walking from cluster 0;
+  - invalidates the sequential pointer when the FAT cache is invalidated or freed.
+- Reduced kernel BSS pressure by hashing FAT volume locks into 16 `sync_sharedvar` slots instead of allocating one for every possible `MAXDEVICES` id; unrelated volumes may share a lock, which only adds serialization.
+- Verified:
+  - `make test-screenshot PASS`
+  - `make test-fatwrite PASS`
+  - `make test-fatwrite-coop PASS`
+  - `make test-integration PASS`
+  - `make test-spawn PASS`
+  - `make test-make PASS`
+  - `make test-fatchain-unit` and `make test-vfsgrow-unit` pass.
+- Current state: source, docs, and QA plan are updated; build artifacts are being excluded before commit.
+
+### 19:35 — `test-termtest` fixed: serial ttys now answer DSR-6 with a lightweight cursor model
+**Current problem / activity:** `test-termtest` timed out after sending DSR-6 (`CSI 6 n`) because headless `-nographic` boots mark the console tty `TTY_SERIAL`, and `vt_feed()` previously passed serial bytes through without interpreting cursor sequences.
+
+- Added a lightweight `serx`/`sery` cursor model to `vt_state_t`.
+- Added `vt_serial_feed()` in `kernel/console/tty_vt.c`:
+  - serial output is still passed through to COM1 unchanged;
+  - basic cursor moves (`H/f`, `A/B/C/D/E/F/G/d`) are tracked;
+  - DSR-6 is answered by injecting `CSI row;col R` into the tty input queue.
+- `vt_dsr_response()` now uses the serial cursor model for `TTY_SERIAL` ttys and the DDL cursor for framebuffer/VGA ttys.
+- Verified:
+  - `make test-termtest PASS`
+  - `make test-vim PASS`
+  - `make test-integration PASS`
+  - `make test-ttycanon-unit`, `test-consolemux-unit`, and `test-fbconsole-unit` pass.
+- Changes committed and pushed.
+
+### 19:10 — Vim full-screen start/exit and console restore verified; `defaults.vim` startup error removed
+**Current problem / activity:** Finishing the `vim` console fix: the alternate-screen termcap shim restored the primary prompt, but Vim still printed `E1187: Failed to source defaults.vim` at startup.
+
+- Added a minimal `ics-os/contrib/vim/defaults.vim` and pointed `default_vimruntime_dir` at `/icsos/share/vim/runtime`.
+- Fixed the Vim staging dependency in `ics-os/contrib/vim/Makefile` so `pathdef.c` changes trigger a restage/rebuild.
+- Deployed the rebuilt `vim.exe` and `defaults.vim` into `ics-os/ics-os-uefi.img` under `::/apps/vim.exe` and `::/share/vim/runtime/defaults.vim`.
+- Booted a copy of the image headlessly with QMP and confirmed:
+  - `vim` starts without the `E1187` prompt.
+  - The Vim splash appears.
+  - `ZZ` exits with status `0`.
+  - The primary console prompt and previous console content are restored.
+  - The prompt accepts further commands after exit.
+- Updated `make test-vim` to install the runtime `defaults.vim` into the smoke-test ISO and to use a longer/larger TCG boot window; `make test-vim PASS`.
+- Ran `make test-integration PASS` after the kernel/Vim changes.
+- `make test-termtest` initially timed out in the `-nographic` serial configuration because `vt_feed()` treated `TTY_SERIAL` as a raw pass-through and did not answer DSR-6 on the serial tty; this was fixed in the 19:35 entry.
+- Changes committed and pushed.
+
+### 00:55 — GUI shell input/echo fixed; absent COM1 no longer floods the tty
+**Current problem / activity:** The manual GUI boot now reached the shell, but typed characters were not echoed and Enter triggered `execp: loading /icsos/apps...` / `Command or executable not found.` with no visible command line.
+
+- Diagnosed the live QEMU instance with QMP `screendump` and font-based OCR of the guest framebuffer; the screen showed repeated failed exec attempts for the current `/icsos/apps` path, consistent with invisible bytes being entered at the shell.
+- Root cause:
+  - `console_main()` marked the console tty `TTY_SERIAL` for every non-legacy DDL. A UEFI GOP/framebuffer DDL uses a malloced shadow buffer, so a COM1-less GUI boot was treated as a serial console.
+  - With `-serial none`, `tty_read()` raw-polled COM1. An absent 16550 receiver reads `0xFF`, which the old ready-bit test treated as forever-ready, injecting invisible `0xFF` bytes into the canonical line buffer.
+  - `vt_feed()` with `TTY_SERIAL` sent echo bytes to `serial_putc()` and returned, so the DDL/framebuffer path never received key echo.
+- Fix:
+  - `ics-os/kernel/console/tty.c`: `serial_getc_poll()` now calls `serial_getc()`, which checks `uart1.ready` and uses the normal UART lock instead of probing `0x3F8` directly.
+  - `ics-os/kernel/console/console.c`: set `TTY_SERIAL` only when `serial_com1_present()` is true and the DDL is not legacy VGA. A COM1-less GUI/framebuffer boot uses the keyboard/DDL path; headless serial boots still use COM1.
+- Verified:
+  - GUI: QEMU `-display gtk -serial none`, QMP key injection typed `echo consoleinputfixok`; `screendump` OCR showed the echoed command and the output `consoleinputfixok`.
+  - Headless serial: QEMU `-display none -serial socket`, sent `echo headlessserialfixok` to COM1; the serial stream returned `headlessserialfixok`.
+  - `make test-usb-uefi-gpt PASS`, `make test-boot PASS`, and `make test-ttycanon-unit` all passed.
+- Regenerated `ics-os/ics-os-uefi.img` with the kernel fix. Changes are not committed yet.
+- Current state: the GUI shell should echo input and execute typed commands; rerun `ics-os/scripts/boot-dist.sh ics-os-uefi.img uefi` after closing any QEMU instance holding the image lock.
+
 ## 2026-09-24 (Manila, UTC+8)
+
+### 23:05 — manual GUI boot no longer appears stuck at `STAGE 16`
+**Current problem / activity:** `scripts/boot-dist.sh ics-os-uefi.img uefi` opened a QEMU GTK window but the panel stayed on `STAGE 16: taskswitcher`, making it look like the kernel had hung.
+
+- Root cause: the script originally attached QEMU’s COM1 with `-serial null`. The kernel treats any present 16550 UART as the headless serial path and deliberately leaves `fb_live_render` off after the framebuffer selftest. With a UEFI/OVMF GOP and no serial console, the bottom-row stage badge remained visible while the actual console output was not blitted to the panel.
+- Verified with a QMP `screendump` of a copy of `ics-os-uefi.img`:
+  - With the default serial port present, the guest still reached the shell, but the GUI framebuffer did not show the live console.
+  - With `-serial none`, the same image booted to the distribution shell and the framebuffer rendered the shell correctly.
+- Updated `ics-os/scripts/boot-dist.sh`:
+  - `SERIAL=none` is now the default for visible displays (`gtk`, `sdl`, `cocoa`, `spice`, `vnc`).
+  - `SERIAL=stdio` is now the default for `DISPLAY_TYPE=none`.
+  - Explicit `SERIAL=file`, `SERIAL=stdio`, or `SERIAL=null` still override the default.
+  - The script prints a note when a serial device is attached while a visible display is requested, because that combination can leave the framebuffer console inactive.
+- Verified the updated script with `DRY_RUN=1` and a headless QMP screenshot run of a copy of the UEFI image using the script’s new `SERIAL=none` path. The screenshot decoded to the distribution shell prompt.
+- To use the GUI: close any existing QEMU instance holding the image lock and rerun `ics-os/scripts/boot-dist.sh ics-os-uefi.img uefi`.
+
+### 14:30 — manual distribution thumb-drive QEMU boot script
+**Current problem / activity:** Adding a repeatable local script for manually booting the ICS-OS distribution thumb-drive image with display output.
+
+- Added `ics-os/scripts/boot-dist.sh` to boot `ics-os-dist.img` or `ics-os-uefi.img` in QEMU with a GUI display by default.
+- The script supports `auto`, `bios`, and `uefi` modes. Auto mode selects UEFI for `*uefi*` image names or images with a GPT `EFI PART` header, and BIOS/IDE otherwise.
+- Missing known images are built automatically by default: `ics-os-dist.img` uses `make dist`, `ics-os-usb.img` uses `make usb`, and `ics-os-uefi.img` uses `make usb-uefi`; `AUTO_BUILD=0` disables this.
+- UEFI mode uses OVMF on q35 with xHCI USB mass storage, matching the N150/Etcher thumb-drive path. BIOS mode attaches the image as an IDE drive and boots with GRUB i386-pc.
+- Display output defaults to GTK on Linux and Cocoa on macOS; `DISPLAY_TYPE=vnc` is supported for headless hosts, and `SERIAL=file` / `SERIAL=stdio` remain available for debugging.
+- Verified with `DRY_RUN=1` command construction and a 30-second headless `DISPLAY_TYPE=none SERIAL=stdio` boot of `ics-os-uefi.img`; the guest reached `Root mount [OK]`, `FBCONSOLE_PASS`, `CONSOLE_READY`, and the distribution shell.
+
+### 10:10 — `ics-os-contrib` licensing compliance
+**Current problem / activity:** Auditing and remediating third-party licenses in the standalone `ics-os-contrib` repository.
+
+- Added `LICENSE` (GPLv2) for original ICS-OS contrib code.
+- Added `THIRD-PARTY.md` with package-by-package license attribution for pinned tarballs and vendored component files.
+- Added `docs/licenses/` copies of GPLv2, GPLv3, LGPLv3, the GCC Runtime Exception, TCC LGPL 2.1, NetHack GPL, Vim License, and the Realtek firmware redistribution license.
+- Added `components/lzozip/COPYING` for the MiniLZO GPLv2 files.
+- Repackaged `nethack-3.6.7-icsos.tar.gz` with modification notices in `include/config.h`, `include/unixconf.h`, and `sys/share/unixtty.c`, plus `NOTICE-ICSOS.txt`.
+- Repackaged `rtw8821c-firmware.tar.gz` with `LICENCE.rtlwifi_firmware.txt` and updated `sources/MANIFEST.sha256`.
+- Repackaged `rtw88-icsos-reference.tar.gz` with `NOTICE-ICSOS.txt` documenting the file-specific SPDX identifiers.
+- Verified `scripts/extract.sh` for the changed tarballs, rebuilt `components/nethack`, and ran `make all` successfully.
+- Pushed `ics-os-ex/ics-os-contrib` `main` to `2b62789`.
 
 ### 07:52 — `make test-nethack` PASS; NetHack startup GPF fixed
 **Current problem / activity:** None for NetHack; committing and pushing `ics-os-v2`.

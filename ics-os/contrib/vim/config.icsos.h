@@ -17,15 +17,17 @@
 /* #undef HAVE_X11 */
 /* #undef HAVE_WAYLAND */
 
-/* No terminfo / termcap; the kernel TTY drives VT100/xterm output directly. */
+/* The SDK provides a minimal ICS-OS termcap shim (sdk/include/termcap.h and
+ * contrib/vim/icsos_stub.c) so Vim can use the alternate screen and restore
+ * the primary console when it exits. */
 /* #undef TERMINFO */
 /* #undef HAVE_OSPEED */
 /* #undef HAVE_UP_BC_PC */
 /* #undef HAVE_OUTFUNTYPE */
 /* #undef HAVE_DEL_CURTERM */
-/* #undef HAVE_TGETENT */
+#define HAVE_TGETENT 1
 /* #undef TGETENT_ZERO_ERR */
-/* #undef HAVE_TERMCAP_H */
+#define HAVE_TERMCAP_H 1
 /* #undef HAVE_TERMIO_H */
 
 /* GCC provides __DATE__/__TIME__ and the unused attribute. */

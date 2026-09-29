@@ -69,6 +69,8 @@
 #define FXN_FDFILE   0xB0
 #define FXN_MMAP     0xB6
 #define FXN_MUNMAP   0xB7
+#define FXN_MPROTECT 0xB8
+#define FXN_MSYNC    0xB9
 
 /*============DEX constants for files===========*/
 #define FILE_READ 0

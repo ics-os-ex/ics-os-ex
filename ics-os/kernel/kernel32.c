@@ -165,6 +165,7 @@ extern int cpu_count;
 #include "console/dex_DDL.c"
 #include "hardware/vga/fbconsole.c"
 #include "console/tty.c"
+#include "console/vt_color.c"
 #include "console/tty_vt.c"
 #include "console/tty_tc.c"
 #include "hardware/dexapm.c"
@@ -686,6 +687,12 @@ process_init();    //defined in process.c
     }
     fbdbg_stage(15, "APs started");
     kbd_boot_leds_hold(KBD_LED_CAPS | KBD_LED_NUM);
+
+    {
+       extern volatile int sched_inject_switch_gap;
+       if (strcmp(kernel_cmdline, "fault-switch-gap") == 0)
+          sched_inject_switch_gap = 16;
+    }
 
     /* BSP keeps PIT/LAPIC timer for scheduling; enable after AP probe. */
    {

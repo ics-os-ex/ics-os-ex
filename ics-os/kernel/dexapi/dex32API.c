@@ -23,6 +23,7 @@ although a user procedure call is in the works
 ********************************************************************/
 
 #include "dex32API.h"
+#include "../memory/dexmem.h"
 
 /* Diagnostic: monotonic count of api_syscall() entries.  The selfhost
    spin watchdog (stdlib/time.c) samples this to tell a busy syscall loop
@@ -59,7 +60,14 @@ int api_removesystemcall(DWORD function_number){
       return -1;
    };
    return -1;
-};
+ };
+
+api_arg_t sys_icsos_proc_list(api_arg_t, api_arg_t, api_arg_t, api_arg_t,
+                              api_arg_t);
+api_arg_t sys_icsos_sysinfo(api_arg_t, api_arg_t, api_arg_t, api_arg_t,
+                            api_arg_t);
+api_arg_t sys_icsos_kill(api_arg_t, api_arg_t, api_arg_t, api_arg_t,
+                         api_arg_t);
 
 void api_init(){
    int i;
@@ -205,6 +213,8 @@ void api_init(){
     api_addsystemcall(0xB5,console_puts,0,0);
    api_addsystemcall(0xB6,dex32_mmap,0,0);
     api_addsystemcall(0xB7,dex32_munmap,0,0);
+    api_addsystemcall(0xB8,dex32_mprotect,0,0);
+    api_addsystemcall(0xB9,dex32_msync,0,0);
     api_addsystemcall(0xC0,sys_tcgetattr,0,0);
     api_addsystemcall(0xC1,sys_tcsetattr,0,0);
     api_addsystemcall(0xC2,sys_tcflush,0,0);
@@ -222,7 +232,10 @@ void api_init(){
      api_addsystemcall(0xCE,sys_recvfrom,0,API_REQUIRE_INTS);
      api_addsystemcall(0xCF,sys_netcfg,0,API_REQUIRE_INTS);
      api_addsystemcall(0xD0,sys_dup2,0,API_REQUIRE_INTS);
-  };
+      api_addsystemcall(0xD1,sys_icsos_proc_list,0,API_REQUIRE_INTS);
+      api_addsystemcall(0xD2,sys_icsos_sysinfo,0,API_REQUIRE_INTS);
+      api_addsystemcall(0xD3,sys_icsos_kill,0,API_REQUIRE_INTS);
+   };
 
 
 api_arg_t api_syscall(api_arg_t fxn, api_arg_t val, api_arg_t val2,

@@ -5,6 +5,7 @@ cc1test- Run host-built GCC cc1 to compile a trivial file in-OS.
 cc- Builds a C program (invokes tcc.exe). Args: <name.exe> <name.c>
 cd- Changes working directory. Args: <directory>
 cls- Clears the screen. 
+colortest- Drive the VT SGR parser; verify 256/truecolor mapping.
 copy- Copy source to destination: Args: <source> <destination>
 cpuid- Displays CPU information.
 del- Deletes a files or directory. Args: <filename/dirname>
@@ -60,6 +61,7 @@ rempcut- Removes a path alias. Args: <alias:>
 ren- Renames a file. Args: <oldname> <newname>
 rmdir- Removes a directory and all its subdirectories. Args: <dirname>
 run- Executes a batch file or script. Args: <script>
+screenshot- Save the framebuffer as PPM. Args: [path]
 selfhost- Compile a test program with in-OS tcc and run it.
 set- Sets an environment variable. Args: <key>=<value>
 shutdown- Shuts down the system.
@@ -76,5 +78,6 @@ use- Tells the extension manager to use the extension: Args: <extension>
 ver- Shows version information.
 version- Full version banner.
 vimtest- Run FEAT_TINY vim --version (ELF TUI loader smoke test).
+wifidbg- RTL8821CE RX-path diagnostic (HW write-pointer dwell).
 wifiscan- Poll RX for beacons; print SSIDs.
 wifistat- Dump RTL8821CE / wlan0 status (FW, MAC, RX).

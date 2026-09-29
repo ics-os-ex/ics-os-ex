@@ -128,8 +128,83 @@ int main(void)
    }
    printf("termtest: DSR CUP OK\n");
 
-   /* 7. select(2) zero-timeout: no pending input after flush */
-   tcflush(0, TCIFLUSH);
+    /* 7. relative cursor motion */
+    tcflush(0, TCIFLUSH);
+    write(1, "\x1b[5;10H", 7);
+    write(1, "\x1b[3A\x1b[2C", 8);
+    write(1, "\x1b[6n", 4);
+    if (read_exact(7, buf))
+       return fail("DSR(CUU/CUF) read");
+    if (memcmp(buf, "\x1b[2;12R", 7) != 0) {
+       printf("termtest: FAIL DSR(CUU/CUF) got [%s]\n", buf);
+       printf("TERMTEST_FAIL\n");
+       return 1;
+    }
+    printf("termtest: DSR relative motion OK\n");
+
+    /* 8. cursor clamping at screen edges */
+    tcflush(0, TCIFLUSH);
+    write(1, "\x1b[2;12H", 7);
+    write(1, "\x1b[10A\x1b[100C", 11);
+    write(1, "\x1b[6n", 4);
+    if (read_exact(7, buf))
+       return fail("DSR(clamp) read");
+    if (memcmp(buf, "\x1b[1;80R", 7) != 0) {
+       printf("termtest: FAIL DSR(clamp) got [%s]\n", buf);
+       printf("TERMTEST_FAIL\n");
+       return 1;
+    }
+    printf("termtest: DSR clamp OK\n");
+
+    /* 9. DECSC/DECRST (ESC 7 / ESC 8) */
+    tcflush(0, TCIFLUSH);
+    write(1, "\x1b[10;20H", 8);
+    write(1, "\0337", 2);
+    write(1, "\x1b[1;1H", 6);
+    write(1, "\0338", 2);
+    write(1, "\x1b[6n", 4);
+    if (read_exact(7, buf))
+       return fail("DSR(DECSC/DECRST) read");
+    if (memcmp(buf, "\x1b[10;20R", 7) != 0) {
+       printf("termtest: FAIL DSR(DECSC/DECRST) got [%s]\n", buf);
+       printf("TERMTEST_FAIL\n");
+       return 1;
+    }
+    printf("termtest: DSR DECSC/DECRST OK\n");
+
+    /* 10. huge SU must not hang the parser */
+    tcflush(0, TCIFLUSH);
+    write(1, "\x1b[999999999999S", 16);
+    write(1, "\x1b[6n", 4);
+    if (read_exact(7, buf))
+       return fail("DSR(SU) read");
+    if (memcmp(buf, "\x1b[10;20R", 7) != 0) {
+       printf("termtest: FAIL DSR(SU) got [%s]\n", buf);
+       printf("TERMTEST_FAIL\n");
+       return 1;
+    }
+    printf("termtest: SU clamp OK\n");
+
+    /* 11. OSC strings must not execute embedded CSI before ST termination */
+    tcflush(0, TCIFLUSH);
+    write(1, "\x1b]0;\x1b[6n\x1b\\", 10);
+    {
+       fd_set rfds;
+       struct timeval tv;
+       FD_ZERO(&rfds);
+       FD_SET(0, &rfds);
+       tv.tv_sec = 0;
+       tv.tv_usec = 0;
+       n = select(1, &rfds, 0, 0, &tv);
+       if (n < 0)
+          return fail("select(OSC)");
+       if (n != 0)
+          return fail("OSC embedded CSI produced input");
+    }
+    printf("termtest: OSC ST OK\n");
+
+    /* 12. select(2) zero-timeout: no pending input after flush */
+    tcflush(0, TCIFLUSH);
    {
       fd_set rfds;
       struct timeval tv;
@@ -145,7 +220,7 @@ int main(void)
    }
    printf("termtest: select zero-timeout OK\n");
 
-   /* 8. poll(2) zero timeout */
+   /* 13. poll(2) zero timeout */
    {
       struct pollfd pfd;
       pfd.fd = 0;
@@ -159,7 +234,7 @@ int main(void)
    }
    printf("termtest: poll zero-timeout OK\n");
 
-   /* 9. restore canonical mode */
+   /* 14. restore canonical mode */
    if (tcsetattr(0, TCSANOW, &canon))
       return fail("tcsetattr(canonical restore)");
    if (tcgetattr(0, &back))

@@ -33,6 +33,7 @@ static unsigned int fb_rshift, fb_rsize, fb_gshift, fb_gsize, fb_bshift, fb_bsiz
 static unsigned char *fb_base;
 static int fb_cx = -1;
 static int fb_cy = -1;
+static int fb_cursor_vis = 1;
 static unsigned int fb_zoom_x = 1;
 static unsigned int fb_zoom_y = 1;
 static unsigned int fb_offx;
@@ -519,27 +520,47 @@ void fbconsole_clear_screen(void)
     fbconsole_cursor_to(0, 0);
 }
 
-void fbconsole_cursor_to(int x, int y)
+static void fb_cursor_draw(int x, int y)
 {
     unsigned int row, col;
     unsigned int white;
+    white = fb_color(0x0Fu);
+    for (row = 0; row < 16u * (fb_zoom_y ? fb_zoom_y : 1u); row++)
+        for (col = 0; col < 8u * (fb_zoom_x ? fb_zoom_x : 1u); col++)
+            fb_put_pixel(fb_cell_px(x) + col, fb_cell_py(y) + row, white);
+    fb_flush_glyph(fb_cell_px(x), fb_cell_py(y));
+}
+
+void fbconsole_cursor_to(int x, int y)
+{
     if (!fbconsole_active() || !fb_live_render)
         return;
     if (x < 0) x = 0;
     if (x >= 80) x = 79;
     if (y < 0) y = 0;
     if (y >= 25) y = 24;
-    if (fb_cx == x && fb_cy == y)
+    if (fb_cx == x && fb_cy == y && fb_cursor_vis)
         return;
-    if (fb_cx >= 0)
+    if (fb_cx >= 0 && fb_cursor_vis)
         fb_reblit_cell(fb_cx, fb_cy);
     fb_cx = x;
     fb_cy = y;
-    white = fb_color(0x0Fu);
-    for (row = 0; row < 16u * (fb_zoom_y ? fb_zoom_y : 1u); row++)
-        for (col = 0; col < 8u * (fb_zoom_x ? fb_zoom_x : 1u); col++)
-            fb_put_pixel(fb_cell_px(x) + col, fb_cell_py(y) + row, white);
-    fb_flush_glyph(fb_cell_px(x), fb_cell_py(y));
+    if (fb_cursor_vis)
+        fb_cursor_draw(x, y);
+}
+
+void fbconsole_cursor_visible(int visible)
+{
+    if (!fbconsole_active() || !fb_live_render)
+        return;
+    visible = visible ? 1 : 0;
+    if (visible == fb_cursor_vis)
+        return;
+    if (!visible && fb_cx >= 0)
+        fb_reblit_cell(fb_cx, fb_cy);
+    fb_cursor_vis = visible;
+    if (visible)
+        fb_cursor_draw(fb_cx < 0 ? 0 : fb_cx, fb_cy < 0 ? 0 : fb_cy);
 }
 
 void fbconsole_selftest(void)

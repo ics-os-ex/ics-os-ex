@@ -54,22 +54,25 @@ static void fat_wait_io(DWORD hdl)
 }
 
 int fat_deviceid;
-static sync_sharedvar fat_volume_busy[MAXDEVICES];
+#define FAT_VOLUME_LOCKS 16
+static sync_sharedvar fat_volume_busy[FAT_VOLUME_LOCKS];
 
 /* Serializes FAT metadata, the shared fatcache[] buffer, and volume I/O.
    Hold across fat_wait_io() (which may taskswitch). Nested acquire by the
    same owner is allowed. Readers that skip this lock can loadfat() into a
-   cache buffer a writer is still walking, which truncates guest files. */
+   cache buffer a writer is still walking, which truncates guest files.
+   Device ids are hashed so unrelated volumes may share a lock; that only
+   serializes I/O and does not change per-volume ordering. */
 static void fat_lock_volume(int id)
 {
-   if (id >= 0 && id < MAXDEVICES)
-      sync_entercrit(&fat_volume_busy[id]);
+    if (id >= 0)
+       sync_entercrit(&fat_volume_busy[(unsigned)id & (FAT_VOLUME_LOCKS - 1)]);
 }
 
 static void fat_unlock_volume(int id)
 {
-   if (id >= 0 && id < MAXDEVICES)
-      sync_leavecrit(&fat_volume_busy[id]);
+    if (id >= 0)
+       sync_leavecrit(&fat_volume_busy[(unsigned)id & (FAT_VOLUME_LOCKS - 1)]);
 }
 
 int obtain_next_cluster(int cluster,void *fat,int fat_type,BPB *bpbblock,int id)
@@ -364,36 +367,61 @@ void loadfat(BPB *bpbblock,void *fat,int id)
  */
 #define FATCACHE_MAXDEVS 4
 typedef struct {
-   int   id;
-   int   valid;
-   int   dirty;
-   DWORD fat_sectors;
-   DWORD device_generation;
-   BYTE  *fat;
+    int   id;
+    int   valid;
+    int   dirty;
+    DWORD fat_sectors;
+    DWORD device_generation;
+    BYTE  *fat;
+    const void *seq_dir;
+    DWORD seq_off, seq_block;
+    unsigned int seq_clust;
 } fatcache_ent;
 
 static fatcache_ent fatcache[FATCACHE_MAXDEVS];
 
+static void fat_cache_clear_seq(fatcache_ent *e)
+{
+    e->seq_dir = 0;
+    e->seq_off = 0;
+    e->seq_block = 0;
+    e->seq_clust = 0;
+}
+
+static fatcache_ent *fat_cache_seq_entry(int id)
+{
+    int i;
+    DWORD gen = devmgr_get_generation(id);
+    for (i = 0; i < FATCACHE_MAXDEVS; i++)
+       if (fatcache[i].valid && fatcache[i].id == id &&
+           fatcache[i].device_generation == gen)
+          return &fatcache[i];
+    return 0;
+}
+
 void fat_cache_invalidate(int id)
 {
-   int i;
-   for (i = 0; i < FATCACHE_MAXDEVS; i++)
-      if (fatcache[i].valid && fatcache[i].id == id)
-         fatcache[i].dirty = 1;
+    int i;
+    for (i = 0; i < FATCACHE_MAXDEVS; i++)
+       if (fatcache[i].valid && fatcache[i].id == id) {
+          fatcache[i].dirty = 1;
+          fat_cache_clear_seq(&fatcache[i]);
+       }
 }
 
 void fat_cache_freeall(void)
 {
-   int i;
-   for (i = 0; i < FATCACHE_MAXDEVS; i++) {
-      if (fatcache[i].valid && fatcache[i].fat)
-         free(fatcache[i].fat);
-      fatcache[i].fat = 0;
-      fatcache[i].valid = 0;
-      fatcache[i].dirty = 0;
-      fatcache[i].id = -1;
-      fatcache[i].fat_sectors = 0;
-   }
+    int i;
+    for (i = 0; i < FATCACHE_MAXDEVS; i++) {
+       if (fatcache[i].valid && fatcache[i].fat)
+          free(fatcache[i].fat);
+       fatcache[i].fat = 0;
+       fatcache[i].valid = 0;
+       fatcache[i].dirty = 0;
+       fatcache[i].id = -1;
+       fatcache[i].fat_sectors = 0;
+       fat_cache_clear_seq(&fatcache[i]);
+    }
 }
 
 BYTE *fat_cache_get(BPB *bpbblock, int id)
@@ -1986,47 +2014,57 @@ int fillsectorinfo(fatdirentry *dir,BPB *bpbblock,DWORD *sectinfo,int id)
 
       
 int writefile12EX2(fatdirentry *dir,BPB *bpbblock,char *buf,int se,int start,int end,int id)
-      {
-         unsigned int cluster, sector, ofs=0 , block=0; //obtain starting cluster
-         DWORD handle;
-         DWORD bytes_per_cluster = fat_getbytesperblock(id);
-         DWORD startblock = start / bytes_per_cluster;
-         DWORD endblock =   end / bytes_per_cluster;
-         DWORD adj= end % bytes_per_cluster + 1;
-         DWORD startadj =  start % bytes_per_cluster ;
-         DWORD startlength= bytes_per_cluster - startadj;
-         DWORD sectors_per_cluster = bpbblock->sectors_per_cluster;
-          BYTE *fat = 0;
-          int fat_type;
-          int fat_own = 0;
-          void *temp_buffer;
+        {
+           unsigned int cluster, sector, ofs=0 , block=0; //obtain starting cluster
+           DWORD handle;
+           DWORD bytes_per_cluster = bpbblock->sectors_per_cluster * bpbblock->bytes_per_sector;
+           DWORD startblock = start / bytes_per_cluster;
+           DWORD endblock =   end / bytes_per_cluster;
+           DWORD adj= end % bytes_per_cluster + 1;
+           DWORD startadj =  start % bytes_per_cluster ;
+           DWORD startlength= bytes_per_cluster - startadj;
+           DWORD sectors_per_cluster = bpbblock->sectors_per_cluster;
+            BYTE *fat = 0;
+            int fat_type;
+            int fat_own = 0;
+            void *temp_buffer;
+            fatcache_ent *seq;
 
 
-          DWORD total_requests = endblock-startblock + 1;
+           DWORD total_requests = endblock-startblock + 1;
 
-          fat_type = fat_get_fat_type(id,bpbblock);
+           fat_type = fat_get_fat_type(id,bpbblock);
 
-         cluster=dir->st_clust;
-         
-         if (cluster==0) return 0;
-         
-         if (fat_type!=FAT12_FAT32)
-          {
-          fat=fat_cache_get(bpbblock,id);
-          if (!fat)
-          {
-             fat=(BYTE*)malloc(bpbblock->sectors_per_fat*512);//allocate memory for FAT
-             loadfat(bpbblock,fat,id);
-             fat_own=1;
-          }
-          };
+           cluster=dir->st_clust;
 
-          ofs = 0;
+           if (cluster==0) return 0;
 
-          //allocate temporary buffer, where we will place our data
-          temp_buffer = (void*)malloc(bytes_per_cluster);
-         
-         do {
+           if (fat_type!=FAT12_FAT32)
+            {
+            fat=fat_cache_get(bpbblock,id);
+            if (!fat)
+            {
+               fat=(BYTE*)malloc(bpbblock->sectors_per_fat*512);//allocate memory for FAT
+               loadfat(bpbblock,fat,id);
+               fat_own=1;
+            }
+            };
+
+            ofs = 0;
+
+            //allocate temporary buffer, where we will place our data
+            temp_buffer = (void*)malloc(bytes_per_cluster);
+            seq = fat_cache_seq_entry(id);
+            if (seq && !(dir->attrib & ATTR_DIRECTORY) &&
+                seq->seq_dir == (const void *)dir &&
+                seq->seq_off == (DWORD)start && seq->seq_block == startblock &&
+                seq->seq_clust && seq->seq_clust < (unsigned)fat_get_eoc(fat_type))
+            {
+               block = (unsigned)startblock;
+               cluster = seq->seq_clust;
+            }
+
+          do {
             
             /*convert cluster numbers to sectors numbers, since the block device
             only understands sector numbers*/
@@ -2097,12 +2135,29 @@ int writefile12EX2(fatdirentry *dir,BPB *bpbblock,char *buf,int se,int start,int
          while (cluster < fat_get_eoc(fat_type));
          
 
-         free(temp_buffer);
+         if (seq && !(dir->attrib & ATTR_DIRECTORY))
+            {
+               DWORD noff = (DWORD)end + 1;
+               seq->seq_off = noff;
+               seq->seq_dir = (const void *)dir;
+               if (noff / bytes_per_cluster == endblock)
+               {
+                  seq->seq_block = endblock;
+                  seq->seq_clust = cluster;
+               }
+               else
+               {
+                  seq->seq_block = endblock + 1;
+                  seq->seq_clust = (unsigned)obtain_next_cluster(cluster,fat,fat_type,bpbblock,id);
+               }
+            };
 
-          if (fat!=0 && fat_own)
-          free(fat);
-          return 1; //success
-       ;};
+          free(temp_buffer);
+
+           if (fat!=0 && fat_own)
+           free(fat);
+           return 1; //success
+        ;};
       
       
 DWORD fat_openfileEX(vfs_node *f,char *bufr,int start,int end,int id)

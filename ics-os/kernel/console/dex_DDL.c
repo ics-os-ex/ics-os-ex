@@ -244,9 +244,9 @@ void Dex32UpdateCursor(DEX32_DDL_INFO *dev, int y, int x){
 
 //Emulates an ANSI compatible display subsystem
 void Dex32PutC(DEX32_DDL_INFO *dev, char c){
-   /* Serial mirror lives in putcEX to avoid double COM1 output. */
-   if (!ddl_ptr_ok(dev))
-      return;
+    /* Serial mirror lives in putcEX to avoid double COM1 output. */
+    if (!ddl_ptr_ok(dev))
+       return;
    if (c=='\t'){
       int i;
       for (i=0;i<3;i++)

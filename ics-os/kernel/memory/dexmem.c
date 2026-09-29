@@ -10,6 +10,13 @@
 #include "../cpu/spinlock.h"
 #include "../cpu/smp.h"
 
+/* Kernel heap (kheap.c); forward-declared here rather than #including kheap.h
+   because that header defines a global (auxillary_malloc_base) and is not
+   guarded, so it must not be pulled into this translation unit.  The per-process
+   VMA table (PCB386.vmas) is heap-allocated with malloc() and freed on exit. */
+void *malloc(unsigned int size);
+void free(void *ptr);
+
 /* Stop Interrupts */
 inline void stopints(){
   asm ("cli");
@@ -1301,99 +1308,621 @@ void *dex32_sbrk(unsigned int amt)
       return (void*)ret;
     };
 
-/* Anonymous mmap: grow down from mmap_brk so GGC pages are not in the
-   sbrk/malloc arena.  File-backed maps stay in the SDK. */
-void *dex32_mmap(unsigned long length, unsigned long flags,
+#ifdef __x86_64__
+/* ===================== mmap VMA subsystem =====================
+   Backs the real mmap/munmap/mprotect/msync syscalls with a per-process
+   table of virtual memory areas (PCB386.vmas, see dexmem.h).
+
+   Anonymous maps are committed eagerly from the frame pool.  File-backed maps
+   are demand-paged: the VMA is recorded at mmap() and the backing frame is
+   loaded on the first page fault (vm_area_fault), so a large map costs no
+   frames until it is touched.  MAP_SHARED dirty pages are written back to the
+   file on munmap/exit/msync.  There is no page cache: frames are per-process,
+   so two processes mapping one file do not share frames (a MAP_SHARED write
+   back is per-process). */
+
+/* Standard POSIX errno values returned to user space as negative values.
+   Named MMAP_* so they do not collide with the kernel's per-file errno macros
+   (e.g. dlmalloc.c redefines ENOMEM to a non-POSIX pool sentinel). */
+#define MMAP_EBADF   9
+#define MMAP_ENOMEM  12
+#define MMAP_EINVAL  22
+
+/* Mirror of sdk/include/sys/mman.h (keep in sync). */
+#define MPROT_READ    1
+#define MPROT_WRITE   2
+#define MPROT_EXEC    4
+#define MMAP_SHARED   1
+#define MMAP_PRIVATE  2
+#define MMAP_ANON     0x20
+#define MMAP_FIXED    0x10
+#define MMAP_GUARD    0x100000UL   /* keep the bump allocator clear of sbrk */
+
+static unsigned long vm_attb_from_prot(unsigned long prot)
+{
+   unsigned long a = PG_USER;
+   if (prot & MPROT_WRITE)
+      a |= PG_WR;
+   return a;
+}
+
+static vm_area *vm_area_slot(struct _PCB386 *p, unsigned long va)
+{
+    int i;
+    if (!p->vmas)
+       return 0;
+    for (i = 0; i < VMA_MAX; i++) {
+       if (p->vmas[i].start == 0)
+          continue;
+       if (va >= p->vmas[i].start && va < p->vmas[i].end)
+          return &p->vmas[i];
+    }
+    return 0;
+}
+
+vm_area *vm_area_find(const struct _PCB386 *p, unsigned long va)
+{
+   return (vm_area *)vm_area_slot((struct _PCB386 *)p, va);
+}
+
+static int vm_vma_overlap(vm_area *a, vm_area *b)
+{
+   return a->start < b->end && b->start < a->end;
+}
+
+/* Read the present 4KiB PTE for vaddr in a private PML4.  Returns the entry
+   (0 if absent / not a 4KiB leaf) and, if phys_out, the frame it maps. */
+static u64 vm_pte_entry(u64 *pml4, unsigned long long vaddr, u64 *phys_out)
+{
+   const u64 phys_mask = 0x000FFFFFFFFF000ULL;
+   u64 *pml4v, *pdpt, *pd, *pte;
+   u64 e;
+   if (!userpd_is_private(pml4) || vaddr >= 0x40000000ULL)
+      return 0;
+   pml4v = (u64 *)KDIRECT((u64)(uintptr)pml4 & phys_mask);
+   e = pml4v[(vaddr >> 39) & 0x1FF];
+   if (!(e & PG_PRESENT) || (e & PG_PAGESIZE))
+      return 0;
+   pdpt = (u64 *)KDIRECT(e & phys_mask);
+   e = pdpt[(vaddr >> 30) & 0x1FF];
+   if (!(e & PG_PRESENT) || (e & PG_PAGESIZE))
+      return 0;
+   pd = (u64 *)KDIRECT(e & phys_mask);
+   e = pd[(vaddr >> 21) & 0x1FF];
+   if (!(e & PG_PRESENT) || (e & PG_PAGESIZE))
+      return 0;
+   pte = (u64 *)KDIRECT(e & phys_mask);
+   e = pte[(vaddr >> 12) & 0x1FF];
+   if (!(e & PG_PRESENT))
+      return 0;
+   if (phys_out)
+      *phys_out = e & phys_mask;
+   return e;
+}
+
+/* Forward decls: the frame-pool helpers are defined later in this file
+   (near the userpd_* routines) but vm_install_page() uses upop() here. */
+static DWORD *upop(void);
+static void upush(DWORD *fr);
+
+/* Install an already-filled frame at vaddr, creating the 4KiB PTE table if
+   needed.  The caller allocated and filled the frame, so the user never
+   observes a partially-loaded page.  The walk mirrors userpd_map_page() and
+   relies on per-process isolation (the faulting task owns its PML4).  Returns
+   1 if this call installed the PTE, 0 if the VA was already present (caller
+   releases the frame), or -1 on OOM / bad VA. */
+static int vm_install_page(u64 *pml4, unsigned long long vaddr,
+                           u64 phys, unsigned long attb)
+{
+   const u64 phys_mask = 0x000FFFFFFFFF000ULL;
+   int bi = (int)((vaddr >> 21) & 0x1FF);
+   int gi = (int)((vaddr >> 12) & 0x1FF);
+   u64 *pml4v, *pdpt, *pd, *pte;
+   u64 pe, de, be;
+   int installed;
+
+   if (!userpd_is_private(pml4) || vaddr >= 0x40000000ULL)
+      return -1;
+   pml4v = (u64 *)KDIRECT((u64)(uintptr)pml4 & phys_mask);
+   pe = pml4v[0];
+   if (!(pe & PG_PRESENT) || (pe & PG_PAGESIZE))
+      return -1;
+   pdpt = (u64 *)KDIRECT(pe & phys_mask);
+   de = pdpt[0];
+   if (!(de & PG_PRESENT) || (de & PG_PAGESIZE))
+      return -1;
+   pd = (u64 *)KDIRECT(de & phys_mask);
+   be = pd[bi];
+   if (!(be & PG_PRESENT) || (be & PG_PAGESIZE)) {
+      u64 *t = upop();
+      if (!t)
+         return -1;
+      memset(KDIRECT((u64)(uintptr)t), 0, 0x1000);
+      pd[bi] = (u64)(uintptr)t | 0x03ULL;
+      be = pd[bi];
+      {
+         unsigned long long block = vaddr & ~0x1FFFFFULL;
+         __asm__ __volatile__("invlpg (%0)" :: "r"((unsigned long)block) : "memory");
+      }
+   }
+   pte = (u64 *)KDIRECT(be & phys_mask);
+   if (pte[gi] & PG_PRESENT)
+      installed = 0;
+   else {
+      pte[gi] = phys | (attb | PG_PRESENT);
+      installed = 1;
+      __asm__ __volatile__("invlpg (%0)" :: "r"((unsigned long)vaddr) : "memory");
+   }
+   return installed;
+}
+
+/* Write back the dirty pages of one MAP_SHARED VMA to its file.  Only pages
+   the CPU marked dirty (PG_DIRTY) are written; clean pages are left alone. */
+static void vm_flush_vma_range(struct _PCB386 *p, vm_area *v)
+{
+   u64 *pml4 = (u64 *)(uintptr)p->pagedirloc;
+   file_PCB *f = (file_PCB *)v->file;
+   unsigned long va, foff;
+   if (!f || (v->flags & VMF_SHARED) == 0)
+      return;
+   for (va = v->start, foff = v->foff; va < v->end; va += 0x1000, foff += 0x1000) {
+      u64 phys = 0;
+      u64 e = vm_pte_entry(pml4, (unsigned long long)va, &phys);
+      if (!(e & PG_PRESENT) || !(e & PG_DIRTY))
+         continue;
+      (void)vfs_write_at(f, (DWORD)foff, (const char *)KDIRECT(phys), 0x1000);
+   }
+}
+
+unsigned long vm_area_alloc(struct _PCB386 *p, unsigned long length,
+                            unsigned long prot, unsigned long flags,
+                            void *file, unsigned long foff,
+                            unsigned long hint, int fixed)
+{
+   unsigned long pages, vlen, heap, base;
+   int slot, i;
+   u64 *pml4;
+
+   if (!p || length == 0)
+       return 0;
+    if (!p->vmas) {
+       /* Lazily allocate the VMA table on first mmap so processes that never
+          map keep a NULL pointer and no heap cost. */
+       p->vmas = (vm_area *)malloc(sizeof(vm_area) * VMA_MAX);
+       if (!p->vmas)
+          return 0;
+       memset(p->vmas, 0, sizeof(vm_area) * VMA_MAX);
+    }
+    pages = (length + 0xFFFUL) / 0x1000UL;
+    vlen = pages * 0x1000UL;
+    heap = (unsigned long)(uintptr)p->knext;
+   if (heap < MEM_USER_HEAP)
+      heap = MEM_USER_HEAP;
+
+   if (fixed) {
+      base = hint & ~0xFFFUL;
+      if (base < heap + MMAP_GUARD || base + vlen > MEM_USER_HEAP_LIMIT)
+         return 0;
+      /* MAP_FIXED: reject overlap with an existing VMA (we do not split). */
+      for (i = 0; i < VMA_MAX; i++) {
+         vm_area t;
+         if (p->vmas[i].start == 0)
+            continue;
+         t.start = base;
+         t.end = base + vlen;
+         if (vm_vma_overlap(&t, &p->vmas[i]))
+            return 0;
+      }
+   } else {
+      unsigned long top;
+      if (!p->mmap_brk)
+         p->mmap_brk = (char *)(uintptr)MEM_USER_HEAP_LIMIT;
+      top = (unsigned long)(uintptr)p->mmap_brk;
+      if (top < vlen + MMAP_GUARD || top - vlen < heap + MMAP_GUARD)
+         return 0;
+      base = (top - vlen) & ~0xFFFUL;
+   }
+
+   slot = -1;
+   for (i = 0; i < VMA_MAX; i++) {
+      if (p->vmas[i].start == 0) { slot = i; break; }
+   }
+   if (slot < 0)
+      return 0;
+
+   pml4 = (u64 *)(uintptr)p->pagedirloc;
+   if (!file) {
+      /* Anonymous: commit eagerly so the map is immediately usable. */
+      for (i = 0; i < (int)pages; i++) {
+         if (!userpd_map_page(pml4,
+                              (unsigned long long)base + (unsigned long long)i * 0x1000ULL,
+                              vm_attb_from_prot(prot))) {
+            unsigned long j;
+            for (j = 0; j < (unsigned long)i; j++)
+               userpd_unmap_page(pml4,
+                                 (unsigned long long)base + (unsigned long long)j * 0x1000ULL);
+            return 0;
+         }
+      }
+   }
+   p->vmas[slot].start = base;
+   p->vmas[slot].end = base + vlen;
+   p->vmas[slot].prot = vm_attb_from_prot(prot);
+   p->vmas[slot].flags = (flags & MMAP_SHARED) ? VMF_SHARED : VMF_PRIVATE;
+   p->vmas[slot].file = file;
+   p->vmas[slot].foff = foff & ~0xFFFUL;
+   if (!fixed)
+      p->mmap_brk = (char *)(uintptr)base;
+   return base;
+}
+
+int vm_area_remove(struct _PCB386 *p, unsigned long start, unsigned long end)
+{
+   u64 *pml4;
+   int i;
+   int removed = 0;
+
+   if (!p || start >= end || (start & 0xFFFUL) || (end & 0xFFFUL))
+       return -1;
+    if (!p->vmas)
+       return -1;
+    pml4 = (u64 *)(uintptr)p->pagedirloc;
+    for (i = 0; i < VMA_MAX; i++) {
+       vm_area *v = &p->vmas[i];
+       if (v->start == 0 || v->start >= end || v->end <= start)
+          continue;
+      {
+         unsigned long fs = (start > v->start) ? start : v->start;
+         unsigned long fe = (end < v->end) ? end : v->end;
+         unsigned long va;
+       if (v->flags & VMF_SHARED) {
+             vm_area sub = *v;
+             sub.start = fs;
+             sub.end = fe;
+             sub.foff = v->foff + (fs - v->start);
+             vm_flush_vma_range(p, &sub);
+          }
+         for (va = fs; va < fe; va += 0x1000)
+            userpd_unmap_page(pml4, (unsigned long long)va);
+      }
+      if (start <= v->start && v->end <= end) {
+         if (v->file)
+            vfs_file_put((file_PCB *)v->file);
+         v->start = 0;
+      } else if (start <= v->start) {
+         /* removed the left part: keep [end, v->end) */
+         v->foff += end - v->start;
+         v->start = end;
+      } else if (v->end <= end) {
+         /* removed the right part: keep [v->start, start) */
+         v->end = start;
+      } else {
+         /* both ends trimmed: split.  Keep [v->start, start) here and, if a
+            slot is free, record [end, v->end) with its own file ref.  If no
+            slot is free the right tail loses its VMA and re-faults (lazy). */
+         unsigned long orig_end = v->end;
+         unsigned long newfoff = v->foff + (end - v->start);
+         unsigned long rprot = v->prot;
+         unsigned long rflags = v->flags;
+         void *rfile = v->file;
+         int j;
+         v->end = start;
+         for (j = 0; j < VMA_MAX; j++) {
+            if (p->vmas[j].start == 0) {
+               p->vmas[j].start = end;
+               p->vmas[j].end = orig_end;
+               p->vmas[j].prot = rprot;
+               p->vmas[j].flags = rflags;
+               p->vmas[j].file = rfile;
+               p->vmas[j].foff = newfoff;
+               if (rfile)
+                  vfs_file_get((file_PCB *)rfile);
+               break;
+            }
+         }
+      }
+      removed++;
+   }
+   return removed ? 0 : -1;
+}
+
+int vm_area_set_prot(struct _PCB386 *p, unsigned long start, unsigned long end,
+                     unsigned long prot)
+{
+   u64 *pml4;
+   unsigned long attb;
+   int i;
+   int covered = 1;
+
+  if (!p || start >= end || (start & 0xFFFUL) || (end & 0xFFFUL))
+       return -1;
+    if (!p->vmas)
+       return -1;
+    attb = vm_attb_from_prot(prot);
+    pml4 = (u64 *)(uintptr)p->pagedirloc;
+   for (i = 0; i < VMA_MAX; i++) {
+      vm_area *v = &p->vmas[i];
+      if (v->start == 0 || v->start >= end || v->end <= start)
+         continue;
+      if (v->start < start || v->end > end)
+         covered = 0;   /* range not fully inside one VMA */
+      v->prot = attb;
+   }
+   /* Rewrite the present leaf PTEs over the range so the new prot applies to
+      already-faulted pages; absent pages pick up the new prot on next fault. */
+   for (i = 0; i < VMA_MAX; i++) {
+      vm_area *v = &p->vmas[i];
+      unsigned long va;
+      if (v->start == 0 || v->start >= end || v->end <= start)
+         continue;
+      for (va = (start > v->start) ? start : v->start;
+           va < ((end < v->end) ? end : v->end); va += 0x1000) {
+         u64 phys = 0;
+         u64 e = vm_pte_entry(pml4, (unsigned long long)va, &phys);
+         if (!(e & PG_PRESENT) || (e & PG_PAGESIZE))
+            continue;
+         {
+            int bi = (int)((va >> 21) & 0x1FF);
+            int gi = (int)((va >> 12) & 0x1FF);
+            const u64 phys_mask = 0x000FFFFFFFFF000ULL;
+            u64 *pml4v = (u64 *)KDIRECT((u64)(uintptr)pml4 & phys_mask);
+            u64 *pdpt = (u64 *)KDIRECT(pml4v[0] & phys_mask);
+            u64 *pd = (u64 *)KDIRECT(pdpt[0] & phys_mask);
+            u64 *pte = (u64 *)KDIRECT(pd[bi] & phys_mask);
+            pte[gi] = (pte[gi] & ~((u64)(PG_WR | PG_USER))) | attb;
+            __asm__ __volatile__("invlpg (%0)" :: "r"((unsigned long)va) : "memory");
+         }
+      }
+   }
+   return covered ? 0 : -1;
+}
+
+int vm_area_fault(struct _PCB386 *p, unsigned long va, unsigned fault_info)
+{
+   vm_area *v;
+   u64 *pml4;
+   u64 phys;
+   unsigned long foff;
+   (void)fault_info;
+
+   if (!p)
+      return 0;
+   va &= ~0xFFFUL;
+   v = vm_area_find(p, va);
+   if (!v)
+      return 0;
+   pml4 = (u64 *)(uintptr)p->pagedirloc;
+   phys = frame_alloc();
+   if (!phys)
+      return -1;
+   memset(KDIRECT(phys), 0, 0x1000);
+   foff = v->foff + (va - v->start);
+   if (v->file) {
+      int n = vfs_read_at((file_PCB *)v->file, (DWORD)foff,
+                          (char *)KDIRECT(phys), 0x1000);
+      if (n < 0) {
+         frame_release(phys);
+         return -1;
+      }
+   }
+   {
+       int r = vm_install_page(pml4, (unsigned long long)va, phys, v->prot);
+       if (r < 0) {
+          frame_release(phys);
+          return -1;
+       }
+       if (r == 0)
+          frame_release(phys);   /* VA became present under us; keep the old page */
+    }
+    return 1;
+}
+
+int vm_area_fork(const struct _PCB386 *parent, struct _PCB386 *child)
+{
+    int i;
+    if (!parent || !child)
+       return -1;
+    if (!parent->vmas)
+       return 0;   /* parent has no VMAs; child table stays NULL */
+    child->vmas = (vm_area *)malloc(sizeof(vm_area) * VMA_MAX);
+    if (!child->vmas)
+       return -1;
+    memset(child->vmas, 0, sizeof(vm_area) * VMA_MAX);
+    for (i = 0; i < VMA_MAX; i++) {
+       if (parent->vmas[i].start == 0)
+          continue;
+       child->vmas[i] = parent->vmas[i];
+       if (child->vmas[i].file) {
+          file_PCB *f = (file_PCB *)child->vmas[i].file;
+          /* The child needs its own active_refs; if the file is closing we
+             degrade that VMA to anonymous (present pages were already COW'd). */
+          if (!vfs_file_get(f))
+             child->vmas[i].file = 0;
+       }
+    }
+    return 0;
+}
+
+void vm_area_exit(struct _PCB386 *p)
+{
+    int i;
+    if (!p || !p->vmas)
+       return;
+    for (i = 0; i < VMA_MAX; i++) {
+       if (p->vmas[i].start == 0)
+          continue;
+       if (p->vmas[i].flags & VMF_SHARED)
+          vm_flush_vma_range(p, &p->vmas[i]);
+       if (p->vmas[i].file)
+          vfs_file_put((file_PCB *)p->vmas[i].file);
+       p->vmas[i].start = 0;
+    }
+    free(p->vmas);
+    p->vmas = 0;
+}
+
+int vm_area_msync(struct _PCB386 *p, unsigned long start, unsigned long end)
+{
+   int i;
+   vm_area sub;
+    if (!p || start >= end || (start & 0xFFFUL) || (end & 0xFFFUL))
+       return -1;
+    if (!p->vmas)
+       return -1;
+    for (i = 0; i < VMA_MAX; i++) {
+       if (p->vmas[i].start == 0 || p->vmas[i].start >= end || p->vmas[i].end <= start)
+          continue;
+      if ((p->vmas[i].flags & VMF_SHARED) && p->vmas[i].file) {
+         sub = p->vmas[i];
+         sub.start = (start > sub.start) ? start : sub.start;
+         sub.end = (end < sub.end) ? end : sub.end;
+         sub.foff = p->vmas[i].foff + (sub.start - p->vmas[i].start);
+         vm_flush_vma_range(p, &sub);
+      }
+   }
+   return 0;
+}
+
+/* mmap(): the first ABI slot carries a user pointer to struct mmap_args (the
+   six values do not fit the five-register DEX int 0x30 ABI).  Returns the
+   mapped base or a negative MMAP_* errno. */
+void *dex32_mmap(unsigned long arg1, unsigned long flags,
                  unsigned long a3, unsigned long a4, unsigned long a5)
 {
-#ifdef __x86_64__
-     DWORD irq;
-     unsigned long pages, i, va, start, heap;
-     (void)flags;
-     (void)a3;
-     (void)a4;
-     (void)a5;
+   struct mmap_args *ua = (struct mmap_args *)(uintptr)arg1;
+   struct mmap_args a;
+   unsigned long heap;
+   void *file = 0;
+   long ret;
+   (void)flags; (void)a3; (void)a4; (void)a5;
 
-     if (length == 0)
-        return (void *)(uintptr)-1;
-     pages = (length + 4095UL) / 4096UL;
-     length = pages * 4096UL;
+   if (!ua || !current_process)
+      return (void *)(uintptr)(-MMAP_EINVAL);
+   memcpy(&a, ua, sizeof(a));
+   if (a.length == 0)
+      return (void *)(uintptr)(-MMAP_EINVAL);
+   heap = (unsigned long)(uintptr)current_process->knext;
+   if (heap < MEM_USER_HEAP)
+      heap = MEM_USER_HEAP;
 
-     dex32_stopints(&irq);
-     if (!current_process->mmap_brk)
-        current_process->mmap_brk = (char *)(uintptr)MEM_USER_HEAP_LIMIT;
-     start = (unsigned long)(uintptr)current_process->mmap_brk;
-     heap = (unsigned long)(uintptr)current_process->knext;
-     if (start < length + 0x100000UL || start - length < heap + 0x100000UL) {
-        dex32_restoreints(irq);
-        return (void *)(uintptr)-1;
-     }
-     va = (start - length) & ~0xFFFUL;
-     for (i = 0; i < pages; i++) {
-        if (!userpd_map_page((u64 *)(uintptr)current_process->pagedirloc,
-                             (unsigned long long)va + (unsigned long long)i * 0x1000ULL,
-                             PG_USER | PG_WR)) {
-           unsigned long j;
-           for (j = 0; j < i; j++)
-              userpd_unmap_page((u64 *)(uintptr)current_process->pagedirloc,
-                                (unsigned long long)va + (unsigned long long)j * 0x1000ULL);
-           dex32_restoreints(irq);
-           return (void *)(uintptr)-1;
-        }
-        {
-           unsigned long pva = va + i * 0x1000UL;
-           __asm__ __volatile__("invlpg (%0)" :: "r"(pva) : "memory");
-        }
-     }
-     current_process->mmap_brk = (char *)(uintptr)va;
-     dex32_restoreints(irq);
-     return (void *)(uintptr)va;
-#else
-     (void)length; (void)flags; (void)a3; (void)a4; (void)a5;
-     return (void *)(uintptr)-1;
-#endif
+   if ((a.flags & MMAP_ANON) || a.fd == (unsigned long)-1) {
+       unsigned long base = vm_area_alloc(current_process, a.length, a.prot,
+                                          a.flags, 0, 0, a.addr,
+                                          (a.flags & MMAP_FIXED) ? 1 : 0);
+       if (!base)
+          return (void *)(uintptr)(-MMAP_ENOMEM);
+       return (void *)(uintptr)base;
+    }
+
+   /* File-backed: require an aligned offset inside the file, take a ref. */
+   if (a.offset & 0xFFFUL)
+      return (void *)(uintptr)(-MMAP_EINVAL);
+   file = sys_fd_file((int)a.fd);
+   if (!file)
+      return (void *)(uintptr)(-MMAP_EBADF);
+   if (!vfs_file_get((file_PCB *)file)) {
+      return (void *)(uintptr)(-MMAP_EBADF);
+   }
+   {
+      unsigned long base = vm_area_alloc(current_process, a.length, a.prot,
+                                         a.flags, file, a.offset,
+                                         a.addr, (a.flags & MMAP_FIXED) ? 1 : 0);
+      if (!base) {
+         vfs_file_put((file_PCB *)file);
+         return (void *)(uintptr)(-MMAP_ENOMEM);
+      }
+      ret = (long)base;
+   }
+   return (void *)(uintptr)ret;
 }
 
 int dex32_munmap(unsigned long addr, unsigned long length,
                  unsigned long a3, unsigned long a4, unsigned long a5)
 {
-#ifdef __x86_64__
-     DWORD irq;
-     unsigned long pages, i, heap, mmap_lim;
-     (void)a3;
-     (void)a4;
-     (void)a5;
-
-     if (length == 0)
-        return 0;
-     if (addr & 0xFFFUL)
-        return -1;
-     pages = (length + 4095UL) / 4096UL;
-     heap = (unsigned long)(uintptr)current_process->knext;
-     mmap_lim = current_process->mmap_brk
-        ? (unsigned long)(uintptr)current_process->mmap_brk
-        : (unsigned long)MEM_USER_HEAP_LIMIT;
-     /* Only unmap pages in the anonymous mmap window. */
-     if (addr < mmap_lim || addr + pages * 4096UL > MEM_USER_HEAP_LIMIT)
-        return -1;
-     if (addr < heap)
-        return -1;
-
-     dex32_stopints(&irq);
-     for (i = 0; i < pages; i++) {
-        if (!userpd_unmap_page((u64 *)(uintptr)current_process->pagedirloc,
-                               (unsigned long long)addr + (unsigned long long)i * 0x1000ULL)) {
-           dex32_restoreints(irq);
-           return -1;
-        }
-     }
-     dex32_restoreints(irq);
-     return 0;
-#else
-     (void)addr; (void)length; (void)a3; (void)a4; (void)a5;
-     return -1;
-#endif
+   (void)a3; (void)a4; (void)a5;
+   if (!current_process)
+      return -1;
+   if (length == 0)
+      return 0;
+   if (addr & 0xFFFUL)
+      return -MMAP_EINVAL;
+   return vm_area_remove(current_process, addr, addr + ((length + 0xFFF) & ~0xFFFUL));
 }
+
+void *dex32_mprotect(unsigned long addr, unsigned long length,
+                     unsigned long prot, unsigned long a3, unsigned long a4)
+{
+   (void)a3; (void)a4;
+   if (!current_process)
+      return (void *)(uintptr)(-MMAP_EINVAL);
+   if (length == 0 || (addr & 0xFFFUL))
+      return (void *)(uintptr)(-MMAP_EINVAL);
+   if (vm_area_set_prot(current_process, addr,
+                        addr + ((length + 0xFFF) & ~0xFFFUL), prot) < 0)
+      return (void *)(uintptr)(-MMAP_EINVAL);
+   return (void *)0;
+}
+
+void *dex32_msync(unsigned long addr, unsigned long length,
+                  unsigned long flags, unsigned long a3, unsigned long a4)
+{
+   (void)flags; (void)a3; (void)a4;
+   if (!current_process)
+      return (void *)(uintptr)(-MMAP_EINVAL);
+   if (length == 0 || (addr & 0xFFFUL))
+      return (void *)(uintptr)(-MMAP_EINVAL);
+   if (vm_area_msync(current_process, addr,
+                     addr + ((length + 0xFFF) & ~0xFFFUL)) < 0)
+      return (void *)(uintptr)(-MMAP_EINVAL);
+   return (void *)0;
+}
+#else
+/* 32-bit build: no VMA subsystem.  Keep the syscall surface linkable. */
+void *dex32_mmap(unsigned long length, unsigned long flags,
+                 unsigned long a3, unsigned long a4, unsigned long a5)
+{
+   (void)length; (void)flags; (void)a3; (void)a4; (void)a5;
+   return (void *)(uintptr)-1;
+}
+int dex32_munmap(unsigned long addr, unsigned long length,
+                 unsigned long a3, unsigned long a4, unsigned long a5)
+{
+   (void)addr; (void)length; (void)a3; (void)a4; (void)a5;
+   return -1;
+}
+void *dex32_mprotect(unsigned long addr, unsigned long length,
+                     unsigned long prot, unsigned long a3, unsigned long a4)
+{
+   (void)addr; (void)length; (void)prot; (void)a3; (void)a4;
+   return (void *)(uintptr)-1;
+}
+void *dex32_msync(unsigned long addr, unsigned long length,
+                  unsigned long flags, unsigned long a3, unsigned long a4)
+{
+   (void)addr; (void)length; (void)flags; (void)a3; (void)a4;
+   return (void *)(uintptr)-1;
+}
+vm_area *vm_area_find(const struct _PCB386 *p, unsigned long va)
+{ (void)p; (void)va; return 0; }
+unsigned long vm_area_alloc(struct _PCB386 *p, unsigned long length,
+                            unsigned long prot, unsigned long flags,
+                            void *file, unsigned long foff,
+                            unsigned long hint, int fixed)
+{ (void)p;(void)length;(void)prot;(void)flags;(void)file;(void)foff;(void)hint;(void)fixed; return 0; }
+int vm_area_remove(struct _PCB386 *p, unsigned long start, unsigned long end)
+{ (void)p;(void)start;(void)end; return -1; }
+int vm_area_set_prot(struct _PCB386 *p, unsigned long start, unsigned long end,
+                     unsigned long prot)
+{ (void)p;(void)start;(void)end;(void)prot; return -1; }
+int vm_area_fault(struct _PCB386 *p, unsigned long va, unsigned fault_info)
+{ (void)p;(void)va;(void)fault_info; return 0; }
+int vm_area_fork(const struct _PCB386 *parent, struct _PCB386 *child)
+{ (void)parent;(void)child; return 0; }
+void vm_area_exit(struct _PCB386 *p)
+{ (void)p; }
+int vm_area_msync(struct _PCB386 *p, unsigned long start, unsigned long end)
+{ (void)p;(void)start;(void)end; return -1; }
+#endif
 
 void dex32_copy_on_write(DWORD *directory)
 {
@@ -2426,10 +2955,10 @@ u64 *userpd_clone_cow(u64 *parent, unsigned long long private_vaddr)
                 && va < MEM_SYSCALL_STACK + 0x80000ULL))
             continue;
          if ((entry & (PG_PRESENT | PG_WR)) == (PG_PRESENT | PG_WR)) {
-            entry = (entry & ~PG_WR) | PG_COPYWRITE;
-            parent_pte[gi] = entry;
-            child_pte[gi] = entry | cow_new;
-         }
+             entry = (entry & ~PG_WR) | PG_COPYWRITE;
+             parent_pte[gi] = entry;
+             child_pte[gi] = entry | cow_new;
+          }
       }
    }
    if (cow_trace_count < 4)

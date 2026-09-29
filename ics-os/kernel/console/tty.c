@@ -10,7 +10,7 @@ static tty_t *tty_com1;
 extern void taskswitch(void);
 extern void Dex32PutC(DEX32_DDL_INFO *dev, char c);
 extern void serial_putc(char c);
-extern unsigned char inportb(unsigned int port);
+extern int serial_getc(void);
 extern int get_processlist(PCB386 **buf);
 extern int console_execute(const char *str);
 extern void vt_feed(tty_t *t, int c);
@@ -120,9 +120,10 @@ void tty_attach_proc(PCB386 *p, tty_t *t)
 
 static int serial_getc_poll(void)
 {
-   if ((inportb(0x3F8 + 5) & 1) == 0)
-      return -1;
-   return (int)inportb(0x3F8);
+    /* Never probe the 16550 directly: on a COM1-less QEMU/laptop path the
+       port reads 0xFF, which the raw status test treats as a forever-ready
+       receiver and floods the canonical line buffer with 0xFF bytes. */
+    return serial_getc();
 }
 
 void tty_signal_int(tty_t *t)
@@ -314,14 +315,14 @@ int tty_read(tty_t *t, char *buf, int n)
 }
 
 int tty_write(tty_t *t, const char *buf, int n)
-{
-   int i;
-   if (!t || !buf || n <= 0)
-      return 0;
-   for (i = 0; i < n; i++)
-      tty_echo(t, buf[i]);
-   return n;
-}
+ {
+    int i;
+    if (!t || !buf || n <= 0)
+       return 0;
+    for (i = 0; i < n; i++)
+       tty_echo(t, buf[i]);
+    return n;
+ }
 
 int sys_kcmd(char *cmd)
 {

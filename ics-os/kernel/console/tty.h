@@ -20,12 +20,14 @@ struct _PCB386;
 
 /* Per-tty VT100/xterm parser state (see console/tty_vt.c). */
 typedef struct _vt_state {
-   int state;             /* 0 ground, 1 esc, 2 csi, 3 osc */
-   int csi_n;
-   char csi[24];
-   int sgr;               /* current VGA cell attribute */
+   int state;             /* 0 ground, 1 esc, 2 csi, 3 osc, 4 osc-esc */
+  int csi_n;
+    char csi[48];          /* holds a full CSI, incl. combined truecolor SGR */
+    int sgr;               /* current VGA cell attribute */
    int savx, savy;
-   int savsgr;
+    int savsgr;
+    int serx, sery;        /* lightweight cursor model for TTY_SERIAL output */
+
    int stb_top, stb_bot;  /* DECSTBM region, 0-based inclusive */
    int curhidden;
    int alt;               /* alternate screen active */
@@ -68,7 +70,9 @@ int sys_kcmd(char *cmd);
 /* VT100/xterm screen interpreter, fed by tty output (console/tty_vt.c). */
 void vt_init(vt_state_t *v);
 void vt_feed(tty_t *t, int c);
+int vt_sgr_probe(const char *seq);
 void vt_screen_clear(vt_state_t *v, struct _dex32_direct_device_hdl *ddl, int attr);
 void vt_cursor_set_visible(struct _dex32_direct_device_hdl *ddl, int visible);
+void vt_alt_exit(tty_t *t, int restorecursor);
 
 #endif

@@ -7,7 +7,7 @@
 #include "vim.h"
 
 char_u *default_vim_dir = (char_u *)"/icsos/share/vim";
-char_u *default_vimruntime_dir = (char_u *)"";
+char_u *default_vimruntime_dir = (char_u *)"/icsos/share/vim/runtime";
 char_u *all_cflags = (char_u *)"-m64 -std=gnu99 -w -nostdlib -ffreestanding -static -DHAVE_CONFIG_H ";
 char_u *all_lflags = (char_u *)"-m64 -no-pie -nostdlib -static -Wl,--gc-sections ";
 char_u *compiled_user = (char_u *)"icsos";

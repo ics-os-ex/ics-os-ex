@@ -1000,6 +1000,7 @@ volatile char *irqwrap_offchk_use3=&irqwrap_userstack_chk[0];
       goto fail;
    if (posix_fd_clone_fork(child,parent)<0)
       goto fail;
+   vm_area_fork(parent, child);
 
    dex32_stopints(&flags);
    sync_entercrit(&processmgr_busy);
@@ -1019,6 +1020,7 @@ fail:
    if (child->parameters)
       free(child->parameters);
    pcb_free_irq_kstack(child);
+   vm_area_exit(child);
    free(child);
 nomem:
     fork_frame_fail("NOMEM", parent, -12);
@@ -1295,6 +1297,7 @@ DWORD createprocess(
 
 DWORD dex32_asyncproc(saveregs *r,void *entrypoint,char *name,DWORD stacksize){
    PCB386 *temp=(PCB386*)malloc(sizeof(PCB386));
+   memset(temp,0,sizeof(PCB386));
 
    temp->before=current_process;
    strcpy(temp->name,name);
@@ -1685,6 +1688,11 @@ DWORD kill_process(DWORD processid){
             freeprocessmemory(ptr->meminfo,(DWORD*)ptr->pagedirloc); //
 
 #ifdef __x86_64__
+         /* Flush MAP_SHARED dirty pages and drop the VMA file refs BEFORE the
+            private PML4 is freed.  We hold processmgr_busy, so the flush's
+            io_busy acquire is a nested sync_entercrit and pure-spins (no
+            yield) — the timer still preempts the spin, so no deadlock. */
+         vm_area_exit(ptr);
          /* Reclaim a private PML4 whenever CR3 is a pool frame.
             User ELFs enter with kernel CS but still own the directory.
             Threads share the parent's PML4 — only the non-thread PCB
@@ -2497,6 +2505,23 @@ static void ps_unclaim_if_unused(PCB386 *process, PCB386 *prev, int me)
       process->on_cpu = -1;
 }
 
+volatile unsigned long ps_switch_dying_refusals;
+
+static void ps_switch_dying_refused(const char *path, int me, PCB386 *process,
+                                    PCB386 *prev)
+{
+   unsigned long n = __sync_add_and_fetch(&ps_switch_dying_refusals, 1);
+   if (n <= 8) {
+      char db[160];
+      sprintf(db, "SWITCH-DYING-REFUSED %s cpu=%d pid=%d status=0x%x "
+              "rip=0x%llx prev=%d n=%lu\n",
+              path, me, (int)process->processid, (unsigned)process->status,
+              (unsigned long long)process->ctx.rip,
+              prev ? (int)prev->processid : -1, n);
+      serial_puts(db);
+   }
+}
+
 void ps_switchto(PCB386 *process){
    int me = smp_cpu_id();
    PCB386 *prev = (me >= 0 && me < MAX_CPUS) ? (PCB386 *)cpus[me].current
@@ -2579,6 +2604,19 @@ void ps_switchto(PCB386 *process){
       this CPU does not own makes the next IRQ pick up that task's IRQ kstack
       (or user stack) while its real owner is still running it. */
    if (process->on_cpu != me || ps_pcb_running_elsewhere(process, me)) {
+      ps_unclaim_if_unused(process, prev, me);
+      ps_switchto_in_progress[me] = 0;
+      startints();
+      return;
+   }
+   /* The caller picked `process` before this interrupt-off window.  A timer
+      in between can run it to self_exit_current(), which marks it DYING and
+      releases on_cpu without saving ctx -- a fork child that never yielded
+      still has ctx.rip == fork_child_return over its exited stack.  DYING is
+      set while the exiting CPU still owns on_cpu, so holding the claim here
+      guarantees the flag is visible. */
+   if (process != prev && (process->status & PS_ATTB_DYING)) {
+      ps_switch_dying_refused("switch", me, process, prev);
       ps_unclaim_if_unused(process, prev, me);
       ps_switchto_in_progress[me] = 0;
       startints();
@@ -2699,9 +2737,13 @@ static void ps_switchto_load_only(PCB386 *process, PCB386 *held)
    ps_switchto_in_progress[me] = 1;
    stopints();
    if (process->on_cpu != me ||
-       foreign_idle_pid(me, (unsigned long)process->processid)) {
+       foreign_idle_pid(me, (unsigned long)process->processid) ||
+       (process != held && process != prev &&
+        (process->status & PS_ATTB_DYING))) {
       if (foreign_idle_pid(me, (unsigned long)process->processid))
          ps_current_anom_log("load", me, process);
+      else if (process->on_cpu == me && (process->status & PS_ATTB_DYING))
+         ps_switch_dying_refused("load", me, process, prev);
       if (process->on_cpu == me && process != prev && process != held)
          process->on_cpu = -1;
       ps_switchto_in_progress[me] = 0;
@@ -2817,6 +2859,11 @@ static void zombie_reclaim(PCB386 *z)
              zombie_enqueue(z);
              return;
           }
+          /* Flush MAP_SHARED dirty pages and drop VMA file refs before the
+             PML4 is freed.  self_exit_current already closed the fds in this
+             path; the VMA's own active_refs keep the file_PCB alive for the
+             flush. */
+          vm_area_exit(z);
           userpd_free((u64 *)(uintptr)z->pagedirloc);
           z->pagedirloc = pagedir1;
        }
@@ -3092,6 +3139,35 @@ inline void taskswitch(){
 
 /* Invoked from the timer IRQ wrapper after time_handler(). */
 
+/* Fault injection ("fault-switch-gap" cmdline): hold the window between
+   scheduler() picking a never-run fork child and ps_switchto() open with
+   interrupts enabled until a nested timer switch has run that child to
+   self-exit.  Deterministically reproduces the stale-choice switch into a
+   DYING PCB that re-ran fork_child_return over the child's exit stack. */
+volatile int sched_inject_switch_gap;
+
+static void sched_switch_gap_inject(PCB386 *chosen)
+{
+   extern void fork_child_return(void);
+   DWORD flags;
+   unsigned int t0;
+
+   if (chosen->accesslevel != ACCESS_USER ||
+       chosen->ctx.rip != (u64)(uintptr)fork_child_return)
+      return;
+   if (__sync_sub_and_fetch(&sched_inject_switch_gap, 1) < 0)
+      return;
+   storeflags(&flags);
+   startints();
+   t0 = ticks;
+   while (!(chosen->status & PS_ATTB_DYING) && ticks - t0 < 200)
+      __asm__ __volatile__("hlt");
+   restoreflags(flags);
+   serial_puts((chosen->status & PS_ATTB_DYING)
+               ? "SWITCH-GAP-INJECT child-exited\n"
+               : "SWITCH-GAP-INJECT timeout\n");
+}
+
 void schedule_from_timer(void){
     PCB386 *readyprocess;
     devmgr_scheduler_extension *cursched;
@@ -3099,6 +3175,7 @@ void schedule_from_timer(void){
     int voluntary;
     int leftover_load_only = 0;
     PCB386 *abandoned = 0;
+    DWORD sft_flags;
 
     {
        extern void smp_repair_stale_current(void);
@@ -3207,19 +3284,33 @@ void schedule_from_timer(void){
         }
      }
 
+   /* Keep interrupts off from the choice to ps_switchto()'s own cli.  On the
+      voluntary path (taskswitch with IF=1) a timer in that gap could run the
+      chosen task to self-exit, leaving readyprocess naming a DYING PCB that
+      zombie_drain() may then free.  context_switch() saves prev with IF=1,
+      so a switched-out task still resumes interruptible. */
+   storeflags(&sft_flags);
+   stopints();
    readyprocess = (PCB386*)bridges_link((devmgr_generic*)cursched, &cursched->scheduler,
                                           current_process,0,0,0,0,0);
     if (leftover_load_only) {
        if (!readyprocess)
           readyprocess = current_process;
        ps_switchto_load_only(readyprocess, abandoned);
+       restoreflags(sft_flags);
        return;
     }
-    if (!readyprocess || readyprocess == current_process)
+    if (!readyprocess || readyprocess == current_process) {
+       restoreflags(sft_flags);
        return;
+    }
+
+    if (sched_inject_switch_gap > 0 && voluntary)
+       sched_switch_gap_inject(readyprocess);
 
     current_process->totalcputime++;
     ps_switchto(readyprocess);
+    restoreflags(sft_flags);
 }
 
 //The taskswitcher() is basically the program that runs all the time, aka CPU scheduler.
@@ -3485,8 +3576,177 @@ DWORD getprocessinfo(DWORD processid,PCB386 *data){
       return 1;
    };
    return 0;
-   ;
+    ;
 };
+
+/* Safe user-visible stats for htop.  These deliberately expose scalars only;
+   the raw PCB contains kernel pointers and must not cross the API.  The
+   layouts must stay byte-identical to sdk/include/sys/icsos.h. */
+#define ICSOS_PROC_NAMELEN 32
+#define ICSOS_MAX_CPUS 8
+#define ICSOS_ST_RUNNING  1
+#define ICSOS_ST_BLOCKED  2
+#define ICSOS_ST_DYING    4
+#define ICSOS_ST_THREAD   8
+#define ICSOS_ST_KERNEL   16
+#define ICSOS_ST_DRIVER   32
+
+struct icsos_procinfo {
+   unsigned int pid;
+   unsigned int ppid;
+   char name[ICSOS_PROC_NAMELEN];
+   unsigned int state;
+   unsigned int priority;
+   unsigned int cpu_affinity;
+   unsigned int on_cpu;
+   unsigned long long totalcputime;
+   unsigned long long arrivaltime;
+   unsigned long long rss_pages;
+   unsigned int pad;
+};
+
+struct icsos_sysinfo {
+   unsigned int uptime_ticks;
+   unsigned int hz;
+   unsigned int ncpu;
+   unsigned int total_procs;
+   unsigned long long total_pages;
+   unsigned long long free_pages;
+   unsigned long long used_pages;
+   unsigned long long total_cpu_ticks;
+   unsigned long long cpu_ticks[ICSOS_MAX_CPUS];
+};
+
+static void icsos_proc_name_copy(char *dst, const char *src)
+{
+   int i;
+   if (!src)
+      src = "";
+   for (i = 0; i < ICSOS_PROC_NAMELEN - 1 && src[i]; i++)
+      dst[i] = src[i];
+   dst[i] = 0;
+}
+
+api_arg_t sys_icsos_proc_list(api_arg_t buf, api_arg_t max, api_arg_t a3,
+                              api_arg_t a4, api_arg_t a5)
+{
+   PCB386 *list;
+   struct icsos_procinfo *out;
+   long lmax;
+   int total, n, i;
+
+   (void)a3; (void)a4; (void)a5;
+   lmax = (long)max;
+   if (lmax < 0)
+      lmax = 0;
+
+   total = get_processlist(&list);
+   if (total < 0)
+      total = 0;
+   if (total > 0 && !list)
+      return 0;
+
+   n = total;
+   if (n > lmax)
+      n = lmax;
+
+   if (buf && n > 0) {
+      out = (struct icsos_procinfo *)buf;
+      for (i = 0; i < n; i++) {
+         unsigned int st = 0;
+         unsigned long long rss = 0;
+
+         out[i].pid = list[i].processid;
+         out[i].ppid = list[i].owner;
+         icsos_proc_name_copy(out[i].name, list[i].name);
+         if (list[i].on_cpu >= 0)
+            st |= ICSOS_ST_RUNNING;
+         if (list[i].status & PS_ATTB_BLOCKED)
+            st |= ICSOS_ST_BLOCKED;
+         if (list[i].status & PS_ATTB_DYING)
+            st |= ICSOS_ST_DYING;
+         if (list[i].status & PS_ATTB_THREAD)
+            st |= ICSOS_ST_THREAD;
+         if (list[i].accesslevel == ACCESS_SYS)
+            st |= ICSOS_ST_KERNEL;
+         else if (list[i].accesslevel == ACCESS_DRIVER)
+            st |= ICSOS_ST_DRIVER;
+         out[i].state = st;
+         out[i].priority = list[i].priority;
+         out[i].cpu_affinity = (list[i].cpu_affinity < 0)
+            ? 0xFFFFFFFFu : (unsigned int)list[i].cpu_affinity;
+         out[i].on_cpu = (list[i].on_cpu < 0)
+            ? 0xFFFFFFFFu : (unsigned int)list[i].on_cpu;
+         out[i].totalcputime = list[i].totalcputime;
+         out[i].arrivaltime = list[i].arrivaltime;
+         if (list[i].meminfo && list[i].pagedirloc)
+            rss = getprocessmemory(list[i].meminfo, list[i].pagedirloc);
+         out[i].rss_pages = rss;
+         out[i].pad = 0;
+      }
+   }
+
+   if (list)
+      free(list);
+   return (api_arg_t)total;
+}
+
+api_arg_t sys_icsos_sysinfo(api_arg_t buf, api_arg_t a1, api_arg_t a2,
+                            api_arg_t a3, api_arg_t a4)
+{
+   struct icsos_sysinfo *o;
+   unsigned long long total_cpu = 0;
+   int i, ncpu = 0;
+
+   (void)a1; (void)a2; (void)a3; (void)a4;
+   o = (struct icsos_sysinfo *)buf;
+   if (!o)
+      return (api_arg_t)-22;
+
+   o->uptime_ticks = ticks;
+   o->hz = context_switch_rate;
+   for (i = 0; i < MAX_CPUS; i++) {
+      o->cpu_ticks[i] = cpus[i].ticks;
+      if (cpus[i].online)
+         ncpu++;
+      total_cpu += cpus[i].ticks;
+   }
+   o->ncpu = ncpu;
+   o->total_procs = totalprocess();
+   o->total_pages = frame_total_count();
+   o->free_pages = frame_free_count();
+   o->used_pages = (o->total_pages > o->free_pages)
+      ? o->total_pages - o->free_pages : 0;
+   o->total_cpu_ticks = total_cpu;
+   return 0;
+}
+
+api_arg_t sys_icsos_kill(api_arg_t pid, api_arg_t sig, api_arg_t a3,
+                         api_arg_t a4, api_arg_t a5)
+{
+   PCB386 *p;
+   long lpid, lsig;
+
+   (void)a3; (void)a4; (void)a5;
+   lpid = (long)pid;
+   lsig = (long)sig;
+   if (lpid <= 0)
+      return (api_arg_t)-3;
+
+   p = ps_findprocess((DWORD)lpid);
+   if (p == (PCB386 *)-1)
+      return (api_arg_t)-3;
+   if (lsig == 0)
+      return 0;
+   if (lsig < 1 || lsig >= 16)
+      return 0;
+   if (p->accesslevel != ACCESS_USER && !(p->status & PS_ATTB_THREAD))
+      return (api_arg_t)-1;
+
+   sigterm = (DWORD)lpid;
+   taskswitch();
+   return 0;
+}
 
 //dex32_locktasks is used only by system functions to temporarily prevent
 //other processes from taking control of the CPU
