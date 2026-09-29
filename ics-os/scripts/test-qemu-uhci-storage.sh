@@ -95,10 +95,15 @@ printf '%s\n' 'set timeout=0' \
 grub-mkrescue -o "$BOOT_ISO" "$ISO_ROOT" >/dev/null 2>&1
 
 printf 'ics-os QEMU %s persistent root write\n' "$CONTROLLER" > "$PAYLOAD_SOURCE"
+# dmesg must run AFTER the copy so the ring contains the SYNC CACHE trace;
+# the trailing echo marks autoexec completion (the wait below keys on it so
+# the dmesg dump is fully flushed before QEMU is killed).
 cat > "$AUTOEXEC" <<'EOF'
 @echo off
 set PATH=/icsos/apps
 cp-posix.exe -v /icsos/work/UHCISRC.TXT /icsos/work/UHCIRES.TXT
+dmesg
+echo USBSTOR_AUTOEXEC_DONE
 EOF
 
 PART_START="$(sfdisk -J "$RAW_IMAGE" | python3 -c \
@@ -119,8 +124,9 @@ mdel -i "${RAW_IMAGE}@@${OFFSET}" ::work/UHCIRES.TXT >/dev/null 2>&1 || true
     < /dev/null > "$SERIAL_LOG" 2>&1 &
 QEMU_PID=$!
 
+# Wait for the post-dmesg completion marker so the ring dump is in the log.
 if ! timeout "$TIMEOUT_SECONDS" grep -a -m1 -q \
-    'cp: copied /icsos/work/UHCISRC.TXT -> /icsos/work/UHCIRES.TXT' \
+    'USBSTOR_AUTOEXEC_DONE' \
     < <(tail -n +1 -F "$SERIAL_LOG" 2>/dev/null); then
     echo "test-qemu-usb-storage: guest marker timed out hcd=$CONTROLLER" >&2
     tail -n 100 "$SERIAL_LOG" >&2 || true
@@ -216,9 +222,13 @@ fi
 grep -a -q 'usb: registered usb0p0' "$SERIAL_LOG"
 grep -a -q 'Root filesystem is the USB mass-storage device.' "$SERIAL_LOG"
 grep -a -q 'Root mount \[OK\]' "$SERIAL_LOG"
-grep -a -q 'usb: cache synchronized' "$SERIAL_LOG"
 grep -a -q 'cp: copied /icsos/work/UHCISRC.TXT -> /icsos/work/UHCIRES.TXT' \
     "$SERIAL_LOG"
+# SYNC CACHE trace is KLOG_DEBUG: it must reach the log ONLY through the
+# dmesg ring dump (records carry a "[ +secs.mmm ]" timestamp prefix). A live
+# console echo would corrupt a user TUI (regression: it printed mid-NetHack).
+grep -a -q '^\[ +[0-9.]* \] usb: cache synchronized' "$SERIAL_LOG"
+! grep -a -q '^usb: cache synchronized' "$SERIAL_LOG"
 ! grep -a -q 'General Protection fault\|Page fault\|Double fault\|Divide by zero' "$SERIAL_LOG"
 ! grep -a -q 'TLB shootdown timeout\|mmio: TLB shootdown failed' "$SERIAL_LOG"
 ! grep -a -q 'XHCI_RESET_RECOVERY_FAIL' "$SERIAL_LOG"
