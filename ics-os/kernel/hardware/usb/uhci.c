@@ -15,6 +15,7 @@
 #include "usb_debug.h"
 #include "../dma.h"
 #include "../keyboard/kbd_boot_leds.h"
+#include "../../console/klog.h"
 
 extern void serial_puts(const char *s);
 extern int console_execute(const char *str);
@@ -961,10 +962,13 @@ static int usb_flush_device(void)
     result = usb_msc_bot(cdb, 10, 0, 0, 0);
     usb_io_lock_release();
     if (!result) {
-        printf("usb: SYNCHRONIZE CACHE failed\n");
+        /* A failed flush can lose data: keep this on the live console. */
+        klog(KLOG_ERR, "usb: SYNCHRONIZE CACHE failed\n");
         return -1;
     }
-    printf("usb: cache synchronized\n");
+    /* Steady-state trace: every fsync/close emits one. dmesg-only by default
+       (KLOG_DEBUG < console threshold) so it cannot corrupt a user TUI. */
+    klog(KLOG_DEBUG, "usb: cache synchronized\n");
     return 0;
 }
 
@@ -1821,7 +1825,7 @@ void usb_cdc_bulk_io_end(void)
 
 static int usb_cdc_pump_tx(void)
 {
-    DWORD head, tail, n, i, cap;
+    DWORD head, tail, tail_start, n, i, cap;
     unsigned long flags;
     if (!usb_cdc_ready || usb_cdc_pumping || usb_host != USB_HOST_XHCI)
         return 0;
@@ -1831,6 +1835,7 @@ static int usb_cdc_pump_tx(void)
     usb_io_lock_acquire();
     __asm__ __volatile__("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
     tail = usb_cdc_tx_tail;
+    tail_start = tail;
     head = usb_cdc_tx_head;
     cap = usb_cdc_mps_out;
     if (!cap || cap > sizeof(usb_cdc_dma_buf))
@@ -1847,6 +1852,12 @@ static int usb_cdc_pump_tx(void)
     if (n) {
         if (!xhci_bulk(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_out, 0,
                        usb_cdc_dma_buf, (int)n)) {
+            /* Roll the tail back so the bytes stay in the TX ring and are
+               retransmitted on the next pump. A short CDC-OUT timeout
+               (Pico FIFO briefly full while its firmware is busy) must not
+               drop console or RPC bytes; the old code advanced the tail
+               before xhci_bulk and lost the chunk on every timeout. */
+            usb_cdc_tx_tail = tail_start;
             serial_puts("USB_CDC_TX_FAIL\n");
             usb_cdc_tx_fails++;
             if (usb_cdc_tx_fails > 8)

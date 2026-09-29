@@ -40,6 +40,7 @@ STATUS_OK=0
 PICO_VER_OK=0
 KVER_OK=0
 STATUS_VER_OK=0
+CDC_TX_FAIL=0
 FINAL_HEALTH=""
 
 cleanup() {
@@ -78,6 +79,53 @@ fi
 mkdir -p "$WORK_DIR" "$ISO_ROOT/boot/grub" "$ARTIFACT_DIR"
 touch "$SERIAL_LOG" "$HTTP_LOG"
 cp "$SOURCE_IMAGE" "$RAW_IMAGE"
+# The Pico debug use case keeps the guest up (it is the target being debugged).
+# The stock image's autoexec.bat runs `colortest` then `reboot`, which closes the
+# guest window before the /status RPC poll can land. Rewrite the scratch copy's
+# autoexec.bat to `@echo off` so the console stays live. Best-effort: on any
+# parse failure keep the original image and let the (racy) poll decide.
+python3 - "$RAW_IMAGE" <<'PY' 2>>"$HTTP_LOG" || true
+import struct, sys
+path = sys.argv[1]
+data = bytearray(open(path, "rb").read())
+try:
+    p = data[446:462]
+    lba = struct.unpack("<I", p[8:12])[0]
+    bpb = data[lba*512:(lba+11)*512]
+    bps = struct.unpack("<H", bpb[11:13])[0]
+    spc = bpb[13]; res = struct.unpack("<H", bpb[14:16])[0]; nfat = bpb[16]
+    fatsz32 = struct.unpack("<I", bpb[36:40])[0]
+    data_start = lba + res + nfat*fatsz32
+    rootcl = struct.unpack("<I", bpb[44:48])[0]
+    rd = data_start + (rootcl-2)*spc
+    new = b"@echo off\n"
+    done = False
+    for i in range(0, spc*bps, 32):
+        off = rd*512 + i
+        e = data[off:off+32]
+        if not e or e[0] in (0, 0xE5):
+            continue
+        name = e[0:8].rstrip(b"\x00 ").decode("latin1").upper()
+        ext = e[8:11].rstrip(b"\x00 ").decode("latin1").upper()
+        if name != "AUTOEXEC" or ext != "BAT":
+            continue
+        cl = (struct.unpack("<H", e[20:22])[0] << 16) | struct.unpack("<H", e[26:28])[0]
+        size = struct.unpack("<I", e[28:32])[0]
+        s = (data_start + (cl-2)*spc)*512
+        data[s:s+len(new)] = new
+        if size > len(new):
+            data[s+len(new):s+size] = b"\x00"*(size-len(new))
+        struct.pack_into("<I", data, off+28, len(new))
+        done = True
+        break
+    if done:
+        open(path, "wb").write(data)
+        print("cdc-pico: scratch autoexec.bat -> '@echo off' (no reboot)")
+    else:
+        print("cdc-pico: autoexec.bat not found; keeping image as-is")
+except Exception as ex:
+    print("cdc-pico: autoexec patch skipped: %s" % ex)
+PY
 cp kernel/Kernel64.bin "$ISO_ROOT/vmdex"
 printf '%s\n' 'set timeout=0' \
     "menuentry \"ics\" { multiboot2 /vmdex ${POLL_CMDLINE}; boot }" \
@@ -120,13 +168,18 @@ while [ $SECONDS -lt $DEADLINE ]; do
     echo "$STATUS" | grep -aq 'release=' && STATUS_VER_OK=1
     echo "$HEALTH" | grep -aq '^pico=' && PICO_VER_OK=1
     grep -a -q 'Root mount \[OK\]' "$SERIAL_LOG" 2>/dev/null && ROOT_OK=1
+    # Original defect: the CDC bulk OUT ring inherited the short CDC IN poll
+    # timeout, so a busy full-speed Pico tripped it and each timeout dropped a
+    # 64-byte console/RPC chunk (garbled /status). usb_cdc_pump_tx prints
+    # USB_CDC_TX_FAIL on that path, so its presence means the fix regressed.
+    grep -a -q 'USB_CDC_TX_FAIL' "$SERIAL_LOG" 2>/dev/null && CDC_TX_FAIL=1
     if [ "$ROOT_OK" = 1 ] && [ "$CDC_OK" = 1 ] && [ "$RX_OK" = 1 ] && \
-       [ "$STATUS_OK" = 1 ] && [ "$KVER_OK" = 1 ] && [ "$PICO_VER_OK" = 1 ] && \
-       [ "$STATUS_VER_OK" = 1 ]; then
+        [ "$STATUS_OK" = 1 ] && [ "$KVER_OK" = 1 ] && [ "$PICO_VER_OK" = 1 ] && \
+        [ "$STATUS_VER_OK" = 1 ] && [ "$CDC_TX_FAIL" = 0 ]; then
         STATE=ok
         break
     fi
-    if grep -a -q 'failed to open host usb device\|no USB mass-storage device\|panic\|General Protection fault\|Page fault' "$SERIAL_LOG" 2>/dev/null; then
+    if grep -a -q 'failed to open host usb device\|no USB mass-storage device\|USB_CDC_TX_FAIL\|panic\|General Protection fault\|Page fault' "$SERIAL_LOG" 2>/dev/null; then
         STATE=failed
         break
     fi
@@ -148,6 +201,7 @@ echo "$FINAL_STATUS" | grep -aq 'release=' && STATUS_VER_OK=1
 FINAL_HEALTH="$(pico_get "http://${PICO_IP}/health")"
 echo "$FINAL_HEALTH" | grep -aq '^pico=' && PICO_VER_OK=1
 echo "$FINAL_HEALTH" | grep -aq '^kernel=ICSOS_VER ' && KVER_OK=1
+grep -a -q 'USB_CDC_TX_FAIL' "$SERIAL_LOG" 2>/dev/null && CDC_TX_FAIL=1
 
 echo "=============================================="
 echo "  USB CDC Pico gadget (QEMU usb-host)"
@@ -161,6 +215,7 @@ echo "STATUS_CDC     = $STATUS_OK"
 echo "PICO_VER       = $PICO_VER_OK"
 echo "ICSOS_VER      = $KVER_OK"
 echo "STATUS_RELEASE = $STATUS_VER_OK"
+echo "CDC_TX_FAIL    = $CDC_TX_FAIL   (must be 0: no dropped CDC bulk-OUT chunks)"
 echo "--- pico /health ---"
 echo "$FINAL_HEALTH" | tr -cd '\11\12\15\40-\176\n' | head -c 400
 echo
@@ -177,9 +232,9 @@ echo "Artifacts: $ARTIFACT_DIR"
 
 if [ "$ROOT_OK" = 1 ] && [ "$CDC_OK" = 1 ] && [ "$RX_OK" = 1 ] && \
    [ "$STATUS_OK" = 1 ] && [ "$KVER_OK" = 1 ] && [ "$PICO_VER_OK" = 1 ] && \
-   [ "$STATUS_VER_OK" = 1 ]; then
-    echo "PASS: QEMU xHCI MSC root + Pico CDC IN/RPC (USB_CDC_RX, STATUS, ICSOS_VER)"
+   [ "$STATUS_VER_OK" = 1 ] && [ "$CDC_TX_FAIL" = 0 ]; then
+    echo "PASS: QEMU xHCI MSC root + Pico CDC IN/RPC (USB_CDC_RX, STATUS, ICSOS_VER, no CDC TX drops)"
     exit 0
 fi
-echo "FAIL: need Root mount [OK], USB_CDC_CONSOLE_OK, ICSOS_VER, USB_CDC_RX, pico=, and STATUS cdc=1/release="
+echo "FAIL: need Root mount [OK], USB_CDC_CONSOLE_OK, ICSOS_VER, USB_CDC_RX, pico=, STATUS cdc=1/release=, and no USB_CDC_TX_FAIL"
 exit 1
