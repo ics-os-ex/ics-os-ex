@@ -1,6 +1,237 @@
 # Development blog
 
+## 2026-09-29 (Manila, UTC+8)
+
+### 14:52 — GCC self-host gates green: stale cc1 (legacy mmap ABI) + VMA_MAX=32 exhaustion
+
+**Current problem / activity:** `apps/cc1.exe` page-faulted in-OS
+(`PF64 rip=0x10963df cr2=0xffffffffffffffea`, inside `free`/`_chkstk`), which
+blocked every GCC self-host gate (`test-cc1`, `test-gcc-kbuild`, `test-dist`).
+Task: root-cause the fault, fix it, and get the three gates passing so the
+distribution can be certified self-host capable.
+
+- **Root cause 1 — stale cc1 (legacy `mmap` ABI):** the committed `cc1.exe` was
+  built *before* commit `b36a7b7`, which moved the SDK `mmap()` from a
+  register-based ABI to a `struct mmap_args` pointer ABI (`sdk/posix.c` builds a
+  6×`unsigned long` struct and passes `&args` as the syscall pointer). The stale
+  cc1 still emitted the old register call, so the kernel mis-read the arguments
+  and returned -34; GGC treated the negative return as a valid pointer and
+  dereferenced it → the PF at `0xffffffffffffffea` (a negative/invalid address).
+  - **Fix:** relink cc1 against the current SDK
+    (`make -C contrib/gcc cc1`), verify the new `mmap` calls `ics_sys` with the
+    struct-pointer ABI (`0x1098466`), and install to `apps/cc1.exe`. `test-cc1`
+    (a GGC anonymous-mmap stress probe, made self-contained so it needs no
+    staged `stdio.h`) now PASSES.
+- **Root cause 2 — kernel `VMA_MAX=32` too small for GGC:** after the relink,
+  `test-gcc-kbuild` compiled ~15 kernel files fine, then failed on `kernel32.c`
+  with `virtual memory exhausted: errno=12` (ENOMEM, a graceful GGC exit, *not*
+  a PF). GGC backs its page groups with `mmap`: one VMA per 2 MiB quire
+  (`GGC_QUIRE_SIZE=512`) plus one VMA per larger object. The peak *concurrent*
+  live VMAs for a large translation unit exceed 32, so `vm_area_alloc` ran out
+  of slots, the single-page fallback mmap also failed, and GGC aborted. (Address
+  space allowed ~383 2 MiB-quires and physical RAM was ample — the 32-slot table
+  was the binding constraint.)
+  - **Fix:** raise `VMA_MAX` 32 → 256 in `kernel/memory/vma.h` (lazy 12 KiB per
+    process, cheap O(n) scans), and update the stale "~1.5 KiB" size note in
+    `process.h`. Rebuild the kernel (`make -C kernel`).
+- **Result — all three gates green:**
+  - `make test-cc1` → **PASS** (no PF; GGC anon mmap works).
+  - `make test-gcc-kbuild` → **PASS**: cc1/as/ld compile the **entire kernel
+    in-OS**, link it, kexec into the new kernel (`KEXEC_BOOT_OK`), and pass the
+    post-kexec capability suite (`SMP: 2 CPUs online`, `work-steal=ok cpus=2`,
+    `EXEC_TEST_PASS`, `GCC_E2E_OK`/`GCC_E2E_RUN_OK`, `KEXEC_SMP_OK cpus=2`,
+    `KEXEC_CAPABILITY_PASS`).
+  - `make test-dist` → **PASS** (`GCC_DRIVER_OK`, `DIST_GCC_OK`,
+    `GCC_DRV_RUN_OK`, no `GCC_DRV_FAIL`).
+- **Difficulty / note:** the in-OS kernel build is slow (~5 min to kexec under
+  KVM), so the long tests are run in the background (`setsid nohup`) and polled
+  on the serial log rather than held in a blocking shell call.
+
+### 10:10 — N150 distribution UEFI thumbdrive: one-command builder + pre-flash validation
+
+**Current problem / activity:** produce a current, flash-ready ICS-OS distribution
+UEFI thumbdrive image for the physical Intel N150 (including the CDC-fixed kernel
+from 08:40), and create a repeatable script that builds it and verifies it on the
+N150-equivalent firmware path *before* it hits hardware.
+
+- **Why a new script:** `make usb-etcher` already builds + zips the image
+  (GPT + FAT32 ESP, UEFI `BOOTX64.EFI` + BIOS/Bochs GRUB, GOP framebuffer, in-OS
+  GCC toolchain + SDK + apps via `prep-dist`), and `make test-usb-uefi-gpt`
+  validates it — but they were separate steps and the test always waited a fixed
+  timeout. Added `scripts/mk-n150-dist.sh` (wired in as `make n150-dist`):
+  build + zip once, then boot-validate under OVMF + q35 xHCI (the firmware the
+  N150 actually uses) with an early-exit poll, then print sha256 + dd/Etcher
+  instructions. `--no-verify` skips the boot; `--size` sets the image size.
+- **Bug found + fixed during bring-up:** the early-exit poll initially broke on
+  `FBCONSOLE_PASS`, but that marker is printed *early* (framebuffer init, ~line 23
+  of the boot log), long before root mount / SMP. It killed QEMU at
+  "Starting application processors..." so `Root mount [OK]`/`GPT_DETECT usb0`/
+  `AP scheduling` were absent → false validation FAIL. The true end-of-boot marker
+  is `kernel prompt` (the dist shell, ~line 173, after CONSOLE_READY +
+  XHCI_HOTPLUG_MONITOR_READY). Fix: poll for `kernel prompt` only; keep
+  `FBCONSOLE_PASS` as an *assertion*, not the break condition. Poll window raised
+  to 180s for TCG (no KVM) boot variance; a skipped validation (no OVMF) no longer
+  fails an otherwise good build.
+- **Built + validated** via `./scripts/mk-n150-dist.sh`:
+  - `make usb-etcher` → fresh `ics-os-uefi.img` (128 MiB, CDC-fixed `vmdex`) +
+    `ics-os-uefi.img.zip` (Etcher).
+  - OVMF q35 xHCI boot validation **PASS**: `GPT_DETECT usb0`, `serial console
+    ready`, `Root mount [OK]`, `Root filesystem is the USB mass-storage device`,
+    `AP scheduling enabled`, `FBCONSOLE_PASS`, no GPF.
+- **Result:** flash-ready image at `ics-os-uefi.img` / `ics-os-uefi.img.zip`.
+  Flash: `sudo dd if=ics-os-uefi.img of=/dev/sdX bs=4M conv=fsync` (check
+  `lsblk` first) or select the .zip in Balena Etcher.
+
+### 08:40 — Pico 2 W CDC remote-debug: xHCI CDC bulk-OUT timeout dropped console/RPC bytes
+
+**Current problem / activity:** the physical Raspberry Pi Pico 2 W
+(`2e8a:0005`) CDC-ACM remote-debug bridge through QEMU `usb-host` on q35 xHCI
+was garbling the `/status` RPC and dropping console text. Task: find the root
+cause in the kernel xHCI CDC path and fix it so remote Pico debug works (and so
+it works on the physical Intel N150, which shares this xHCI CDC OUT path).
+
+- **Root cause:** `xhci_transfer_sg()` applied the *CDC IN poll* timeout
+  (`XHCI_CDC_IN_SPINS`, 40000 spins) to **every** CDC ring, including bulk OUT.
+  A real full-speed Pico NAKs its OUT endpoint while MicroPython is busy
+  (`gc.collect()`, Wi-Fi, HTTP handling); the xHC NAK-retries, but the 40000-spin
+  kernel timeout fired first → 9× `xhci: transfer timeout ep=4 len=64` during
+  boot. Each timeout dropped a 64-byte chunk.
+- **Data loss:** `usb_cdc_pump_tx()` advanced `usb_cdc_tx_tail` *before* the
+  blocking `xhci_bulk()`; on timeout the 64-byte chunk (console text + RPC body)
+  was lost permanently, corrupting the 190-byte `/status` response (body leaked
+  to the console, leading bytes eaten by the Pico RPC parser → `6_root=1`,
+  missing `usb_root=`/`release=`).
+- **Fix (kernel):**
+  - `xhci_policy.h`: new `XHCI_CDC_OUT_SPINS` (400000, 10× the IN timeout) —
+    long enough for the Pico to drain, short enough to bound the console stall
+    if the Pico is truly stuck (avoids a multi-second `XHCI_TIMEOUT` stall).
+  - `xhci.c xhci_transfer_sg()`: pick the timeout by `direction` — CDC ring +
+    `DMA_FROM_DEVICE` → IN spins; CDC ring OUT → OUT spins; non-CDC →
+    `XCHI_TIMEOUT` (xhci.c:1089).
+  - `uhci.c usb_cdc_pump_tx()`: roll back `usb_cdc_tx_tail` to `tail_start` on
+    `xhci_bulk` failure so the chunk is retransmitted on the next pump tick (no
+    data loss). Safe because the stale timed-out TRB is dropped by
+    `xhci_trb_in_td` (index < new `first`) and the ring is FIFO-ordered.
+- **Verified** via `PICO_IP=192.168.0.186 make test-usb-cdc-pico`:
+  - Fresh guest serial log has **0** `xhci: transfer timeout` / `USB_CDC_TX_FAIL`
+    (was 9). New kernel `compiled=Sep 29 2026 08:10:42` boots clean.
+  - `/status` now returns clean `cdc=1` + `usb_root=1` + `release=...`.
+  - All assertions green: `Root mount [OK]`, `USB_CDC_CONSOLE_OK`, `USB_CDC_RX`,
+    `ICSOS_VER`, `pico=0.8.2-20260917`, `cdc=1`, `release=`.
+- **Test hardening** (`scripts/test-qemu-xhci-cdc-pico.sh`):
+  - New `CDC_TX_FAIL` assertion: FAIL if the guest serial log contains
+    `USB_CDC_TX_FAIL` (regression for the original cause, not just the final
+    success message).
+  - The Pico debug use case keeps the guest up (it is the target being debugged),
+    but the stock image's `autoexec.bat` runs `colortest` then `reboot`, closing
+    the guest window before the `/status` poll lands. The script now rewrites the
+    *scratch* copy's `autoexec.bat` to `@echo off` (best-effort) so the console
+    stays live.
+- Result: `PASS: QEMU xHCI MSC root + Pico CDC IN/RPC (USB_CDC_RX, STATUS,
+  ICSOS_VER, no CDC TX drops)`.
+
+### 00:20 — NetHack N150 "unidentified executable format": mmap replicated on QEMU xHCI + file-verify self-test
+
+**Current problem / activity:** on the physical Intel N150, launching nethack
+failed with `dex32_loader: unidentified executable format (/icsos/apps/nethack.exe)`
++ `magic 80 c9 25 00` (after the `elf64_stream_load` path failed and fell back
+to the mmap path). Task: replicate a nethack mmap start via the USB xHCI
+thumbdrive and pin down whether the failure is a bad file or a read-path bug.
+
+- **Replicated on QEMU q35 xHCI — it WORKS.** Added an `execp-mmap` cmdline
+  fault hook in `execp_load` (console.c) that skips `elf64_stream_load` and
+  forces the `vfs_mapfile`+`dex32_loader` path. With a fresh vmdex and
+  `multiboot2 /vmdex execp-mmap` in grub.cfg, QEMU xHCI reads a valid ELF
+  (`elf64: parsing`) and nethack runs (banner + `Who are you?`). The N150
+  failure does **not** reproduce on QEMU → it is N150-specific (physical medium
+  or real-hardware xHCI read path), not a loader/format bug.
+- Confirmed the source `ics-os-uefi.img` is pristine: its `/apps/nethack.exe`
+  sha256-matches the host `apps/nethack.exe` (valid ELF64, `7f454c46`,
+  3813392 bytes). `80 c9 25 00` appears zero times in the real file.
+- **Built a deterministic file-integrity self-test** (`nethack-verify` cmdline,
+  `execp_verify_file` in console.c): reads nethack.exe through BOTH the VFS
+  stream path (fread, 128 KiB chunks) and the mmap path (vfs_mapfile), printing
+  `size`, `sum32`, FNV-1a 32, and the first 32 bytes of each. Runs as a kthread
+  (not the BSP boot flow) so the xHCI completion kthread can service the blocked
+  reads — the BSP tight-loop deadlocked on the first 4 KiB read.
+- **Validated the self-test on QEMU xHCI:** output `size=3813392 sum32=13ed0c41
+  fnv1a32=e44c5b3e first32=7f 45 4c 46…` — an exact match to the host-side
+  reference for the same file. Both read paths are correct on QEMU.
+- **Interpretation for the N150:** boot the N150 with `nethack-verify` and
+  compare. If `fnv1a32=e44c5b3e` + ELF `first32` → the file on the stick is
+  intact (the original failure was transient/loader). If `fnv1a32` differs or
+  `first32=80 c9 25 00` → the first cluster on the physical stick is corrupted
+  (bad flash or bad sector) or a real-hardware xHCI read bug.
+- Regression test: `make test-nethack-mmap-xhci` (Makefile) builds a q35 xHCI
+  UEFI thumbdrive, patches grub.cfg to `multiboot2 /vmdex execp-mmap`, and
+  asserts `[mmap]` + `elf64: parsing` + the NetHack banner + no
+  "unidentified executable format"/GPF. PASSES — codifies that the mmap path
+  loads and runs a valid ELF64, so the N150 failure is not the loader.
+- Deliverable: `ics-os-nethack-verify.img` (new kernel + `nethack-verify`
+  cmdline in grub.cfg + nethack in /apps, empty autoexec) ready to flash.
+- Blocked: the Pico debug bridge (192.168.0.186) went fully offline (even
+  `/health` times out) → cannot run the verify on the N150 remotely yet.
+  `POST /kexec` hardcodes cmdline `kexeced` (kexec.c), so it cannot carry
+  `nethack-verify`; a re-flashed image is required.
+
 ## 2026-09-28 (Manila, UTC+8)
+
+### 22:31 — Kernel-log policy: debug traces no longer corrupt user TUIs
+
+**Current problem / activity:** during the NetHack game, kernel messages such
+as `usb: cache synchronized` (printed on every SCSI SYNC CACHE from
+`usb_flush_device()`) interleaved with the game screen. User asked to clean up
+all logs or set a policy so debug logs don't interfere with user program
+output.
+
+- Diagnosis: every bare kernel `printf()` echoed to the live console (default
+  `klog_console_max` was KLOG_DEBUG = echo everything). The level-tagged
+  `klog(level, ...)` API existed but had zero callers; the UHCI storage test
+  even grepped the live console for a per-op trace.
+- Policy (host-testable in `klog_ring.h`): default console threshold is now
+  `KLOG_CONSOLE_DEFAULT` = KLOG_INFO. Messages are always buffered in the
+  dmesg ring; they echo live only when `klog_console_echo(level, max)` holds.
+  Convention: steady-state per-I/O/per-tick traces use `klog(KLOG_DEBUG, ...)`
+  (ring-only by default), real failures `klog(KLOG_ERR, ...)`. `dmesg -n <0-7>`
+  still raises the threshold live for debugging.
+- Applied the convention to the offender: `usb: cache synchronized` →
+  `klog(KLOG_DEBUG, ...)`; `usb: SYNCHRONIZE CACHE failed` →
+  `klog(KLOG_ERR, ...)` (a failed flush can lose data, stays visible).
+- Echo decision consolidated in `klog_console_echo()` (klog.c + dexio.c);
+  bare printf capture level (KLOG_INFO) unchanged, so all existing serial
+  test markers keep working.
+- Tests: `tests/klog_unit.c` TAP plan 19→24 with policy regression checks
+  (default threshold is INFO; DEBUG not echoed; INFO/NOTICE/WARN/ERR echoed;
+  `dmesg -n 7` echoes all). `scripts/test-qemu-uhci-storage.sh` autoexec now
+  runs `dmesg` after the copy (wait moved to a `USBSTOR_AUTOEXEC_DONE`
+  post-dmesg marker) and asserts the SYNC CACHE trace appears **only** with a
+  `[ +secs.mmm ]` dmesg timestamp prefix, never as a live console line.
+- Docs: wiki §3.7 "Kernel logging (klog/dmesg)"; AGENTS.md architecture note.
+
+### 22:05 — Bare `nethack` launch fixed: "cannot chdir to /nethack"
+
+**Current problem / activity:** on the UEFI xHCI thumbdrive, typing `nethack`
+(no `-d`) died with `cannot chdir to /nethack` + `execp: child faulted`.
+
+- Root cause: the kernel mounts every OS root (FAT thumbdrive, UEFI ESP, CD,
+  IDE) at `/icsos` (`kernel/kernel32.c` root-mount block), but the 11b23aa
+  rebuild baked `HACKDIR "/nethack"` into `nethack.exe` (vendored
+  `config.h` had a wrong comment claiming the FAT root mounts at `/`).
+  `chdirx()` in `unixmain.c` then failed at startup. The existing tests never
+  caught it: `test-nethack`/`test-nethack-xhci` always passed `-d` explicitly.
+- Fix: `config.h` `HACKDIR` → `/icsos/nethack`; rebuilt (`apps/nethack.exe`).
+- Second bug found while rebuilding: `contrib/nethack/Makefile`'s `.stage`
+  force-rebuild never runs when `nethack.exe` is newer than all objects, and
+  objects tracked no header deps — so the first "rebuild" silently kept
+  Sep-27 objects with the old HACKDIR. Added `-MMD -MP` + `-include $(DEPS)`
+  so header edits (notably `config.h`) force recompiles; verified a
+  `touch config.h` now schedules all 121 objects.
+- Tests: new host-side `nethack-hackdir-check` (strings guard for
+  `/icsos/nethack` in the binary) runs before both nethack tests;
+  `test-nethack-xhci` now launches bare `nethack` (no `cd`/`-d`) — the exact
+  user scenario — and asserts no `Cannot chdir to`. Both
+  `test-nethack` (ISO) and `test-nethack-xhci` (q35 xHCI + OVMF) PASS;
+  banner + `Who are you?` reached on the bare launch.
 
 ### 21:26 — Main repo moved to `github.com/ics-os-ex/ics-os-ex`
 

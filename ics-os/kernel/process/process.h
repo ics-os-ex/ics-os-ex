@@ -377,7 +377,7 @@ typedef struct _PCB386 {
        kstack_top at hardcoded byte offsets (asserted in process.c), so a new
        field must not shift them.
 
-       A pointer (not an inline VMA_MAX array) so the ~1.5 KiB table does not
+       A pointer (not an inline VMA_MAX array) so the ~12 KiB table does not
        bloat BSS for every static/heap PCB; it is heap-allocated lazily on the
        first mmap by vm_area_alloc() and freed by vm_area_exit().  NULL means
        the process has no VMAs.  See vm_area_* in dexmem.h.  `file` refs are

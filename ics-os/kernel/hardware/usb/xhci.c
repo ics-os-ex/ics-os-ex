@@ -1086,16 +1086,25 @@ static int xhci_transfer_sg(xhci_hcd *hcd, DWORD dev, xhci_ring *ring,
                xhci_usbdev_connected(hcd, dev); waits++)
             usb_io_delay();
     }
-    if (!xhci_next_event(hcd, XHCI_TRB_TRANSFER_EV, 0,
-                         ring, first, endpoint, &cc, 0,
-                         xhci_ring_is_cdc(hcd, ring) ? XHCI_CDC_IN_SPINS
-                                                     : XHCI_TIMEOUT)) {
+    {
+        DWORD wait_spins;
+        if (xhci_ring_is_cdc(hcd, ring))
+            /* IN poll: short (keep console responsive). OUT: long enough
+               for a busy Pico to drain its FIFO and ACK the NAK-retried
+               packet; the IN-poll count dropped boot console + RPC bytes. */
+            wait_spins = (direction == DMA_FROM_DEVICE) ? XHCI_CDC_IN_SPINS
+                                                        : XHCI_CDC_OUT_SPINS;
+        else
+            wait_spins = XHCI_TIMEOUT;
+        if (!xhci_next_event(hcd, XHCI_TRB_TRANSFER_EV, 0,
+                             ring, first, endpoint, &cc, 0, wait_spins)) {
         if (hcd->connection_lost)
             goto out;
         printf("xhci: transfer timeout ep=%u len=%u\n", endpoint, len);
         if (dev == 0)
             hcd->recovery_needed = 1;
         goto out;
+        }
     }
     xhci_mb();
     if (cc != XHCI_CC_SUCCESS && cc != XHCI_CC_SHORT_PACKET) {

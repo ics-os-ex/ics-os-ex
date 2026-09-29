@@ -29,6 +29,16 @@ static inline int xhci_allow_msix(int com1_present, int x2apic)
   Pump first, then a 1-tick wait while the console is bound.
 */
 #define XHCI_CDC_IN_SPINS            40000u
+/*
+  CDC bulk OUT (host -> Pico). The IN-poll timeout (XHCI_CDC_IN_SPINS) is
+  far too short for an OUT: a real full-speed Pico NAKs while its firmware
+  is busy (gc.collect(), Wi-Fi, HTTP handling) and the xHC NAK-retries the
+  packet. Using the IN-poll spin count made every boot pump time out and
+  drop 64-byte console/RPC chunks (Pico /status came back garbled). Give the
+  device time to drain; xhci_next_event yields (taskswitch) and bails on
+  disconnect, so a long bound does not wedge the console.
+*/
+#define XHCI_CDC_OUT_SPINS           400000u
 #define XHCI_CDC_HOTPLUG_DELAY_IDLE  100
 #define XHCI_CDC_HOTPLUG_DELAY_READY 1
 

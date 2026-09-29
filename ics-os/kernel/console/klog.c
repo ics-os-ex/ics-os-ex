@@ -17,7 +17,7 @@ extern void  putcEX(char x);            /* console char sink (serial + DDL) */
 extern int   vsprintf(char *buffer, const char *fmt, va_list args);
 
 static klog_ring_t   the_klog;
-static unsigned char klog_console_max = KLOG_DEBUG; /* echo level <= this */
+static unsigned char klog_console_max = KLOG_CONSOLE_DEFAULT; /* echo level <= this */
 static int           klog_ready = 0;
 
 /* Per-printf capture state. */
@@ -60,7 +60,7 @@ static int klog_pad_u32(char *out, int off, unsigned int v, int width)
 void klog_init(void)
 {
     klog_ring_init(&the_klog);
-    klog_console_max = KLOG_DEBUG;
+    klog_console_max = KLOG_CONSOLE_DEFAULT;
     klog_ready = 1;
 }
 
@@ -122,7 +122,7 @@ void klog(int level, const char *fmt, ...)
         len = KLOG_LINE_MAX - 1;
     buf[len] = 0;
     klog_ring_push(&the_klog, ticks, (unsigned char)level, buf);
-    if (level <= (int)klog_console_max) {
+    if (klog_console_echo(level, klog_console_max)) {
         for (i = 0; i < len; i++)
             putcEX(buf[i]);
     }

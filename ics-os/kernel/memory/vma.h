@@ -21,8 +21,15 @@
     vm_area *vmas pointer in PCB386.  The table is heap-allocated on the first
     mmap and freed on exit/fork-cleanup, so the PCB itself stays small.
     `file` is a file_PCB* (kernel ref held) or NULL for anonymous maps; it is
-    typed void* here so this header stays VFS-independent. */
-#define VMA_MAX 32
+    typed void* here so this header stays VFS-independent.
+
+     VMA_MAX must exceed the peak concurrent live VMAs of the heaviest user
+     workload.  GCC cc1's GGC backs its page groups with mmap: a 2 MiB quire
+     per single-page request plus one VMA per larger object, so compiling a
+     large translation unit (e.g. kernel32.c) peaks well past 32 live VMAs and
+     the old limit exhausted the table mid-compile ("virtual memory exhausted:
+     errno=12").  256 gives wide headroom at a lazy 12 KiB/process cost. */
+#define VMA_MAX 256
 #define VMF_PRIVATE 0x1
 #define VMF_SHARED  0x2
 

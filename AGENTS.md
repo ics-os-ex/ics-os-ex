@@ -180,6 +180,7 @@ the GCC self-host and Multiboot2/QEMU acceptance gates.
 - **Memory map** is `kernel/memory/memlayout.h`. Kernel image must stay below 4MiB (user ELF). Frame stack follows `bssEnd`. Do not invent a new fixed PA; add a reserved range so `mempop` skips it.
 - **SMP**: APs load the kernel GDT (`ap_load_kernel_gdt`), use LAPIC timer vector **0x41**, claim tasks with `on_cpu`, and honor `cpu_affinity`. Console / `fg_mgr` / user processes are BSP-pinned today. Why SMP bugs take days, and which of them are design rather than "SMP is hard", is in `ics-os/docs/smp-debugging-hardness.md`.
 - **Serial** is the headless oracle. Prefer `serial_puts` / putc mirroring for QEMU `-nographic` tests. COM1 TX is `uart_com1_putc` (port I/O in registers only); a C `uart_dev*` reload from the user stack #PF'd in `uart_putc_raw` during `make -j4`.
+- **Kernel log policy**: bare kernel `printf()` is captured at KLOG_INFO and echoes to the console; steady-state per-I/O/per-tick traces must use `klog(KLOG_DEBUG, ...)` (dmesg-ring-only by default, never corrupts a user TUI). Default console threshold is KLOG_INFO; see wiki §3.7 and `make test-klog-unit`.
 - **GCC is the supported kernel compiler.** `make test-kbuild` proves that host-seeded GCC/binutils executables running in ICS-OS can build and kexec the kernel. Do not call ICS-OS fully self-host capable until an in-OS-rebuilt GCC compiles the kernel and the generated kernel passes the post-kexec capability suite. x86_64 TinyCC remains optional.
 
 ## Coding conventions

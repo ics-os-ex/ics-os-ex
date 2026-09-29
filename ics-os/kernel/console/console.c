@@ -206,6 +206,11 @@ int user_fork(){
  * Function that reads an executable and creates a new process for it.
  * ELF64 uses the same VFS stream path as posix_spawn (no whole-file heap
  * map).  mmap+dex32_loader remains for PE/COFF/B32 leftovers.
+ *
+ * Fault hook: `execp-mmap` on the kernel cmdline forces the mmap
+ * (vfs_mapfile + dex32_loader) path by skipping elf64_stream_load.  Used to
+ * replicate real-hardware N150 "unidentified executable format / magic"
+ * failures deterministically on QEMU xHCI (see test-nethack-mmap-xhci).
  */
 static DWORD execp_load(char *fname, DWORD mode, char *params)
 {
@@ -213,10 +218,13 @@ static DWORD execp_load(char *fname, DWORD mode, char *params)
     char *buf;
     char temp[255];
 
-    id = (DWORD)elf64_stream_load(fname, mode, params, showpath(temp),
-                                  current_process);
-    if (id && (int)id != -1)
-       return id;
+    id = 0;
+    if (!strstr(kernel_cmdline, "execp-mmap")) {
+        id = (DWORD)elf64_stream_load(fname, mode, params, showpath(temp),
+                                      current_process);
+        if (id && (int)id != -1)
+            return id;
+    }
 
     sync_entercrit(&elf_map_crit);
     buf = (char*)vfs_mapfile(fname, &size);
@@ -225,14 +233,95 @@ static DWORD execp_load(char *fname, DWORD mode, char *params)
        return 0;
     }
 
-    printf("execp: loading %s (%u bytes) [mmap]\n", fname, (unsigned)size);
+   printf("execp: loading %s (%u bytes) [mmap]\n", fname, (unsigned)size);
     id = dex32_loader(fname, buf, userspace, mode, params,
                       showpath(temp), current_process);
     free(buf);
     sync_leavecrit(&elf_map_crit);
     if (!id || (int)id == -1)
-       return 0;
+        return 0;
     return id;
+}
+
+/*
+ * Deterministic file-integrity self-test (kernel cmdline: `nethack-verify`).
+ * Replicates the N150 "unidentified executable format / magic" failure by
+ * reading an executable through BOTH read paths the loader can take -- the
+ * VFS stream path (fread) and the mmap path (vfs_mapfile) -- then printing
+ * size, FNV-1a 32, and the first bytes of each.  Compare the printed
+ * fnv1a32/size/first32 against the host-side values for the same file to tell
+ * a corrupted medium / first cluster apart from a read-path bug.
+ */
+void execp_verify_file(const char *path)
+{
+    file_PCB *f;
+    vfs_stat st;
+    unsigned char first[32];
+    unsigned char *buf;
+    unsigned long long fnv, sum;
+    unsigned int got, blen, i;
+    void *map;
+    DWORD mapsize = 0;
+    unsigned char *mb;
+
+    printf("verify: opening %s\n", path);
+    f = openfilex((char*)path, FILE_READ);
+    if (!f) {
+        printf("verify: open fail %s\n", path);
+        return;
+    }
+    fstat(f, &st);
+    printf("verify: open+stat ok size=%d\n", st.st_size);
+    /* 128 KiB chunks (matches the ELF stream loader) so a multi-MB file is a
+       handful of MSC transfers, not one per 4 KiB. */
+    buf = (unsigned char*)malloc(0x20000);
+    if (!buf) {
+        printf("verify: malloc fail %s\n", path);
+        fclose(f);
+        return;
+    }
+    fnv = 0x811c9dc5ULL;
+    sum = 0;
+    {
+        int loopn = 0;
+        while ((got = (unsigned int)fread((char*)buf, 0x20000, 1, f)) > 0) {
+            for (i = 0; i < got; i++) {
+                fnv = ((fnv ^ (unsigned long long)buf[i]) * 0x01000193ULL)
+                      & 0xFFFFFFFFULL;
+                sum += buf[i];
+            }
+            loopn++;
+        }
+        printf("verify: read loop done, chunks=%d\n", loopn);
+    }
+    fseek(f, 0, SEEK_SET);
+    blen = (unsigned int)fread((char*)first, 32, 1, f);
+    if (blen > 32)
+        blen = 32;
+    fclose(f);
+
+    map = vfs_mapfile(path, &mapsize);
+    mb = (unsigned char*)map;
+
+    printf("verify: %s size=%d sum32=%08llx fnv1a32=%08llx\n",
+           path, st.st_size,
+           (unsigned long long)(sum & 0xFFFFFFFFULL),
+           (unsigned long long)(fnv & 0xFFFFFFFFULL));
+    printf("verify: stream first%u:", (unsigned)blen);
+    for (i = 0; i < blen; i++)
+        printf(" %02x", first[i]);
+    printf("\n");
+    if (mb) {
+        printf("verify: mmap size=%u first32:", (unsigned)mapsize);
+        for (i = 0; i < 32 && (unsigned)i < mapsize; i++)
+            printf(" %02x", mb[i]);
+        printf("\n");
+    } else {
+        printf("verify: mmap FAILED (vfs_mapfile returned NULL)\n");
+    }
+    if (map)
+        free(map);
+    free(buf);
 }
 
 int user_execp(char *fname, DWORD mode, char *params){

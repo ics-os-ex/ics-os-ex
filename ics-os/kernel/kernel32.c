@@ -521,6 +521,19 @@ void main(){
    dex32_startup(); 
 };
 
+/* kthread body for the `nethack-verify` cmdline self-test: read an executable
+   through both the VFS stream and mmap paths, print size/fnv1a32/first bytes,
+   then idle.  Running as a schedulable kthread lets the xHCI completion
+   kthread service the blocked reads (the BSP boot flow cannot). */
+static void nethack_verify_kthread(void)
+{
+    extern void execp_verify_file(const char *path);
+    execp_verify_file("/icsos/apps/nethack.exe");
+    printf("NETHACK_VERIFY_DONE\n");
+    for (;;)
+        delay(1000);
+}
+
 //next stage
 void dex32_startup(){
     
@@ -1051,9 +1064,9 @@ void dex_init(){
    }
 
    //setup the initial executable loaders (So we could run .EXEs,.b32,coff and elfs)
-   printf("Initializing first module loader(s) [EXE][COFF][ELF][DEX B32]...");
-   dex32_initloader();
-   printf("[OK]\n");   
+    printf("Initializing first module loader(s) [EXE][COFF][ELF][DEX B32]...");
+    dex32_initloader();
+    printf("[OK]\n");
 
    /*Supposed to initialize the Advanced Power Management Interface
      so that I could do a "software" shutdown **IN PROGRESS** */
@@ -1100,9 +1113,18 @@ void dex_init(){
     }
 
     /* Hotplug/CDC after the console exists so a wedged xHCI pump cannot
-       hide the GOP prompt. The monitor thread does its own usb_cdc_pump. */
-    if (usb_start_hotplug_monitor() == -1)
-       printf("xhci: failed to start hotplug monitor\n");
+        hide the GOP prompt. The monitor thread does its own usb_cdc_pump. */
+     if (usb_start_hotplug_monitor() == -1)
+        printf("xhci: failed to start hotplug monitor\n");
+
+    /* Deterministic file-integrity self-test (cmdline: nethack-verify): read
+       an executable through both the VFS stream and mmap paths and print
+       size/fnv1a32/first bytes.  Runs as a kthread (not the BSP boot flow) so
+       the scheduler can service xHCI completions while the read blocks.  Used
+       to diagnose the N150 "unidentified executable format" corruption. */
+    if (strstr(kernel_cmdline, "nethack-verify"))
+        createkthread_on_cpu((void*)nethack_verify_kthread, "nethack-verify",
+                             8192, 0);
 
     /* COM2 (0x2F8) interactive terminal/shell: live commands + introspection
        without a reboot. Attach via a second QEMU -serial chardev (telnet or
