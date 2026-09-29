@@ -442,6 +442,28 @@ int fbconsole_rgb_at(unsigned int x, unsigned int y,
     return 1;
 }
 
+/* Write a raw RGB pixel to the framebuffer at absolute (x,y). Used by the
+   legacy VGA graphics syscalls (write_pixel) when running under UEFI/GOP
+   where there is no 0xA0000 VGA plane. No-op when the framebuffer is not
+   ready. */
+void fbconsole_put_pixel(int x, int y, unsigned int r, unsigned int g,
+                         unsigned int b)
+{
+    unsigned int v, rmax, gmax, bmax, rv, gv, bv;
+    if (!fbconsole_active() || !fb_base)
+        return;
+    if (x < 0 || x >= (int)fb_width || y < 0 || y >= (int)fb_height)
+        return;
+    rmax = fb_rsize ? ((1u << fb_rsize) - 1u) : 0;
+    gmax = fb_gsize ? ((1u << fb_gsize) - 1u) : 0;
+    bmax = fb_bsize ? ((1u << fb_bsize) - 1u) : 0;
+    rv = rmax ? (r * rmax) / 255u : 0;
+    gv = gmax ? (g * gmax) / 255u : 0;
+    bv = bmax ? (b * bmax) / 255u : 0;
+    v = (rv << fb_rshift) | (gv << fb_gshift) | (bv << fb_bshift);
+    fb_put_pixel((unsigned int)x, (unsigned int)y, v);
+}
+
 void fbconsole_cell_render(int x, int y, unsigned char c, unsigned char attr)
 {
     if (!fbconsole_active() || !fb_live_render)

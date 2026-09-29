@@ -160,6 +160,59 @@ typedef struct {
     DWORD block_size;
 } usb_drive_info;
 
+/*
+  USB device registry (Phase 2): supports an arbitrary number of devices of
+  arbitrary classes on the multi-device xHCI controller. Each bound device
+  (usb_device) owns its control/bulk state (the former single-device globals)
+  plus a class-specific priv heap block. A usb_driver vtable is selected by
+  USB class/interface and performs enumerate+bind (probe) and teardown
+  (remove); the registry claims a controller slot per connected port and tries
+  each driver until one binds. Bulk bounce buffers (usb_dma_buf/cbw/csw) stay
+  shared statics: all USB I/O is serialized by usb_io_lock, one transfer at a
+  time, so no per-device bounce duplication is needed.
+*/
+#define USB_MAX_DEVICES   8
+/* usb_device.driver indexes into usb_drivers[]. */
+#define USB_DRV_NONE      (-1)
+#define USB_DRV_MSC       0
+#define USB_DRV_CDC_ACM   1
+
+struct usb_device;
+typedef struct usb_driver {
+    const char *name;
+    int  (*probe)(struct usb_device *dev);
+    void (*remove)(struct usb_device *dev);
+} usb_driver;
+
+/* Per-device state for a USB Mass Storage (BBB/BOT) device. Only the UHCI
+   control address and low-speed flag stay shared globals (uhci_ctrl/uhci_bulk
+   read them; the xHCI path keeps the address in its per-slot context and
+   ignores the data toggle, so xHCI multi-device needs neither). Everything
+   that differs per device — endpoints, sizes/burst, class interface, BOT
+   toggle, CBW tag, drive geometry, media identity — lives here. */
+typedef struct {
+    usb_drive_info drive;
+    int   dev;             /* xHCI usbdevs[] index (0 for UHCI) for bulk/ctrl */
+    int   name_index;      /* "usb%d" block-name index */
+    BYTE  ep_in, ep_out;
+    WORD  ep_in_mps, ep_out_mps;
+    BYTE  ep_in_burst, ep_out_burst;
+    BYTE  msc_interface;
+    BYTE  toggle_in, toggle_out;
+    DWORD tag;
+    usb_media_identity expected_identity;
+    int   media_established;
+} usb_msc;
+
+typedef struct usb_device {
+    int   present;
+    int   slot;          /* xHCI usbdev slot index; -1 if unclaimed */
+    DWORD port;
+    int   driver;        /* index into usb_drivers[]; -1 if none */
+    void *priv;          /* class-specific heap block (usb_msc / ...) */
+    char  name[16];      /* "usb0", "usb1", ... */
+} usb_device;
+
 static volatile DWORD uhci_framelist[1024] __attribute__((aligned(4096)));
 static uhci_qh uhci_qh_ctl  __attribute__((aligned(16)));
 static uhci_td uhci_tds[USB_MAX_TD] __attribute__((aligned(16)));
@@ -169,22 +222,13 @@ static BYTE usb_cbw_buf[32] __attribute__((aligned(16)));
 static BYTE usb_csw_buf[16] __attribute__((aligned(16)));
 
 static WORD uhci_iobase = 0;
-static int  usb_devaddr = 0;
-static int  usb_lowspeed = 0;
-static BYTE usb_ep_in = 0;
-static BYTE usb_ep_out = 0;
-static BYTE usb_msc_interface = 0;
-static BYTE usb_toggle_in = 0;
-static BYTE usb_toggle_out = 0;
-static DWORD usb_tag = 1;
+static int  usb_devaddr = 0;   /* UHCI only (uhci_ctrl/uhci_bulk) */
+static int  usb_lowspeed = 0;  /* UHCI only (uhci td_cs) */
 static int usb_host = 0;
-static WORD usb_ep_in_mps = 64;
-static WORD usb_ep_out_mps = 64;
-static BYTE usb_ep_in_burst = 0;
-static BYTE usb_ep_out_burst = 0;
-static usb_drive_info usb_drive;
-static usb_media_identity usb_expected_identity;
-static int usb_media_established;
+/* Primary (boot) MSC drive state. Secondary drives get their own heap
+   usb_msc; usb_msc0 stays static so the recovery/hotplug/init paths (which
+   manage the boot drive) have a stable object to point at. */
+static usb_msc usb_msc0;
 static spinlock_t usb_io_lock;
 static int usb_xhci_recovering;
 static int usb_xhci_recovery_count;
@@ -196,6 +240,58 @@ static int usb_fault_invalid_cbw;
 static int usb_fault_drop_stall_retry;
 static BYTE usb_recovery_before[512];
 static BYTE usb_recovery_after[512];
+
+/* Device registry (Phase 2). usb_devices[] holds every bound device; the
+   xHCI controller owns one slot per entry. usb_cdc_dev tracks the slot the
+   CDC-ACM console claimed (it was the fixed USB_CDC_DEV before multi-device). */
+static usb_device usb_devices[USB_MAX_DEVICES];
+
+/* Secondary (non-boot) MSC drives. The boot drive is the static usb_msc0 in
+   usbdevs[0]; each additional drive gets a heap usb_msc in a later usbdevs
+   index (2..7, since index 1 is reserved for the CDC-ACM console). */
+#define USB_MAX_SECONDARY   6
+static usb_msc *usb_secondary[USB_MAX_SECONDARY];
+static int usb_secondary_count;
+static int usb_secondary_dev_base;   /* usbdevs index of the next secondary */
+
+static void usb_secondary_reset(void)
+{
+    int i;
+    for (i = 0; i < usb_secondary_count; i++) {
+        if (usb_secondary[i]) {
+            free(usb_secondary[i]);
+            usb_secondary[i] = 0;
+        }
+    }
+    usb_secondary_count = 0;
+    usb_secondary_dev_base = 2;
+    memset(usb_devices, 0, sizeof(usb_devices));
+}
+
+static void usb_registry_add(int idx, DWORD port, int dev, int driver,
+                             void *priv, const char *name)
+{
+    if (idx < 0 || idx >= USB_MAX_DEVICES)
+        return;
+    usb_devices[idx].present = 1;
+    usb_devices[idx].slot = dev;
+    usb_devices[idx].port = port;
+    usb_devices[idx].driver = driver;
+    usb_devices[idx].priv = priv;
+    usb_devices[idx].name[0] = 0;
+    if (name) {
+        int n = 0;
+        while (name[n] && n < 15)
+            usb_devices[idx].name[n++] = name[n];
+    }
+}
+
+static void usb_registry_clear(void)
+{
+    int i;
+    for (i = 0; i < USB_MAX_DEVICES; i++)
+        usb_devices[i].present = 0;
+}
 
 /* Same-CPU: a spinning spin_lock never schedules the hotplug thread that
    holds usb_io_lock during CDC OUT — openfilex then hangs forever on N150
@@ -216,6 +312,9 @@ static void usb_io_lock_release(void)
 }
 #define USB_CDC_TXQ 2048
 #define USB_CDC_DEV 1
+/* Slot the CDC-ACM console claimed (was the fixed USB_CDC_DEV). The I/O path
+   below uses usb_cdc_dev, not the macro, so the console works on any slot. */
+static DWORD usb_cdc_dev = USB_CDC_DEV;
 static volatile DWORD usb_cdc_tx_head;
 static volatile DWORD usb_cdc_tx_tail;
 static unsigned char usb_cdc_txq[USB_CDC_TXQ];
@@ -243,9 +342,9 @@ static unsigned int usb_cdc_kexec_stall;
 static int usb_cdc_rx_seen;
 static int usb_cdc_tx_fails;
 
-static int usb_enumerate_msc(void);
+static int usb_enumerate_msc(usb_msc *m, int dev);
 static int usb_xhci_recover(void);
-static int usb_publish_storage_devices(void);
+static int usb_publish_storage_devices(usb_msc *m, int index);
 static void usb_xhci_hotplug_monitor(void);
 static void usb_cdc_after_msc(void);
 
@@ -254,7 +353,7 @@ static int usb_for_each_part(int (*cb)(int deviceid))
     int i, sum = 0;
     for (i = 0; i < partdev_count(); i++) {
         const partdev_entry *e = partdev_get(i);
-        if (e->parent_deviceid == usb_drive.deviceid && e->mydeviceid >= 0)
+        if (e->parent_deviceid == usb_msc0.drive.deviceid && e->mydeviceid >= 0)
             sum += cb(e->mydeviceid);
     }
     return sum;
@@ -274,8 +373,8 @@ static int usb_quiesce_cb(int deviceid)
 static void usb_invalidate_storage_cache(void)
 {
     int dirty = 0;
-    if (usb_drive.deviceid >= 0) {
-        dirty += blkcache_invalidate_device(usb_drive.deviceid);
+    if (usb_msc0.drive.deviceid >= 0) {
+        dirty += blkcache_invalidate_device(usb_msc0.drive.deviceid);
         dirty += usb_for_each_part(usb_invalidate_cb);
     }
     usb_disconnect_dirty_pages = dirty;
@@ -285,21 +384,21 @@ static void usb_invalidate_storage_cache(void)
 
 static void usb_quiesce_storage_devices(void)
 {
-    if (usb_drive.deviceid >= 0) {
-        devmgr_quiesce_device(usb_drive.deviceid);
+    if (usb_msc0.drive.deviceid >= 0) {
+        devmgr_quiesce_device(usb_msc0.drive.deviceid);
         usb_for_each_part(usb_quiesce_cb);
     }
 }
 
 static void usb_xhci_disconnect_offline(void)
 {
-    if (!usb_drive.present)
+    if (!usb_msc0.drive.present)
         return;
-    usb_drive.present = 0;
+    usb_msc0.drive.present = 0;
     usb_invalidate_storage_cache();
     usb_quiesce_storage_devices();
-    partdev_remove(usb_drive.deviceid);
-    usb_drive.deviceid = -1;
+    partdev_remove(usb_msc0.drive.deviceid);
+    usb_msc0.drive.deviceid = -1;
     printf("xhci: device disconnected; storage offline\n");
 }
 
@@ -579,6 +678,18 @@ static int usb_bulk(BYTE endp, int in, BYTE *data, int len, BYTE *toggle)
     return uhci_bulk(endp, in, data, len, toggle);
 }
 
+/* Per-slot bulk: xHCI routes to the device's controller slot (multi-device);
+   UHCI is single-device so the slot is ignored. */
+static int usb_bulk_dev(DWORD dev, BYTE endp, int in, BYTE *data, int len,
+                        BYTE *toggle)
+{
+    if (usb_host == USB_HOST_XHCI)
+        return xhci_bulk(usb_xhci_hcd, dev, endp, in, data, len);
+    if (dev != 0)
+        return 0;
+    return uhci_bulk(endp, in, data, len, toggle);
+}
+
 static int usb_get_desc_dev(DWORD dev, BYTE type, BYTE index, void *buf,
                             WORD len)
 {
@@ -635,14 +746,14 @@ static int usb_set_config(BYTE cfg)
     return usb_set_config_dev(0, cfg);
 }
 
-static int usb_msc_bot_once(BYTE *cdb, int cdb_len, int in, BYTE *data,
-                            DWORD len)
+static int usb_msc_bot_once(usb_msc *m, BYTE *cdb, int cdb_len, int in,
+                            BYTE *data, DWORD len)
 {
     usb_cbw cbw;
     usb_csw csw;
     memset(&cbw, 0, sizeof(cbw));
     cbw.sig = CBW_SIG;
-    cbw.tag = usb_tag++;
+    cbw.tag = m->tag++;
     cbw.data_len = len;
     cbw.flags = in ? 0x80 : 0x00;
     cbw.lun = 0;
@@ -655,24 +766,26 @@ static int usb_msc_bot_once(BYTE *cdb, int cdb_len, int in, BYTE *data,
         printf("xhci: test sending invalid BOT CBW\n");
     }
 
-    if (!usb_bulk(usb_ep_out, 0, usb_cbw_buf, 31, &usb_toggle_out))
+    if (!usb_bulk_dev(m->dev, m->ep_out, 0, usb_cbw_buf, 31, &m->toggle_out))
         return 0;
 
     if (len && data) {
         if (in) {
             memset(usb_dma_buf, 0, len > sizeof(usb_dma_buf) ? sizeof(usb_dma_buf) : len);
-            if (!usb_bulk(usb_ep_in, 1, usb_dma_buf, (int)len, &usb_toggle_in))
+            if (!usb_bulk_dev(m->dev, m->ep_in, 1, usb_dma_buf, (int)len,
+                              &m->toggle_in))
                 return 0;
             memcpy(data, usb_dma_buf, len);
         } else {
             memcpy(usb_dma_buf, data, len);
-            if (!usb_bulk(usb_ep_out, 0, usb_dma_buf, (int)len, &usb_toggle_out))
+            if (!usb_bulk_dev(m->dev, m->ep_out, 0, usb_dma_buf, (int)len,
+                              &m->toggle_out))
                 return 0;
         }
     }
 
     memset(usb_csw_buf, 0, sizeof(usb_csw_buf));
-    if (!usb_bulk(usb_ep_in, 1, usb_csw_buf, 13, &usb_toggle_in))
+    if (!usb_bulk_dev(m->dev, m->ep_in, 1, usb_csw_buf, 13, &m->toggle_in))
         return 0;
     memcpy(&csw, usb_csw_buf, 13);
     if (csw.sig != CSW_SIG || csw.status != 0)
@@ -680,54 +793,55 @@ static int usb_msc_bot_once(BYTE *cdb, int cdb_len, int in, BYTE *data,
     return 1;
 }
 
-static int usb_clear_endpoint_halt(BYTE endpoint)
+static int usb_clear_endpoint_halt(usb_msc *m, BYTE endpoint)
 {
     usb_setup setup;
     memset(&setup, 0, sizeof(setup));
     setup.bmRequestType = 0x02;
     setup.bRequest = USB_REQ_CLEAR_FEATURE;
     setup.wIndex = endpoint;
-    return usb_ctrl(&setup, 0, 0);
+    return usb_ctrl_dev(m->dev, &setup, 0, 0);
 }
 
-static int usb_xhci_recover_stall(void)
+static int usb_xhci_recover_stall(usb_msc *m)
 {
     usb_setup setup;
     memset(&setup, 0, sizeof(setup));
     setup.bmRequestType = 0x21;
     setup.bRequest = USB_REQ_MSC_RESET;
-    setup.wIndex = usb_msc_interface;
-    if (!usb_ctrl(&setup, 0, 0) ||
-        !usb_clear_endpoint_halt((BYTE)(usb_ep_in | 0x80)) ||
-        !usb_clear_endpoint_halt(usb_ep_out) ||
-        !xhci_recover_bulk_endpoints(usb_xhci_hcd, 0, usb_ep_in,
-                         usb_ep_out)) {
+    setup.wIndex = m->msc_interface;
+    if (!usb_ctrl_dev(m->dev, &setup, 0, 0) ||
+        !usb_clear_endpoint_halt(m, (BYTE)(m->ep_in | 0x80)) ||
+        !usb_clear_endpoint_halt(m, m->ep_out) ||
+        !xhci_recover_bulk_endpoints(usb_xhci_hcd, m->dev, m->ep_in,
+                     m->ep_out)) {
         usb_xhci_hcd->recovery_needed = 1;
         return 0;
     }
-    usb_toggle_in = 0;
-    usb_toggle_out = 0;
+    m->toggle_in = 0;
+    m->toggle_out = 0;
     usb_xhci_stall_recovery_count++;
     printf("xhci: BOT stall recovery complete count=%d\n",
            usb_xhci_stall_recovery_count);
     return 1;
 }
 
-static int usb_msc_bot(BYTE *cdb, int cdb_len, int in, BYTE *data, DWORD len)
+static int usb_msc_bot(usb_msc *m, BYTE *cdb, int cdb_len, int in,
+                       BYTE *data, DWORD len)
 {
-    if (usb_msc_bot_once(cdb, cdb_len, in, data, len))
+    if (usb_msc_bot_once(m, cdb, cdb_len, in, data, len))
         return 1;
     if (usb_host == USB_HOST_XHCI && usb_xhci_hcd->connection_lost) {
         usb_xhci_disconnect_offline();
         return 0;
     }
     if (usb_host == USB_HOST_XHCI && usb_xhci_hcd->stalled_endpoints &&
-        !usb_xhci_recovering && usb_xhci_recover_stall()) {
+        !usb_xhci_recovering && usb_xhci_recover_stall(m)) {
         if (usb_fault_drop_stall_retry) {
             usb_fault_drop_stall_retry = 0;
             usb_xhci_hcd->fault_drop_next = 1;
         }
-        if (usb_msc_bot_once(cdb, cdb_len, in, data, len))
+        if (usb_msc_bot_once(m, cdb, cdb_len, in, data, len))
             return 1;
         usb_xhci_hcd->recovery_needed = 1;
     }
@@ -740,40 +854,40 @@ static int usb_msc_bot(BYTE *cdb, int cdb_len, int in, BYTE *data, DWORD len)
         return 0;
     if (!usb_xhci_recover())
         return 0;
-    return usb_msc_bot_once(cdb, cdb_len, in, data, len);
+    return usb_msc_bot_once(m, cdb, cdb_len, in, data, len);
 }
 
-static int usb_scsi_ready(void)
+static int usb_scsi_ready(usb_msc *m)
 {
     BYTE cdb[16];
     int i;
     memset(cdb, 0, sizeof(cdb));
     cdb[0] = SCSI_TEST_UNIT_READY;
     for (i = 0; i < 8; i++) {
-        if (usb_msc_bot(cdb, 12, 1, 0, 0))
+        if (usb_msc_bot(m, cdb, 12, 1, 0, 0))
             return 1;
         usb_wait_ms(20);
     }
     return 0;
 }
 
-static int usb_scsi_inquiry(void)
+static int usb_scsi_inquiry(usb_msc *m)
 {
     BYTE cdb[16];
     BYTE inq[36];
     memset(cdb, 0, sizeof(cdb));
     cdb[0] = SCSI_INQUIRY;
     cdb[4] = 36;
-    return usb_msc_bot(cdb, 12, 1, inq, 36);
+    return usb_msc_bot(m, cdb, 12, 1, inq, 36);
 }
 
-static int usb_scsi_capacity(u64 *blocks, DWORD *bsize)
+static int usb_scsi_capacity(usb_msc *m, u64 *blocks, DWORD *bsize)
 {
     BYTE cdb[16];
     BYTE cap[8];
     memset(cdb, 0, sizeof(cdb));
     cdb[0] = SCSI_READ_CAPACITY;
-    if (!usb_msc_bot(cdb, 10, 1, cap, 8))
+    if (!usb_msc_bot(m, cdb, 10, 1, cap, 8))
         return 0;
     /* SCSI READ CAPACITY(10) reports a 32-bit LBA, so the value always
        fits; the u64 field simply preserves it without truncation. */
@@ -785,11 +899,12 @@ static int usb_scsi_capacity(u64 *blocks, DWORD *bsize)
     return 1;
 }
 
-static int usb_scsi_rw(int write, DWORD lba, DWORD nblocks, char *buf)
+static int usb_scsi_rw(usb_msc *m, int write, DWORD lba, DWORD nblocks,
+                       char *buf)
 {
     BYTE cdb[16];
     DWORD done = 0;
-    DWORD bsize = usb_drive.block_size ? usb_drive.block_size : 512;
+    DWORD bsize = m->drive.block_size ? m->drive.block_size : 512;
     /* BOT/UHCI TD budget: transfer up to 32KB per SCSI command
        (classic USB MSC optimal chunk). */
     DWORD max_per_cmd = 64;
@@ -805,7 +920,7 @@ static int usb_scsi_rw(int write, DWORD lba, DWORD nblocks, char *buf)
         cdb[5] = (BYTE)(lba + done);
         cdb[7] = (BYTE)(n >> 8);
         cdb[8] = (BYTE)(n & 0xFF);
-        if (!usb_msc_bot(cdb, 10, write ? 0 : 1,
+        if (!usb_msc_bot(m, cdb, 10, write ? 0 : 1,
                          (BYTE*)(buf + done * bsize), n * bsize))
             return 0;
         done += n;
@@ -813,24 +928,60 @@ static int usb_scsi_rw(int write, DWORD lba, DWORD nblocks, char *buf)
     return 1;
 }
 
-static int usb_read_block_raw(u64 block, char *blockbuff, DWORD numblocks)
+/* Resolve the MSC drive that owns a VFS device context (the disk itself or a
+   partition carved from it). Returns the drive's usb_msc or 0. */
+static usb_msc *usb_msc_by_deviceid(int deviceid)
+{
+    int i;
+    for (i = 0; i < USB_MAX_DEVICES; i++) {
+        if (usb_devices[i].present && usb_devices[i].driver == USB_DRV_MSC &&
+            ((usb_msc *)usb_devices[i].priv)->drive.deviceid == deviceid)
+            return (usb_msc *)usb_devices[i].priv;
+    }
+    return 0;
+}
+
+static usb_msc *usb_msc_from_context(void)
+{
+    int ctx = devmgr_getcontext();
+    int i;
+    usb_msc *m;
+    if (usb_hotplug_transition)
+        return 0;
+    m = usb_msc_by_deviceid(ctx);
+    if (m)
+        return m;
+    for (i = 0; i < USB_MAX_DEVICES; i++) {
+        if (usb_devices[i].present && usb_devices[i].driver == USB_DRV_MSC) {
+            m = (usb_msc *)usb_devices[i].priv;
+            if (m->drive.deviceid >= 0 &&
+                partdev_is_child(ctx, m->drive.deviceid))
+                return m;
+        }
+    }
+    return 0;
+}
+
+static int usb_read_block_raw(usb_msc *m, u64 block, char *blockbuff,
+                              DWORD numblocks)
 {
     int result;
     usb_io_lock_acquire();
-    result = usb_drive.present
-        ? usb_scsi_rw(0, (DWORD)block, numblocks, blockbuff) : 0;
+    result = m->drive.present
+        ? usb_scsi_rw(m, 0, (DWORD)block, numblocks, blockbuff) : 0;
     usb_io_lock_release();
     /* Re-arm CDC IN after MSC (skipped while ELF stream quiesced). */
     usb_cdc_after_msc();
     return result;
 }
 
-static int usb_write_block_raw(u64 block, char *blockbuff, DWORD numblocks)
+static int usb_write_block_raw(usb_msc *m, u64 block, char *blockbuff,
+                               DWORD numblocks)
 {
     int result;
     usb_io_lock_acquire();
-    result = usb_drive.present
-        ? usb_scsi_rw(1, (DWORD)block, numblocks, blockbuff) : 0;
+    result = m->drive.present
+        ? usb_scsi_rw(m, 1, (DWORD)block, numblocks, blockbuff) : 0;
     usb_io_lock_release();
     usb_cdc_after_msc();
     return result;
@@ -842,12 +993,13 @@ static DWORD usb_read_le32(const BYTE *value)
            ((DWORD)value[2] << 16) | ((DWORD)value[3] << 24);
 }
 
-static int usb_read_identity_blocks(DWORD block, DWORD count, BYTE *buffer)
+static int usb_read_identity_blocks(usb_msc *m, DWORD block, DWORD count,
+                                    BYTE *buffer)
 {
-    return usb_scsi_rw(0, block, count, (char *)buffer);
+    return usb_scsi_rw(m, 0, block, count, (char *)buffer);
 }
 
-static int usb_capture_volume_identity(u64 startlba, u64 sectors,
+static int usb_capture_volume_identity(usb_msc *m, u64 startlba, u64 sectors,
                                        usb_volume_identity *identity)
 {
     BYTE data[1024];
@@ -855,33 +1007,33 @@ static int usb_capture_volume_identity(u64 startlba, u64 sectors,
        32-bit fields for the same reason. */
     usb_volume_identity_init(identity, (unsigned int)startlba,
                              (unsigned int)sectors);
-    if (!usb_read_identity_blocks((DWORD)startlba, 1, data))
+    if (!usb_read_identity_blocks(m, (DWORD)startlba, 1, data))
         return 0;
     if (usb_volume_identity_from_boot(data, identity))
         return 1;
-    if (sectors >= 4 && usb_read_identity_blocks((DWORD)startlba + 2, 2, data) &&
+    if (sectors >= 4 && usb_read_identity_blocks(m, (DWORD)startlba + 2, 2, data) &&
         usb_volume_identity_from_ext4(data, identity))
         return 1;
-    if (sectors > 64 && usb_read_identity_blocks((DWORD)startlba + 64, 1, data) &&
+    if (sectors > 64 && usb_read_identity_blocks(m, (DWORD)startlba + 64, 1, data) &&
         usb_volume_identity_from_iso9660(data, identity))
         return 1;
     return 0;
 }
 
-static int usb_capture_media_identity(usb_media_identity *identity)
+static int usb_capture_media_identity(usb_msc *m, usb_media_identity *identity)
 {
     BYTE mbr[512];
     int i;
     int partitioned = 0;
     memset(identity, 0, sizeof(*identity));
-    if (!usb_read_identity_blocks(0, 1, mbr))
+    if (!usb_read_identity_blocks(m, 0, 1, mbr))
         return 0;
     if (mbr[510] == 0x55 && mbr[511] == 0xAA)
         for (i = 0; i < 4; i++)
             if (mbr[446 + i * 16 + 4] != 0)
                 partitioned = 1;
     if (!partitioned) {
-        if (!usb_capture_volume_identity(0, usb_drive.total_blocks,
+        if (!usb_capture_volume_identity(m, 0, m->drive.total_blocks,
                                          &identity->volumes[0]))
             return 0;
         identity->count = 1;
@@ -895,7 +1047,7 @@ static int usb_capture_media_identity(usb_media_identity *identity)
             startlba = usb_read_le32(entry + 8);
             sectors = usb_read_le32(entry + 12);
             if (!startlba || !sectors ||
-                !usb_capture_volume_identity(startlba, sectors,
+                !usb_capture_volume_identity(m, startlba, sectors,
                     &identity->volumes[identity->count]))
                 return 0;
             identity->count++;
@@ -905,61 +1057,53 @@ static int usb_capture_media_identity(usb_media_identity *identity)
     return identity->valid;
 }
 
-static int usb_context_is_current(void)
-{
-    int device_context = devmgr_getcontext();
-    if (usb_hotplug_transition)
-        return 0;
-    if (device_context == usb_drive.deviceid)
-        return 1;
-    if (usb_drive.deviceid >= 0 &&
-        partdev_is_child(device_context, usb_drive.deviceid))
-        return 1;
-    return 0;
-}
-
 static int usb_read_block(u64 block, char *blockbuff, DWORD numblocks)
 {
-    if (!usb_context_is_current())
+    usb_msc *m = usb_msc_from_context();
+    if (!m)
         return 0;
-    return usb_read_block_raw(block, blockbuff, numblocks);
+    return usb_read_block_raw(m, block, blockbuff, numblocks);
 }
 
 static int usb_write_block(u64 block, char *blockbuff, DWORD numblocks)
 {
-    if (!usb_context_is_current())
+    usb_msc *m = usb_msc_from_context();
+    if (!m)
         return 0;
-    return usb_write_block_raw(block, blockbuff, numblocks);
+    return usb_write_block_raw(m, block, blockbuff, numblocks);
 }
 
 static u64 usb_total_blocks(void)
 {
-    if (!usb_context_is_current())
+    usb_msc *m = usb_msc_from_context();
+    if (!m)
         return 0;
-    return usb_drive.total_blocks;
+    return m->drive.total_blocks;
 }
 
 static int usb_get_block_size(void)
 {
-    if (!usb_context_is_current())
+    usb_msc *m = usb_msc_from_context();
+    if (!m)
         return 0;
-    return (int)(usb_drive.block_size ? usb_drive.block_size : 512);
+    return (int)(m->drive.block_size ? m->drive.block_size : 512);
 }
 
 static int usb_flush_device(void)
 {
+    usb_msc *m = usb_msc_from_context();
     BYTE cdb[16];
     int result;
-    if (!usb_context_is_current())
+    if (!m)
         return -1;
     usb_io_lock_acquire();
-    if (!usb_drive.present) {
+    if (!m->drive.present) {
         usb_io_lock_release();
         return -1;
     }
     memset(cdb, 0, sizeof(cdb));
     cdb[0] = SCSI_SYNC_CACHE10;
-    result = usb_msc_bot(cdb, 10, 0, 0, 0);
+    result = usb_msc_bot(m, cdb, 10, 0, 0, 0);
     usb_io_lock_release();
     if (!result) {
         /* A failed flush can lose data: keep this on the live console. */
@@ -977,18 +1121,24 @@ static int usb_flush_device(void)
    the SCSI read/write at the disk LBA already translated by partdev. */
 static int usb_part_raw_read(int parent_id, u64 lba, char *buf, DWORD nblocks)
 {
+    usb_msc *m = usb_msc_by_deviceid(parent_id);
     int result;
+    if (!m)
+        return 0;
     blk_mq_lock(parent_id);
-    result = usb_read_block_raw(lba, buf, nblocks);
+    result = usb_read_block_raw(m, lba, buf, nblocks);
     blk_mq_unlock(parent_id);
     return result;
 }
 
 static int usb_part_raw_write(int parent_id, u64 lba, char *buf, DWORD nblocks)
 {
+    usb_msc *m = usb_msc_by_deviceid(parent_id);
     int result;
+    if (!m)
+        return 0;
     blk_mq_lock(parent_id);
-    result = usb_write_block_raw(lba, buf, nblocks);
+    result = usb_write_block_raw(m, lba, buf, nblocks);
     blk_mq_unlock(parent_id);
     return result;
 }
@@ -996,7 +1146,10 @@ static int usb_part_raw_write(int parent_id, u64 lba, char *buf, DWORD nblocks)
 static int usb_gpt_read(unsigned long long lba, void *buf,
                         unsigned int sectors, void *arg)
 {
-    return usb_read_block_raw(lba, (char *)buf, (DWORD)sectors) ? 1 : 0;
+    usb_msc *m = (usb_msc *)arg;
+    if (!m)
+        return 0;
+    return usb_read_block_raw(m, lba, (char *)buf, (DWORD)sectors) ? 1 : 0;
 }
 
 static int usb_looks_like_fat(unsigned char *s)
@@ -1006,72 +1159,77 @@ static int usb_looks_like_fat(unsigned char *s)
             (bps == 512 || bps == 1024 || bps == 2048 || bps == 4096));
 }
 
-static void usb_register_gpt(int deviceid, u64 total_blocks)
+static void usb_register_gpt(usb_msc *m, int deviceid, u64 total_blocks)
 {
     gpt_disk gpt;
     char guidbuf[40];
+    char diskname[16];
     int i;
+    sprintf(diskname,"usb%d", m->name_index);
     /* gpt_parse returns 1 on success (same contract as ide_register_gpt).
        The inverted != 0 check rejected a valid GPT ESP and left usb0
        unpartitioned (test-usb-uefi-gpt / N150 Etcher image). */
-    if (!gpt_parse(usb_gpt_read, NULL, total_blocks, &gpt)) {
-        printf("GPT_WARN usb0 GPT detected but failed validation; no partitions registered\n");
+    if (!gpt_parse(usb_gpt_read, m, total_blocks, &gpt)) {
+        printf("GPT_WARN %s GPT detected but failed validation; no partitions registered\n",
+               diskname);
         return;
     }
     if (gpt.used_backup)
-        printf("GPT_WARN usb0 using backup GPT header\n");
+        printf("GPT_WARN %s using backup GPT header\n", diskname);
     else {
         if (!gpt.primary_header_ok)
-            printf("GPT_WARN usb0 primary GPT header failed validation\n");
+            printf("GPT_WARN %s primary GPT header failed validation\n", diskname);
         if (!gpt.primary_array_ok)
-            printf("GPT_WARN usb0 primary GPT entry array failed validation\n");
+            printf("GPT_WARN %s primary GPT entry array failed validation\n", diskname);
     }
-    partdev_set_disk(deviceid, "usb0", PARTDEV_TABLE_GPT, gpt.disk_guid,
+    partdev_set_disk(deviceid, diskname, PARTDEV_TABLE_GPT, gpt.disk_guid,
                      gpt.used_backup, gpt.entry_count);
     partdev_format_guid(gpt.disk_guid, guidbuf, sizeof(guidbuf));
-    printf("GPT_DETECT usb0 entries=%d diskguid=%s%s\n",
-           gpt.entry_count, guidbuf, gpt.used_backup ? " (backup)" : "");
-   for (i = 0; i < gpt.entry_count; i++) {
+    printf("GPT_DETECT %s entries=%d diskguid=%s%s\n",
+           diskname, gpt.entry_count, guidbuf, gpt.used_backup ? " (backup)" : "");
+    for (i = 0; i < gpt.entry_count; i++) {
         char name[20];
         const gpt_entry *e = &gpt.entries[i];
-        sprintf(name, "usb0p%d", e->index);
+        sprintf(name, "%sp%d", diskname, e->index);
         if (partdev_register(deviceid, name, e->type_name,
-                             (int)usb_drive.block_size,
-                             e->first_lba, e->last_lba + 1,
-                             usb_part_raw_read, usb_part_raw_write, 0,
-                             e->type_name, e->index,
-                             (u64)e->attributes, e->name) < 0) {
-            printf("GPT_WARN usb0 partition %d not registered (cap reached)\n",
-                   e->index);
+                              (int)m->drive.block_size,
+                              e->first_lba, e->last_lba + 1,
+                              usb_part_raw_read, usb_part_raw_write, 0,
+                              e->type_name, e->index,
+                              (u64)e->attributes, e->name) < 0) {
+            printf("GPT_WARN %s partition %d not registered (cap reached)\n",
+                   diskname, e->index);
             continue;
         }
         printf("usb: registered %s (LBA %u)\n", name, (unsigned)e->first_lba);
     }
 }
 
-static void usb_register_mbr(int deviceid)
+static void usb_register_mbr(usb_msc *m, int deviceid)
 {
     unsigned char mbr[512];
     partition_mbr *pmbr;
+    char diskname[16];
     int i;
 
+    sprintf(diskname,"usb%d", m->name_index);
     memset(mbr, 0, 512);
-    if (!usb_read_block_raw(0, (char *)mbr, 1)) {
-        printf("PART_SCAN usb0 MBR read failed\n");
+    if (!usb_read_block_raw(m, 0, (char *)mbr, 1)) {
+        printf("PART_SCAN %s MBR read failed\n", diskname);
         return;
     }
     if (mbr[510] != 0x55 || mbr[511] != 0xAA) {
-        printf("PART_SCAN usb0 bad MBR signature; unpartitioned\n");
+        printf("PART_SCAN %s bad MBR signature; unpartitioned\n", diskname);
         return;
     }
     pmbr = (partition_mbr *)mbr;
     if (usb_looks_like_fat(mbr) && pmbr->tables[0].type == 0 &&
         pmbr->tables[1].type == 0 && pmbr->tables[2].type == 0 &&
         pmbr->tables[3].type == 0) {
-        printf("usb: FAT volume on usb0 (no partition table)\n");
+        printf("usb: FAT volume on %s (no partition table)\n", diskname);
         return;
     }
-    partdev_set_disk(deviceid, "usb0", PARTDEV_TABLE_MBR,
+    partdev_set_disk(deviceid, diskname, PARTDEV_TABLE_MBR,
                      (const unsigned char *)0, 0, 4);
     for (i = 0; i < 4; i++) {
         char name[20];
@@ -1079,25 +1237,25 @@ static void usb_register_mbr(int deviceid)
         BYTE ptype = pmbr->tables[i].type;
         if (ptype == 0)
             continue;
-        sprintf(name, "usb0p%d", i);
+        sprintf(name, "%sp%d", diskname, i);
         sprintf(desc, "%s on USB partition %d",
                 ide_identify_partition_type(ptype), i);
       if (partdev_register(deviceid,
-                              name,
-                              desc,
-                              (int)usb_drive.block_size,
-                              pmbr->tables[i].startlba,
-                              pmbr->tables[i].startlba +
-                                  pmbr->tables[i].sector_size,
-                              usb_part_raw_read,
-                              usb_part_raw_write,
-                              0,
-                              ide_identify_partition_type(ptype),
-                              i,
-                              0,
-                              (const char *)0) < 0) {
-            printf("PART_WARN usb0 MBR entry %d not registered (cap reached)\n",
-                   i);
+                               name,
+                               desc,
+                               (int)m->drive.block_size,
+                               pmbr->tables[i].startlba,
+                               pmbr->tables[i].startlba +
+                                   pmbr->tables[i].sector_size,
+                               usb_part_raw_read,
+                               usb_part_raw_write,
+                               0,
+                               ide_identify_partition_type(ptype),
+                               i,
+                               0,
+                               (const char *)0) < 0) {
+            printf("PART_WARN %s MBR entry %d not registered (cap reached)\n",
+                   diskname, i);
             continue;
         }
         printf("usb: registered %s (LBA %u)\n", name,
@@ -1105,40 +1263,44 @@ static void usb_register_mbr(int deviceid)
     }
 }
 
-static int usb_register_partitions(int deviceid)
+static int usb_register_partitions(usb_msc *m, int deviceid)
 {
     u64 total_blocks;
     int kind;
+    char diskname[16];
 
-    if (!usb_drive.present || usb_drive.block_size != 512 || deviceid < 0)
+    if (!m->drive.present || m->drive.block_size != 512 || deviceid < 0)
         return 0;
-    total_blocks = usb_drive.total_blocks;
-    kind = gpt_detect(usb_gpt_read, NULL);
+    sprintf(diskname,"usb%d", m->name_index);
+    total_blocks = m->drive.total_blocks;
+    kind = gpt_detect(usb_gpt_read, m);
     if (kind < 0) {
-        printf("PART_SCAN usb0 MBR read failed\n");
+        printf("PART_SCAN %s MBR read failed\n", diskname);
         return 0;
     }
     if (kind == 1)
-        usb_register_gpt(deviceid, total_blocks);
+        usb_register_gpt(m, deviceid, total_blocks);
     else if (kind == 0)
-        usb_register_mbr(deviceid);
+        usb_register_mbr(m, deviceid);
     else
-        printf("PART_SCAN usb0 no partition table (unpartitioned)\n");
+        printf("PART_SCAN %s no partition table (unpartitioned)\n", diskname);
     return 1;
 }
 
-static int usb_publish_storage_devices(void)
+static int usb_publish_storage_devices(usb_msc *m, int index)
 {
     devmgr_block_desc blk;
-    if (!usb_expected_identity.valid &&
-        !usb_capture_media_identity(&usb_expected_identity)) {
+    char name[16];
+    if (!m->expected_identity.valid &&
+        !usb_capture_media_identity(m, &m->expected_identity)) {
         printf("usb: stable volume identity unavailable\n");
     }
-    /* Drop any stale partition metadata keyed on the previous usb0 id before
+    /* Drop any stale partition metadata keyed on the previous id before
        (re)publishing; the disconnect path normally already cleared it. */
-    partdev_remove(usb_drive.deviceid);
+    partdev_remove(m->drive.deviceid);
     memset(&blk, 0, sizeof(blk));
-    strcpy(blk.hdr.name, "usb0");
+    sprintf(name,"usb%d", index);
+    strcpy(blk.hdr.name, name);
     strcpy(blk.hdr.description, usb_host == USB_HOST_XHCI
         ? "USB Mass Storage (xHCI)" : "USB Mass Storage (UHCI)");
     blk.hdr.type = DEVMGR_BLOCK;
@@ -1148,47 +1310,48 @@ static int usb_publish_storage_devices(void)
     blk.total_blocks = usb_total_blocks;
     blk.flush_device = usb_flush_device;
     blk.get_block_size = usb_get_block_size;
-    usb_drive.deviceid = devmgr_register((devmgr_generic*)&blk);
-    if (usb_drive.deviceid < 0)
+    m->name_index = index;
+    m->drive.deviceid = devmgr_register((devmgr_generic*)&blk);
+    if (m->drive.deviceid < 0)
         return 0;
-    usb_register_partitions(usb_drive.deviceid);
-    usb_media_established = 1;
-    printf("usb: registered block device usb0\n");
+    usb_register_partitions(m, m->drive.deviceid);
+    m->media_established = 1;
+    printf("usb: registered block device usb%d\n", index);
     return 1;
 }
 
-static int usb_parse_config(BYTE *cfg, WORD total)
+static int usb_parse_config(usb_msc *m, BYTE *cfg, WORD total)
 {
     int off = 0;
     int found = 0;
     BYTE last_ep = 0;
-    usb_ep_in = 0;
-    usb_ep_out = 0;
-    usb_msc_interface = 0;
-    usb_ep_in_mps = 64;
-    usb_ep_out_mps = 64;
-    usb_ep_in_burst = 0;
-    usb_ep_out_burst = 0;
+    m->ep_in = 0;
+    m->ep_out = 0;
+    m->msc_interface = 0;
+    m->ep_in_mps = 64;
+    m->ep_out_mps = 64;
+    m->ep_in_burst = 0;
+    m->ep_out_burst = 0;
     while (off + 2 <= total) {
         BYTE len = cfg[off];
         BYTE type = cfg[off + 1];
         if (len < 2 || off + len > total)
             return 0;
         if (type == USB_DESC_INTERFACE && len >= 9) {
-            if (found && usb_ep_in && usb_ep_out)
+            if (found && m->ep_in && m->ep_out)
                 return 1;
             last_ep = 0;
-            usb_ep_in = 0;
-            usb_ep_out = 0;
-            usb_ep_in_mps = 64;
-            usb_ep_out_mps = 64;
-            usb_ep_in_burst = 0;
-            usb_ep_out_burst = 0;
+            m->ep_in = 0;
+            m->ep_out = 0;
+            m->ep_in_mps = 64;
+            m->ep_out_mps = 64;
+            m->ep_in_burst = 0;
+            m->ep_out_burst = 0;
             if (cfg[off + 5] == USB_CLASS_MASS &&
                 cfg[off + 6] == USB_SUBCLASS_SCSI &&
                 cfg[off + 7] == USB_PROTO_BBB && cfg[off + 3] == 0) {
                 found = 1;
-                usb_msc_interface = cfg[off + 2];
+                m->msc_interface = cfg[off + 2];
             } else
                 found = 0;
         } else if (found && type == USB_DESC_ENDPOINT && len >= 7) {
@@ -1196,13 +1359,13 @@ static int usb_parse_config(BYTE *cfg, WORD total)
             BYTE attr = cfg[off + 3];
             if ((attr & 3) == 2) {
                 if (addr & 0x80)
-                    usb_ep_in = addr & 0x0F;
+                    m->ep_in = addr & 0x0F;
                 else
-                    usb_ep_out = addr & 0x0F;
+                    m->ep_out = addr & 0x0F;
                 if (addr & 0x80)
-                    usb_ep_in_mps = (WORD)(cfg[off + 4] | (cfg[off + 5] << 8));
+                    m->ep_in_mps = (WORD)(cfg[off + 4] | (cfg[off + 5] << 8));
                 else
-                    usb_ep_out_mps = (WORD)(cfg[off + 4] | (cfg[off + 5] << 8));
+                    m->ep_out_mps = (WORD)(cfg[off + 4] | (cfg[off + 5] << 8));
                 last_ep = addr;
             }
         } else if (found && type == USB_DESC_SS_EP_COMPANION && len >= 6 &&
@@ -1210,16 +1373,16 @@ static int usb_parse_config(BYTE *cfg, WORD total)
             if (cfg[off + 2] > 15)
                 return 0;
             if (last_ep & 0x80)
-                usb_ep_in_burst = cfg[off + 2];
+                m->ep_in_burst = cfg[off + 2];
             else
-                usb_ep_out_burst = cfg[off + 2];
+                m->ep_out_burst = cfg[off + 2];
             last_ep = 0;
         } else {
             last_ep = 0;
         }
         off += len;
     }
-    return found && usb_ep_in && usb_ep_out;
+    return found && m->ep_in && m->ep_out;
 }
 
 static int uhci_reset_port(int port)
@@ -1254,7 +1417,7 @@ static int uhci_reset_port(int port)
     return 1;
 }
 
-static int usb_enumerate_msc(void)
+static int usb_enumerate_msc(usb_msc *m, int dev)
 {
     BYTE devdesc[18];
     BYTE cfghdr[9];
@@ -1262,23 +1425,24 @@ static int usb_enumerate_msc(void)
     BYTE cfg[256];
     BYTE cfgval;
 
+    m->dev = dev;
     usb_devaddr = 0;
-    usb_toggle_in = 0;
-    usb_toggle_out = 0;
+    m->toggle_in = 0;
+    m->toggle_out = 0;
     if (usb_host == USB_HOST_XHCI)
         printf("usb: enumerate port=%u speed=%u slot=%u\n",
-               usb_xhci_hcd->usbdevs[0].port,
-               usb_xhci_hcd->usbdevs[0].speed,
-               usb_xhci_hcd->usbdevs[0].slot);
+               usb_xhci_hcd->usbdevs[dev].port,
+               usb_xhci_hcd->usbdevs[dev].speed,
+               usb_xhci_hcd->usbdevs[dev].slot);
 
-    if (!usb_get_desc(USB_DESC_DEVICE, 0, devdesc, 8))
+    if (!usb_get_desc_dev(dev, USB_DESC_DEVICE, 0, devdesc, 8))
         return 0;
     if (usb_host == USB_HOST_XHCI &&
-        !xhci_set_ep0_packet_size(usb_xhci_hcd, 0, devdesc[7]))
+        !xhci_set_ep0_packet_size(usb_xhci_hcd, dev, devdesc[7]))
         return 0;
     if (!usb_set_address(1))
         return 0;
-    if (!usb_get_desc(USB_DESC_DEVICE, 0, devdesc, 18))
+    if (!usb_get_desc_dev(dev, USB_DESC_DEVICE, 0, devdesc, 18))
         return 0;
     printf("usb: vid=%04x pid=%04x class=%u subclass=%u proto=%u\n",
            (unsigned)(devdesc[8] | (devdesc[9] << 8)),
@@ -1287,42 +1451,42 @@ static int usb_enumerate_msc(void)
            (unsigned)devdesc[6]);
     if (devdesc[4] == 9)
         printf("usb: hub (no hub driver yet)\n");
-    if (!usb_get_desc(USB_DESC_CONFIG, 0, cfghdr, 9))
+    if (!usb_get_desc_dev(dev, USB_DESC_CONFIG, 0, cfghdr, 9))
         return 0;
     total = cfghdr[2] | (cfghdr[3] << 8);
     if (total < 9 || total > sizeof(cfg))
         total = 9;
-    if (!usb_get_desc(USB_DESC_CONFIG, 0, cfg, total))
+    if (!usb_get_desc_dev(dev, USB_DESC_CONFIG, 0, cfg, total))
         return 0;
-    if (!usb_parse_config(cfg, total)) {
+    if (!usb_parse_config(m, cfg, total)) {
         printf("usb: no BBB mass-storage interface\n");
         return 0;
     }
     cfgval = cfg[5] ? cfg[5] : 1;
-    if (!usb_set_config(cfgval))
+    if (!usb_set_config_dev(dev, cfgval))
         return 0;
     if (usb_host == USB_HOST_XHCI &&
-        !xhci_configure_endpoints(usb_xhci_hcd, 0,
-                      usb_ep_in, usb_ep_in_mps,
-                                  usb_ep_in_burst, usb_ep_out,
-                                  usb_ep_out_mps, usb_ep_out_burst))
+        !xhci_configure_endpoints(usb_xhci_hcd, dev,
+                      m->ep_in, m->ep_in_mps,
+                                  m->ep_in_burst, m->ep_out,
+                                  m->ep_out_mps, m->ep_out_burst))
         return 0;
-    printf("usb: MSC endpoints in=%d out=%d\n", usb_ep_in, usb_ep_out);
-    usb_scsi_inquiry();
-    if (!usb_scsi_ready())
+    printf("usb: MSC endpoints in=%d out=%d\n", m->ep_in, m->ep_out);
+    usb_scsi_inquiry(m);
+    if (!usb_scsi_ready(m))
         printf("usb: TEST UNIT READY failed (continuing)\n");
-    if (!usb_scsi_capacity(&usb_drive.total_blocks, &usb_drive.block_size)) {
+    if (!usb_scsi_capacity(m, &m->drive.total_blocks, &m->drive.block_size)) {
         printf("usb: READ CAPACITY failed\n");
         return 0;
     }
-    if (usb_drive.block_size != 512) {
+    if (m->drive.block_size != 512) {
         printf("usb: unsupported block size %u\n",
-               (unsigned)usb_drive.block_size);
+               (unsigned)m->drive.block_size);
         return 0;
     }
     printf("usb: %u blocks, %u bytes/block\n",
-           (unsigned)usb_drive.total_blocks,
-           (unsigned)usb_drive.block_size);
+           (unsigned)m->drive.total_blocks,
+           (unsigned)m->drive.block_size);
     return 1;
 }
 
@@ -1335,15 +1499,19 @@ static int usb_xhci_bind_msc(void)
     if (!ccs)
         ccs = xhci_wait_connected_ports(usb_xhci_hcd);
     printf("xhci: bind ccs=0x%x\n", ccs);
+    /* (Re)bind the boot drive only; secondary drives are bound by
+       usb_bind_secondary_msc() after the primary is published. */
+    usb_secondary_reset();
     usb_xhci_hcd->enumerating = 1;
     usb_xhci_hcd->recovery_needed = 0;
     for (port = 1; port <= usb_xhci_hcd->max_ports && port <= 32; port++) {
         if (!(xhci_port_ccs_mask(usb_xhci_hcd) & xhci_ccs_bit(port)))
             continue;
         printf("xhci: trying port %u\n", port);
-        if (!xhci_claim_port(usb_xhci_hcd, port))
+        if (!xhci_claim_port_dev(usb_xhci_hcd, port, 0))
             continue;
-        if (usb_enumerate_msc()) {
+        if (usb_enumerate_msc(&usb_msc0, 0)) {
+            usb_registry_add(0, port, 0, USB_DRV_MSC, &usb_msc0, "usb0");
             usb_xhci_hcd->enumerating = 0;
             return 1;
         }
@@ -1353,6 +1521,68 @@ static int usb_xhci_bind_msc(void)
     }
     usb_xhci_hcd->enumerating = 0;
     return 0;
+}
+
+/* Bind every additional connected MSC drive as a secondary (usb1, usb2, ...).
+   The boot drive is usbdevs[0] and the CDC console is usb_cdc_dev; everything
+   else is claimed into the next free secondary index (2..7). */
+static void usb_bind_secondary_msc(void)
+{
+    DWORD port;
+    DWORD bound_ports = 0;
+    int name_seq = 1;
+    if (usb_host != USB_HOST_XHCI || !usb_xhci_hcd)
+        return;
+    if (usb_xhci_hcd->usbdevs[0].port)
+        bound_ports |= xhci_ccs_bit(usb_xhci_hcd->usbdevs[0].port);
+    if (usb_xhci_hcd->usbdevs[usb_cdc_dev].port)
+        bound_ports |= xhci_ccs_bit(usb_xhci_hcd->usbdevs[usb_cdc_dev].port);
+    usb_xhci_hcd->enumerating = 1;
+    usb_xhci_hcd->recovery_needed = 0;
+    for (port = 1; port <= usb_xhci_hcd->max_ports && port <= 32; port++) {
+        usb_msc *m;
+        int dev_idx, sec;
+        char name[16];
+        if (!(xhci_port_ccs_mask(usb_xhci_hcd) & xhci_ccs_bit(port)))
+            continue;
+        if (bound_ports & xhci_ccs_bit(port))
+            continue;
+        if (usb_secondary_dev_base - 2 >= USB_MAX_SECONDARY)
+            break;
+        sec = usb_secondary_dev_base - 2;
+        dev_idx = usb_secondary_dev_base++;
+        m = (usb_msc *)malloc(sizeof(usb_msc));
+        if (!m)
+            break;
+        memset(m, 0, sizeof(usb_msc));
+        m->tag = 1;
+        m->ep_in_mps = 64;
+        m->ep_out_mps = 64;
+        m->drive.deviceid = -1;
+        if (!xhci_claim_port_dev(usb_xhci_hcd, port, dev_idx)) {
+            free(m);
+            usb_secondary_dev_base--;
+            continue;
+        }
+        if (!usb_enumerate_msc(m, dev_idx)) {
+            printf("xhci: secondary port %u not mass-storage\n", port);
+            xhci_release_dev(usb_xhci_hcd, dev_idx);
+            free(m);
+            usb_secondary_dev_base--;
+            continue;
+        }
+        usb_secondary[sec] = m;
+        usb_secondary_count = sec + 1;
+        m->drive.present = 1;
+        sprintf(name,"usb%d", name_seq);
+        /* Registry index == xHCI dev slot (2..7) so the CDC slot (1) is
+           never clobbered by a secondary, regardless of bind order. */
+        usb_registry_add(dev_idx, port, dev_idx, USB_DRV_MSC, m, name);
+        usb_publish_storage_devices(m, name_seq);
+        name_seq++;
+        bound_ports |= xhci_ccs_bit(port);
+    }
+    usb_xhci_hcd->enumerating = 0;
 }
 
 static void usb_cdc_reset_state(void)
@@ -1772,8 +2002,8 @@ static void usb_cdc_after_msc(void)
     usb_io_lock_acquire();
     /* Always post the full DMA buffer so len never mismatches a live TRB. */
     cap = sizeof(usb_cdc_rx_dma);
-    if (xhci_bulk_in_try(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_in,
-                         usb_cdc_rx_dma, (int)cap, &got, 0) && got > 0) {
+   if (xhci_bulk_in_try(usb_xhci_hcd, usb_cdc_dev, usb_cdc_ep_in,
+                          usb_cdc_rx_dma, (int)cap, &got, 0) && got > 0) {
         if (got > (int)sizeof(rx))
             got = (int)sizeof(rx);
         memcpy(rx, usb_cdc_rx_dma, (unsigned)got);
@@ -1850,8 +2080,8 @@ static int usb_cdc_pump_tx(void)
         __asm__ __volatile__("sti" : : : "memory");
     i = 0;
     if (n) {
-        if (!xhci_bulk(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_out, 0,
-                       usb_cdc_dma_buf, (int)n)) {
+       if (!xhci_bulk(usb_xhci_hcd, usb_cdc_dev, usb_cdc_ep_out, 0,
+                        usb_cdc_dma_buf, (int)n)) {
             /* Roll the tail back so the bytes stay in the TX ring and are
                retransmitted on the next pump. A short CDC-OUT timeout
                (Pico FIFO briefly full while its firmware is busy) must not
@@ -1913,7 +2143,7 @@ int usb_cdc_pump(void)
     usb_cdc_pumping = 1;
     usb_io_lock_acquire();
     cap = sizeof(usb_cdc_rx_dma);
-    if (xhci_bulk_in_try(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_in,
+    if (xhci_bulk_in_try(usb_xhci_hcd, usb_cdc_dev, usb_cdc_ep_in,
                          usb_cdc_rx_dma, (int)cap, &got,
                          XHCI_CDC_IN_SPINS) && got > 0) {
         if (got > (int)sizeof(rx))
@@ -1931,7 +2161,7 @@ int usb_cdc_pump(void)
         usb_cdc_pumping = 1;
         usb_io_lock_acquire();
         cap = sizeof(usb_cdc_rx_dma);
-        (void)xhci_bulk_in_try(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_in,
+        (void)xhci_bulk_in_try(usb_xhci_hcd, usb_cdc_dev, usb_cdc_ep_in,
                                usb_cdc_rx_dma, (int)cap, 0, 0);
         usb_io_lock_release();
         usb_cdc_pumping = 0;
@@ -1954,7 +2184,7 @@ int usb_cdc_pump(void)
         usb_cdc_pumping = 1;
         usb_io_lock_acquire();
         cap = sizeof(usb_cdc_rx_dma);
-        if (xhci_bulk_in_try(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_in,
+        if (xhci_bulk_in_try(usb_xhci_hcd, usb_cdc_dev, usb_cdc_ep_in,
                              usb_cdc_rx_dma, (int)cap, &got,
                              XHCI_CDC_IN_SPINS) && got > 0) {
             if (got > (int)sizeof(rx))
@@ -1978,7 +2208,7 @@ int usb_cdc_pump(void)
             usb_cdc_pumping = 1;
             usb_io_lock_acquire();
             cap = sizeof(usb_cdc_rx_dma);
-            if (xhci_bulk_in_try(usb_xhci_hcd, USB_CDC_DEV, usb_cdc_ep_in,
+            if (xhci_bulk_in_try(usb_xhci_hcd, usb_cdc_dev, usb_cdc_ep_in,
                                  usb_cdc_rx_dma, (int)cap, &got,
                                  XHCI_CDC_IN_SPINS) && got > 0) {
                 if (got > (int)sizeof(rx))
@@ -2118,11 +2348,18 @@ static int usb_xhci_bind_cdc(void)
         printf("xhci: trying CDC port %u\n", port);
         if (!xhci_claim_port_dev(usb_xhci_hcd, port, USB_CDC_DEV))
             continue;
+        /* Tag this slot as the polled console so the xHCI transfer path
+           applies the CDC-ACM spin policy (short IN spin, posted bulk-IN,
+           stashed completions) to all of its endpoints. */
+        xhci_set_console(usb_xhci_hcd, USB_CDC_DEV, 1);
         if (usb_enumerate_cdc()) {
             char ver[192];
             int vn;
             usb_xhci_hcd->enumerating = 0;
             usb_cdc_ready = 1;
+            usb_cdc_dev = USB_CDC_DEV;
+            usb_registry_add(1, port, USB_CDC_DEV, USB_DRV_CDC_ACM, 0,
+                             "usb-cdc");
             serial_puts("USB_CDC_CONSOLE_OK\n");
             vn = usb_debug_format_icsos_ver(ver, (int)sizeof(ver),
                                             ICSOS_RELEASE, ICSOS_GIT_HASH,
@@ -2153,7 +2390,7 @@ static int usb_xhci_recover(void)
         printf("xhci: controller recovery failed\n");
         xhci_stop_hcd(usb_xhci_hcd);
         usb_xhci_hcd->recovery_needed = 1;
-        usb_drive.present = 0;
+        usb_msc0.drive.present = 0;
         usb_invalidate_storage_cache();
         usb_xhci_recovering = 0;
         usb_cdc_reset_state();
@@ -2162,7 +2399,7 @@ static int usb_xhci_recover(void)
     usb_xhci_bind_cdc();
     usb_xhci_recovery_count++;
     usb_xhci_hcd->recovery_needed = 0;
-    usb_drive.present = 1;
+    usb_msc0.drive.present = 1;
     usb_xhci_recovering = 0;
     printf("xhci: controller recovery complete count=%d\n",
            usb_xhci_recovery_count);
@@ -2172,8 +2409,8 @@ static int usb_xhci_recover(void)
 static int usb_xhci_reconnect(void)
 {
     usb_media_identity replacement_identity;
-    u64 old_blocks = usb_drive.total_blocks;
-    DWORD old_block_size = usb_drive.block_size;
+    u64 old_blocks = usb_msc0.drive.total_blocks;
+    DWORD old_block_size = usb_msc0.drive.block_size;
     /* "First attach ever" is signalled by no previously-enumerated media,
        not by publish state: the reconnect self-tests enumerate the device
        without publishing it, yet must still verify the replacement. */
@@ -2186,27 +2423,27 @@ static int usb_xhci_reconnect(void)
         goto fail;
     usb_xhci_bind_cdc();
     if (!initial_attach) {
-        if (usb_drive.total_blocks != old_blocks ||
-            usb_drive.block_size != old_block_size)
+        if (usb_msc0.drive.total_blocks != old_blocks ||
+            usb_msc0.drive.block_size != old_block_size)
             goto fail;
-        if (!usb_expected_identity.valid ||
-            !usb_capture_media_identity(&replacement_identity) ||
-            !usb_media_identity_equal(&usb_expected_identity,
+        if (!usb_msc0.expected_identity.valid ||
+            !usb_capture_media_identity(&usb_msc0, &replacement_identity) ||
+            !usb_media_identity_equal(&usb_msc0.expected_identity,
                                       &replacement_identity)) {
             printf("usb: replacement volume identity mismatch\n");
             goto fail;
         }
     }
-    usb_drive.present = 1;
+    usb_msc0.drive.present = 1;
     usb_xhci_recovering = 0;
     printf("xhci: device re-enumerated\n");
     return 1;
 fail:
     printf("xhci: device reconnect failed\n");
     xhci_stop_hcd(usb_xhci_hcd);
-    usb_drive.total_blocks = old_blocks;
-    usb_drive.block_size = old_block_size;
-    usb_drive.present = 0;
+    usb_msc0.drive.total_blocks = old_blocks;
+    usb_msc0.drive.block_size = old_block_size;
+    usb_msc0.drive.present = 0;
     usb_xhci_recovering = 0;
     return 0;
 }
@@ -2215,20 +2452,20 @@ static void usb_xhci_hotplug_monitor(void)
 {
     int attach_samples = 0;
     int reconnect_blocked = 0;
-    int offline_reported = !usb_media_established;
+    int offline_reported = !usb_msc0.media_established;
     for (;;) {
         usb_cdc_pump();
         delay(xhci_cdc_hotplug_delay(usb_cdc_ready));
         if (usb_host != USB_HOST_XHCI)
             continue;
-        if (usb_drive.present) {
+        if (usb_msc0.drive.present) {
             attach_samples = 0;
             reconnect_blocked = 0;
             offline_reported = 0;
             if (!xhci_usbdev_connected(usb_xhci_hcd, 0) &&
                 !usb_io_lock.locked &&
                 __sync_bool_compare_and_swap(&usb_hotplug_transition,0,1)) {
-                if (!usb_io_lock.locked && usb_drive.present &&
+                if (!usb_io_lock.locked && usb_msc0.drive.present &&
                     !xhci_usbdev_connected(usb_xhci_hcd, 0)) {
                     usb_xhci_disconnect_offline();
                 }
@@ -2257,10 +2494,10 @@ static void usb_xhci_hotplug_monitor(void)
         attach_samples = 0;
         if (!__sync_bool_compare_and_swap(&usb_hotplug_transition,0,1))
             continue;
-        if (usb_xhci_reconnect() && usb_publish_storage_devices()) {
+        if (usb_xhci_reconnect() && usb_publish_storage_devices(&usb_msc0, 0)) {
             serial_puts("XHCI_HOTPLUG_RECONNECT_OK\n");
         } else {
-            if (usb_drive.present)
+            if (usb_msc0.drive.present)
                 usb_xhci_disconnect_offline();
             reconnect_blocked = 1;
             serial_puts("XHCI_HOTPLUG_RECONNECT_REJECTED\n");
@@ -2273,30 +2510,30 @@ static int usb_xhci_recovery_selftest(void)
 {
     int before = usb_xhci_recovery_count;
     int pass;
-    if (!usb_scsi_rw(0, 0, 1, (char *)usb_recovery_before))
+    if (!usb_scsi_rw(&usb_msc0, 0, 0, 1, (char *)usb_recovery_before))
         goto fail;
     usb_xhci_hcd->fault_drop_next = 1;
-    if (!usb_scsi_rw(0, 0, 1, (char *)usb_recovery_after))
+    if (!usb_scsi_rw(&usb_msc0, 0, 0, 1, (char *)usb_recovery_after))
         goto fail;
     if (usb_xhci_recovery_count != before + 1 ||
         memcmp(usb_recovery_before, usb_recovery_after, 512) != 0)
         goto fail;
     usb_xhci_hcd->fault_drop_next = 1;
-    if (!usb_scsi_rw(0, 0, 1, (char *)usb_recovery_after) ||
+    if (!usb_scsi_rw(&usb_msc0, 0, 0, 1, (char *)usb_recovery_after) ||
         usb_xhci_recovery_count != before + 2 ||
         memcmp(usb_recovery_before, usb_recovery_after, 512) != 0)
         goto fail;
-    usb_drive.present = 1;
+    usb_msc0.drive.present = 1;
     usb_xhci_hcd->fault_drop_next = 1;
     usb_xhci_hcd->fault_fail_init = 1;
-    pass = usb_scsi_rw(0, 0, 1, (char *)usb_recovery_after);
-    if (pass || usb_drive.present ||
+    pass = usb_scsi_rw(&usb_msc0, 0, 0, 1, (char *)usb_recovery_after);
+    if (pass || usb_msc0.drive.present ||
         usb_xhci_recovery_count != before + 2)
         goto fail;
     serial_puts("XHCI_RECOVERY_INIT_FAILURE_OK\n");
-    if (!usb_xhci_recover() || !usb_drive.present ||
+    if (!usb_xhci_recover() || !usb_msc0.drive.present ||
         usb_xhci_recovery_count != before + 3 ||
-        !usb_scsi_rw(0, 0, 1, (char *)usb_recovery_after) ||
+        !usb_scsi_rw(&usb_msc0, 0, 0, 1, (char *)usb_recovery_after) ||
         memcmp(usb_recovery_before, usb_recovery_after, 512) != 0)
         goto fail;
     serial_puts("XHCI_RESET_RECOVERY_OK\n");
@@ -2310,10 +2547,10 @@ static int usb_xhci_stall_recovery_selftest(void)
 {
     int controller_before = usb_xhci_recovery_count;
     int stall_before = usb_xhci_stall_recovery_count;
-    if (!usb_scsi_rw(0, 0, 1, (char *)usb_recovery_before))
+    if (!usb_scsi_rw(&usb_msc0, 0, 0, 1, (char *)usb_recovery_before))
         goto fail;
     usb_fault_invalid_cbw = 1;
-    if (!usb_scsi_rw(0, 0, 1, (char *)usb_recovery_after))
+    if (!usb_scsi_rw(&usb_msc0, 0, 0, 1, (char *)usb_recovery_after))
         goto fail;
     if (usb_xhci_recovery_count != controller_before ||
         usb_xhci_stall_recovery_count != stall_before + 1 ||
@@ -2322,7 +2559,7 @@ static int usb_xhci_stall_recovery_selftest(void)
     serial_puts("XHCI_BOT_SELECTIVE_RECOVERY_OK\n");
     usb_fault_invalid_cbw = 1;
     usb_fault_drop_stall_retry = 1;
-    if (!usb_scsi_rw(0, 0, 1, (char *)usb_recovery_after) ||
+    if (!usb_scsi_rw(&usb_msc0, 0, 0, 1, (char *)usb_recovery_after) ||
         usb_xhci_recovery_count != controller_before + 1 ||
         usb_xhci_stall_recovery_count != stall_before + 2 ||
         memcmp(usb_recovery_before, usb_recovery_after, 512) != 0)
@@ -2341,21 +2578,21 @@ static int usb_xhci_disconnect_selftest(int reconnect, int mismatch)
         strstr(kernel_cmdline, "xhci-reconnect-identity-mismatch-test") != 0;
     int recovery_before = usb_xhci_recovery_count;
     int waits;
-    u64 blocks_before = usb_drive.total_blocks;
-    DWORD block_size_before = usb_drive.block_size;
-    if (reconnect && !usb_expected_identity.valid &&
-        !usb_capture_media_identity(&usb_expected_identity))
+    u64 blocks_before = usb_msc0.drive.total_blocks;
+    DWORD block_size_before = usb_msc0.drive.block_size;
+    if (reconnect && !usb_msc0.expected_identity.valid &&
+        !usb_capture_media_identity(&usb_msc0, &usb_msc0.expected_identity))
         goto fail;
     if (reconnect &&
-        !usb_scsi_rw(0, 0, 1, (char *)usb_recovery_before))
+        !usb_scsi_rw(&usb_msc0, 0, 0, 1, (char *)usb_recovery_before))
         goto fail;
-    usb_drive.present = 1;
+    usb_msc0.drive.present = 1;
     usb_xhci_hcd->fault_disconnect_inflight = 1;
-    if (usb_scsi_rw(0, 0, 1, (char *)usb_recovery_after) ||
-        usb_drive.present || !usb_xhci_hcd->connection_lost ||
+    if (usb_scsi_rw(&usb_msc0, 0, 0, 1, (char *)usb_recovery_after) ||
+        usb_msc0.drive.present || !usb_xhci_hcd->connection_lost ||
         usb_xhci_recovery_count != recovery_before)
         goto fail;
-    if (usb_read_block_raw(0, (char *)usb_recovery_after, 1) ||
+    if (usb_read_block_raw(&usb_msc0, 0, (char *)usb_recovery_after, 1) ||
         usb_xhci_recovery_count != recovery_before)
         goto fail;
     if (reconnect) {
@@ -2366,9 +2603,9 @@ static int usb_xhci_disconnect_selftest(int reconnect, int mismatch)
         if (!xhci_device_attached(usb_xhci_hcd))
             goto fail;
         if (mismatch || identity_mismatch) {
-            if (usb_xhci_reconnect() || usb_drive.present ||
-                usb_drive.total_blocks != blocks_before ||
-                usb_drive.block_size != block_size_before)
+            if (usb_xhci_reconnect() || usb_msc0.drive.present ||
+                usb_msc0.drive.total_blocks != blocks_before ||
+                usb_msc0.drive.block_size != block_size_before)
                 goto fail;
             if (identity_mismatch)
                 serial_puts("XHCI_RECONNECT_IDENTITY_MISMATCH_OK\n");
@@ -2377,7 +2614,7 @@ static int usb_xhci_disconnect_selftest(int reconnect, int mismatch)
             return 1;
         }
         if (!usb_xhci_reconnect() ||
-            !usb_read_block_raw(0, (char *)usb_recovery_after, 1) ||
+            !usb_read_block_raw(&usb_msc0, 0, (char *)usb_recovery_after, 1) ||
             memcmp(usb_recovery_before, usb_recovery_after, 512) != 0 ||
             usb_xhci_recovery_count != recovery_before)
             goto fail;
@@ -2402,16 +2639,16 @@ int usb_xhci_mounted_disconnect_selftest(void)
     int waits;
     int partition;
     if (usb_host != USB_HOST_XHCI ||
-        partdev_first_child(usb_drive.deviceid) < 0)
+        partdev_first_child(usb_msc0.drive.deviceid) < 0)
         goto fail;
-    partition = partdev_first_child(usb_drive.deviceid);
+    partition = partdev_first_child(usb_msc0.drive.deviceid);
     if (!blkcache_read(partition, 0, 1, cached))
         goto fail;
     if (!blkcache_write(partition, 0, 1, cached))
         goto fail;
     usb_disconnect_dirty_pages = 0;
     usb_xhci_hcd->fault_disconnect_inflight = 1;
-    if (usb_read_block_raw(0, (char *)transfer, 1) || usb_drive.present ||
+    if (usb_read_block_raw(&usb_msc0, 0, (char *)transfer, 1) || usb_msc0.drive.present ||
         usb_disconnect_dirty_pages == 0 ||
         blkcache_read(partition, 0, 1, cached) ||
         devmgr_finddevice("usb0") != -1 ||
@@ -2424,7 +2661,7 @@ int usb_xhci_mounted_disconnect_selftest(void)
             usb_wait_ms(10);
         if (!xhci_device_attached(usb_xhci_hcd) ||
             !usb_xhci_reconnect() ||
-            !usb_publish_storage_devices())
+            !usb_publish_storage_devices(&usb_msc0, 0))
             goto fail;
         last_context = devmgr_getcontext();
         devmgr_setcontext(partition);
@@ -2498,6 +2735,71 @@ static int usb_xhci_probe_msc(void)
     return 0;
 }
 
+/* Phase 2 two-disk gate (cmdline: xhci-multi-msc-test). Confirms the primary
+   (usb0) and a secondary (usb1) are both bound as independent MSC drives:
+   each is readable at block 0, their media identities differ (two real disks,
+   not one bound twice), and a raw scratch write to the secondary survives a
+   read-back (the host reads the same LBA from the image file to prove the
+   write went through the USB MSC, not an in-memory bounce). Reports via
+   serial markers without aborting the boot (the primary is the live root). */
+#define USB_MULTI_MSC_TEST_BLOCK 512
+
+static void usb_xhci_multi_msc_selftest(void)
+{
+    usb_msc *sec = (usb_secondary_count > 0) ? usb_secondary[0] : 0;
+    usb_media_identity id0, id1;
+    BYTE wr[512], rb[512];
+    int i;
+
+    if (usb_host != USB_HOST_XHCI) {
+        serial_puts("XHCI_MULTI_MSC_FAIL not-xhci\n");
+        return;
+    }
+    if (!usb_msc0.drive.present || usb_msc0.drive.deviceid < 0) {
+        serial_puts("XHCI_MULTI_MSC_FAIL no-primary\n");
+        return;
+    }
+    if (!sec || !sec->drive.present || sec->drive.deviceid < 0) {
+        serial_puts("XHCI_MULTI_MSC_FAIL no-secondary\n");
+        return;
+    }
+    if (!usb_read_block_raw(&usb_msc0, 0, (char *)wr, 1)) {
+        serial_puts("XHCI_MULTI_MSC_FAIL primary-read0\n");
+        return;
+    }
+    if (!usb_read_block_raw(sec, 0, (char *)rb, 1)) {
+        serial_puts("XHCI_MULTI_MSC_FAIL secondary-read0\n");
+        return;
+    }
+    if (!usb_capture_media_identity(&usb_msc0, &id0) ||
+        !usb_capture_media_identity(sec, &id1) ||
+        usb_media_identity_equal(&id0, &id1)) {
+        serial_puts("XHCI_MULTI_MSC_FAIL same-identity\n");
+        return;
+    }
+    memset(wr, 0xA5, sizeof(wr));
+    wr[0] = 'I';
+    wr[1] = 'C';
+    wr[2] = 'S';
+    wr[3] = 'M';
+    if (!usb_write_block_raw(sec, USB_MULTI_MSC_TEST_BLOCK, (char *)wr, 1)) {
+        serial_puts("XHCI_MULTI_MSC_FAIL secondary-write\n");
+        return;
+    }
+    memset(rb, 0, sizeof(rb));
+    if (!usb_read_block_raw(sec, USB_MULTI_MSC_TEST_BLOCK, (char *)rb, 1)) {
+        serial_puts("XHCI_MULTI_MSC_FAIL secondary-reread\n");
+        return;
+    }
+    for (i = 0; i < 512; i++) {
+        if (rb[i] != wr[i]) {
+            serial_puts("XHCI_MULTI_MSC_FAIL secondary-pattern\n");
+            return;
+        }
+    }
+    serial_puts("XHCI_MULTI_MSC_OK primary=usb0 secondary=usb1 block=512\n");
+}
+
 int usb_init(void)
 {
     BYTE bus, slot, func;
@@ -2506,10 +2808,13 @@ int usb_init(void)
     int found_dev = 0;
 
     kbd_boot_leds_raw(KBD_LED_NUM);
-    memset(&usb_drive, 0, sizeof(usb_drive));
-    memset(&usb_expected_identity, 0, sizeof(usb_expected_identity));
-    usb_media_established = 0;
-    usb_drive.deviceid = -1;
+    memset(&usb_msc0, 0, sizeof(usb_msc0));
+    usb_msc0.tag = 1;
+    usb_msc0.ep_in_mps = 64;
+    usb_msc0.ep_out_mps = 64;
+    usb_msc0.drive.deviceid = -1;
+    memset(usb_devices, 0, sizeof(usb_devices));
+    usb_cdc_dev = USB_CDC_DEV;
 
     if (!uhci_find_controller(&bus, &slot, &func)) {
         printf("usb: no UHCI controller found; probing xHCI\n");
@@ -2583,7 +2888,8 @@ int usb_init(void)
                port, usb_lowspeed ? "low" : "full");
         if (usb_lowspeed)
             continue; /* mass storage is full-speed or faster */
-        if (usb_enumerate_msc()) {
+        if (usb_enumerate_msc(&usb_msc0, 0)) {
+            usb_registry_add(0, 0, 0, USB_DRV_MSC, &usb_msc0, "usb0");
             found_dev = 1;
             break;
         }
@@ -2630,13 +2936,21 @@ int usb_init(void)
 register_device:
     if (usb_host == USB_HOST_XHCI)
         usb_xhci_bind_cdc();
-    usb_drive.present = 1;
-    return usb_publish_storage_devices() ? 0 : -1;
+    usb_msc0.drive.present = 1;
+    if (!usb_publish_storage_devices(&usb_msc0, 0))
+        return -1;
+    /* Multi-MSC: bind every other connected drive as usb1, usb2, ... */
+    if (usb_host == USB_HOST_XHCI)
+        usb_bind_secondary_msc();
+    if (usb_host == USB_HOST_XHCI &&
+        strstr(kernel_cmdline, "xhci-multi-msc-test"))
+        usb_xhci_multi_msc_selftest();
+    return 0;
 }
 
 int usb_storage_available(void)
 {
-    return usb_drive.present;
+    return usb_msc0.drive.present;
 }
 
 int usb_start_hotplug_monitor(void)

@@ -2,6 +2,119 @@
 
 ## 2026-09-29 (Manila, UTC+8)
 
+### 23:35 — USB multi-device, Phase 2 (multi-MSC + device registry) complete & verified
+
+**Current problem / activity:** Finish Phase 2 of the USB multi-device work: the
+upper-layer class-driven device registry in `uhci.c` that generalizes the
+single-`usb_drive` MSC + single-CDC model to an arbitrary number of MSC drives
+(`usb0`/`usb1`/...) alongside the CDC console. The registry model and
+parameterized I/O were in; the last two pieces were a registry-index collision
+and a two-disk acceptance test.
+
+- **Registry-index collision (fixed):** `usb_bind_secondary_msc` registered the
+  first secondary at `usb_registry_add(sec + 1, ...)` = array index 1, which
+  collides with the CDC-ACM slot (`USB_CDC_DEV == 1`). MSC routing uses
+  `drive.deviceid` and CDC uses the xHCI slot directly, so it was harmless, but
+  it broke the "arbitrary types simultaneously" guarantee. Changed to
+  `usb_registry_add(dev_idx, ...)` so the registry index == the xHCI dev slot
+  (secondaries occupy 2..7, CDC keeps 1, primary keeps 0) regardless of bind
+  order.
+- **Two-disk self-test (new):** `usb_xhci_multi_msc_selftest()` in `uhci.c`,
+  gated on the `xhci-multi-msc-test` cmdline and invoked from `usb_init` after
+  `usb_bind_secondary_msc()`. It confirms the primary (usb0) and a secondary
+  (usb1) are both bound as independent MSC drives: each is readable at block 0,
+  their media identities differ (two real disks, not one bound twice —
+  `usb_capture_media_identity` + `usb_media_identity_equal`), and a raw 512-byte
+  scratch write ("ICSM" + 0xA5) to the secondary survives a read-back. It
+  reports via serial markers (`XHCI_MULTI_MSC_OK` / `XHCI_MULTI_MSC_FAIL <why>`)
+  without aborting the boot (the primary is the live root).
+- **Host acceptance test (new):** `scripts/test-qemu-xhci-multi-msc.sh` + the
+  `make test-usb-storage-xhci-multi-msc` target. It copies `ics-os-usb.img` as
+  the primary (usb0/root) and builds a fresh superfloppy FAT16 as the secondary
+  (usb1), attaches two `usb-storage` devices to one q35 xHCI, boots with the
+  self-test cmdline, waits for `XHCI_MULTI_MSC_OK`, then reads LBA 512 back from
+  the **secondary image file** to prove the write went through the USB MSC (not
+  an in-memory bounce). It also asserts two `xhci: configured bulk endpoints`
+  (one per drive), `usb: registered block device usb0`+`usb1`, `Root mount
+  [OK]`, and no `XHCI_MULTI_MSC_FAIL` / GPF / PF.
+- **Verified (all PASS):**
+  - `make test-usb-storage-xhci-multi-msc` → `host: secondary block 512 pattern
+    OK` + `test-qemu-xhci-multi-msc PASS`. Serial log: dev=0 → usb0, dev=2 →
+    usb1 (slot 1 stays reserved for CDC), `usb: FAT volume on usb1 (no
+    partition table)`, `XHCI_MULTI_MSC_OK primary=usb0 secondary=usb1`,
+    `Root mount [OK]`, 0 faults.
+  - `make test-usb-storage-xhci` → `test-qemu-usb-storage PASS hcd=xhci`
+    (single-MSC path intact after the registry-index change).
+  - `make test-usb-cdc-console` → `USB_CDC_CONSOLE_OK` + `ICSOS_VER` (CDC + MSC
+    coexistence intact).
+- **Note (pre-existing, not a regression):** `make test-usb-storage-xhci-hotplug`
+  still times out on the `XHCI_HOTPLUG_MONITOR_READY` marker. Proven pre-existing
+  at git HEAD by stashing the Phase 1/2 USB changes (still fails), stashing the
+  VGA changes (still fails), and running a clean checkout (still fails). Boot
+  completes fully (usb0 + root + console) but the marker never appears; the only
+  silent early-return in `usb_start_hotplug_monitor()` is the
+  `usb_host != USB_HOST_XHCI` guard, which is correctly XHCI. Left for a separate
+  hotplug investigation; it does not block Phase 2.
+- **Next (Phase 3 — CDC-ECM/RNDIS NIC):** register a network driver through the
+  same registry. First NIC is CDC-ECM/RNDIS (the Pico's Wi-Fi bridge target);
+  AX88179 deferred. Reuse the `rtl8139.c` NIC pattern against the `netif`/
+  `netdev`/`pbuf` stack, with the registry's `USB_DRV_ECM`/`USB_DRV_RNDIS`
+  drivers probing class/interface 2/6 and 2/... and exposing a `netif`.
+
+### 18:40 — USB multi-device, Phase 1 (xHCI N-device core) complete & verified
+
+**Current problem / activity:** Generalizing the USB stack for multiple
+simultaneous devices (multi-storage / multi-NIC / CDC-ECM-RNDIS). Phase 1 is
+the xHCI N-device core: replace the fixed 2-slot convention (dev0=MSC,
+dev1=CDC) so any number of downstream devices can be enumerated and driven
+concurrently on one HCD.
+
+- **Change:** `xhci_usbdev` slots now own their control (ep0), bulk-IN, and
+  bulk-OUT rings plus their input-/device-context DMA via a dynamically
+  allocated `xhci_dev_res` block (pointers in the slot, resources in the heap).
+  `xhci_ring_owner()` scans slots to apply the per-device (console) spin/posted
+  policy without hard-coding a slot; the host tags a polled CDC-ACM console with
+  `xhci_set_console()`. `xhci_claim_port_dev()` resets only runtime fields
+  (never the rings/ctx, which persist in `res`); `xhci_alloc_dev_dma()` /
+  `xhci_free_dev_dma()` manage the per-slot heap block; all 8 slots are
+  pre-allocated at `xhci_init_hcd`.
+- **Blocker hit & fixed:** embedding the rings/ctx statically in `xhci_usbdev`
+  grew the image ~13KB and tripped `ld: boot page tables collided with 4MiB
+  user ELF window` (the kernel sits right at the 4MiB cap with a 16KiB guard).
+  Moving the per-device rings/ctx into heap-allocated `res` blocks *shrank* the
+  static footprint below the original: fresh link shows `bssEnd=0x3f6834`
+  (≈18KB headroom under the `bssEnd<=0x3fb000` assert) and the
+  `bootptEnd<=0x400000` assert passes.
+- **Verified (both PASS):**
+  - `make test-usb-storage-xhci` → `test-qemu-usb-storage PASS hcd=xhci`
+    (enumeration + per-slot ring/DMA + MSC bulk path intact).
+  - `make test-usb-cdc-console` → two devices enumerated concurrently on one
+    HCD (MSC dev0/slot1, CDC dev1/slot2), each with its own `res`;
+    `USB_CDC_CONSOLE_OK` + `ICSOS_VER` written to the gadget chardev;
+    `Root mount [OK]`.
+- **Next (Phase 2 — uhci.c device registry):** the upper layer is still the
+  fixed single-`usb_drive` MSC + single-CDC model (`usb_drive`, `usb_devaddr`,
+  `usb_ep_in`, `USB_CDC_DEV` are single-instance globals used across
+  recovery/reconnect/media-identity). Deciding the Phase 2 scope: generalize to
+  a true N-device registry (multi-MSC, per-device recovery/identity — large,
+  touches the block/VFS layer) vs. a NIC-first minimal registry that keeps the
+  well-tested single-MSC path and adds slot-2+ network (CDC-ECM/RNDIS) devices.
+  **Direction (user):** refactor for an **arbitrary number AND types** of USB
+  devices — a true general registry, not a NIC-only shortcut.
+- **Design (Phase 2):** a class-driven device registry in `uhci.c` on top of the
+  already-multi-device xHCI core. `usb_device usb_devices[8]` (each: slot, port,
+  driver index, `priv`, + per-device control/bulk state that was the single
+  globals: devaddr, eps, mps/burst, toggle, tag, msc_interface). `usb_driver`
+  vtable `{match, probe, remove}` selected by USB class/interface (MSC 8/6,
+  CDC-ACM 2/2, vendor bulk-serial, CDC-ECM 2/6, RNDIS). MSC generalizes to
+  N drives (usb0/usb1/...); routing by devmgr context (`devmgr_getcontext()`)
+  and partition `parent_id` → correct drive's BOT state. Bulk bounce (cbw/csw/
+  dma) stays a shared static (all USB I/O serialized by `usb_io_lock`). CDC-ACM
+  console stays a singleton (one console) but is registered through the
+  framework. Executing in verifiable increments: (A) framework + multi-MSC,
+  build + run the full xhci/cdc/hotplug/recovery test matrix; (B) two-disk
+  multi-storage test; (C) Phase 3 CDC-ECM/RNDIS NIC; (D) Phase 4 tests/docs.
+
 ### 14:52 — GCC self-host gates green: stale cc1 (legacy mmap ABI) + VMA_MAX=32 exhaustion
 
 **Current problem / activity:** `apps/cc1.exe` page-faulted in-OS

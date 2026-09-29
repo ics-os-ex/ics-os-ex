@@ -69,7 +69,13 @@ void fbconsole_selftest(void);
 int fbconsole_geom(unsigned int *width, unsigned int *height,
                    unsigned int *bpp);
 int fbconsole_rgb_at(unsigned int x, unsigned int y,
-                     unsigned char *r, unsigned char *g, unsigned char *b);
+                      unsigned char *r, unsigned char *g, unsigned char *b);
+
+/* Write a raw RGB pixel (0-255 per channel) at absolute framebuffer coords.
+   Used by legacy VGA graphics syscalls under UEFI/GOP. No-op when the
+   framebuffer is not ready. */
+void fbconsole_put_pixel(int x, int y, unsigned int r, unsigned int g,
+                         unsigned int b);
 
  /* ---- Direct-framebuffer crash diagnostics (early-boot localization) ----
     Paint straight to the linear framebuffer, bypassing the DDL/console. Safe
