@@ -39,6 +39,16 @@ static inline int xhci_allow_msix(int com1_present, int x2apic)
   disconnect, so a long bound does not wedge the console.
 */
 #define XHCI_CDC_OUT_SPINS           400000u
+/*
+  CDC-ECM NIC bulk IN poll. The NIC is polled (no IRQ) from netif_poll in a
+  tight spin loop by the protocol wait loops (DHCP/ping/udp/tcp) and from
+  softnet. The posted-IN TRB stays armed between polls (xhci_bulk_in_try), so
+  an empty poll only waits a short budget for a frame that is already in
+  flight; a longer budget just delays the next poll with no benefit. Reuses
+  the CDC-ACM console IN budget: responsive enough for the selftest, short
+  enough that a no-data poll does not stall the tick.
+*/
+#define XHCI_ECM_IN_SPINS            40000u
 #define XHCI_CDC_HOTPLUG_DELAY_IDLE  100
 #define XHCI_CDC_HOTPLUG_DELAY_READY 1
 

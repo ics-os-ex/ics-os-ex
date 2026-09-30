@@ -1,5 +1,316 @@
 # Development blog
 
+## 2026-10-01 (Manila, UTC+8)
+
+### 06:10 — ASIX "accept + document gap": data path extracted, RX-flag bug fixed, host unit test added
+**Current problem / activity:** The real-device ASIX gate is blocked on a QEMU
+`usb-host` SuperSpeed vendor-control limitation (all vendor control transfers
+STALL; standard ones work). Decision made: keep the driver in-tree as
+protocol-verified, mark `test-usb-net-asix` as blocked on QEMU SuperSpeed, and
+validate the bulk RX/TX data path another way (host-native unit tests). That is
+what this entry implements.
+
+- **Pure data-path logic extracted to `kernel/hardware/usb/usb_asix.h`.** The
+  two hardware-independent pieces the driver reuses are now `static inline` and
+  host-testable: `asix_tx_header(len, mps, hdr[8])` (LE length + the
+  `0x80008000` enable-padding flag at the OUT-ep MPS boundary, with an
+  `mps==0` div-by-zero guard) and the RX bundle splitter. The splitter is an
+  incremental iterator (`asix_rx_iter_init`/`asix_rx_iter_next`) so the driver
+  processes an arbitrary number of frames with no allocation and never drops
+  one; `asix_rx_parse()` is a thin tested wrapper that drains it into a
+  caller array. `usb_asix_transmit()` and `usb_asix_rx_one()` in `uhci.c` were
+  refactored to call these, so the unit test exercises the exact code that moves
+  real frames. The now-unused `AX_RXHDR_*` `#define`s were dropped from `uhci.c`
+  (they live in the header as `ASIX_RXHDR_*`). Kernel still links; `bssEnd`
+  unchanged.
+- **RX error-flag bug found and fixed.** The original inline parser tested
+  `flags = e & 0xFFFF` (low 16 bits) for the CRC/drop check, but
+  `CRC_ERR=(1<<29)` and `DROP_ERR=(1<<31)` live in bits 29/31 — the check was
+  always 0, so error/drop frames were **not** actually skipped. `asix_rx_iter_next`
+  now tests the full 32-bit `e` against `ASIX_RXHDR_CRC_ERR|ASIX_RXHDR_DROP_ERR`.
+  This is the kind of latent defect a host unit test is meant to catch.
+- **Host-native TAP added: `make test-usb-asix-unit` (24/24 ok).**
+  `tests/usb_asix_unit.c` builds synthetic TX headers and RX bundles (a
+  `build_bundle()` helper lays out IP-align + frame + pad, the per-frame RX
+  header, and the trailing count/offset header) and asserts: TX length LE + pad
+  flag set/clear across MPS boundaries + `mps==0` guard + max-MTU; RX two valid
+  frames (off/len + payload intact), CRC-error + runt skipping, drop-error and
+  dummy (len 0) skipping, and the NULL / got<4 / empty / truncated / overflow /
+  `max_frames`-cap bounds. Wired into the Makefile (`.PHONY` + target) and
+  `AGENTS.md`.
+- **Docs updated.** `scripts/test-qemu-usb-asix.sh` header now explains the
+  QEMU usb-host SuperSpeed vendor-control blocker (with the High-Speed
+  workaround), warns at run time (bypassable with
+  `ASIX_ACK_SUPER_SPEED_BLOCK=1`), and points to the unit test as the standing
+  data-path validation. `AGENTS.md` marks `test-usb-net-asix` "Blocked on QEMU
+  usb-host SuperSpeed" and lists the new `test-usb-asix-unit`.
+- **Status / next.** The driver, protocol, and bulk data path are in-tree and
+  validated; the only remaining gap is the hypervisor's SuperSpeed control
+  plane. Re-run `test-usb-net-asix` if/when a USB 2.0 (High Speed) presentation
+  becomes available; the unit test keeps the data path honest in the meantime.
+
+### 04:20 — ASIX real-device run: enumeration fixed; root cause isolated to a QEMU usb-host SuperSpeed vendor-control limitation
+**Current problem / activity:** The physical ASIX (`0b95:1790`, USB 3.0 /
+SuperSpeed) now enumerates correctly in QEMU (`usb-host` on q35 xHCI), but
+the first vendor control transfer STALLs and every vendor control transfer
+(both IN and OUT) fails, so the NIC never comes up and DHCP/ping/UDP/TCP are
+unreachable.
+
+- **Enumeration bug fixed.** The ASIX config descriptor is long enough that
+  the old 256-byte read was misparsing the endpoint table, so the bulk
+  endpoints were never found. `usb_enumerate_asix()` now reads the 9-byte
+  config header, uses the real `wTotalLength` (bounded to the stack buffer),
+  and re-reads the full config before parsing. The device is now correctly
+  identified: `usb: asix vid=0b95 pid=1790`, `configured bulk endpoints
+  in=5 out=6`.
+- **Dead error checks fixed.** `usb_asix_reset()` used `< 0` on calls that
+  return 0/1, so real failures were silently swallowed (the "ready" banner
+  printed even though the PHY was never powered up). All converted to `!` /
+  `== 0`.
+- **Defensive hardening (kept).** 100 ms settle after SET_CONFIGURATION + EP
+  config; bounded 4-attempt / 25 ms retry in `usb_asix_read_reg` /
+  `usb_asix_write_reg`.
+- **Root cause isolated (diagnostic).** A one-shot vendor READ (IN data
+  phase) of the burned MAC, inserted before the first OUT, also STALLs:
+  `xhci: control failed request=1 cc=6 (stall)` then `vendor READ(IN) -> 0`.
+  So it is NOT specific to OUT-with-data — **all vendor control transfers
+  STALL**, while standard control transfers (GET_DESCRIPTOR, GET_CONFIG,
+  SET_CONFIGURATION) succeed. The protocol was verified byte-identical to the
+  in-tree Linux `ax88179_178a` reference (first command: `bmRequestType=0x20`,
+  `bRequest=0x01`, `wValue=0x26`, `wIndex=2`, `wLength=2`, data `0x0000`).
+  Settle delays (100/500 ms) do not help. An EP0 Stop+SetDequeue resync after
+  the failed transfer was tried and reverted: QEMU's emulated xHCI rejects the
+  Stop with `cc=5` (No Slot), so it is not a viable recovery here.
+- **Conclusion: QEMU usb-host SuperSpeed limitation.** QEMU's `usb-host` has
+  known SuperSpeed control-plane / speed-negotiation / `bMaxPacketSize0`
+  bugs; the documented workaround is to force the device onto a lower (USB 2.0
+  / High Speed) link. The real AX88179 is SuperSpeed in practice, so the
+  vendor register interface cannot be exercised through the current QEMU
+  `usb-host` path. The driver, protocol, and test harness are in and correct;
+  the real-device acceptance gate is blocked by the hypervisor, not the kernel.
+- **Next / decision point:** either (a) force a USB 2.0 (High Speed)
+  presentation of the device (physical USB-2 hub or a host/QEMU-side speed
+  override) so the vendor control path is exercised, or (b) accept the driver
+  as in-tree + protocol-verified, mark `test-usb-net-asix` as blocked on the
+  QEMU SuperSpeed path, and validate the bulk-data RX/TX path another way.
+  Awaiting direction before investing further.
+
+### 03:11 — ASIX AX88179 USB Gigabit NIC finalized; 4 MiB kernel wall cleared via BSS trim; high-VA split (Tier 1) deferred
+
+**Current problem / activity:** Land the ASIX AX88179/178A USB Ethernet NIC
+(`0b95:1790`) as a permanent, always-compiled driver and clear the 4 MiB
+kernel BSS wall so the kernel links with it in; then add the real-LAN QEMU
+`usb-host` acceptance test and document the deferred high-VA kernel split.
+
+- **4 MiB wall cleared by a BSS trim, not by moving the kernel.** The kernel
+  image (BSS + trailing `.bootpt` boot page tables) is linked at the low VA
+  `0x0` and must end below the 4 MiB user-ELF base; the linker asserts
+  `bssEnd <= 0x3FB000` and `bootptEnd <= 0x400000`. The ASIX driver pushed
+  BSS past that. Instead of a high-VA kernel re-base (Tier 1, high-risk), we
+  trimmed a large legacy BSS table: `PARTDEV_MAX` 192 → 64 in
+  `kernel/partition/partdev.h` (`partdev_table` is `136` bytes/entry, freeing
+  `128 * 136 = 17,408` B). `GPT_MAX_ENTRIES` stays `128` (real GPT images
+  declare 128 entries; trimming it would break them). Result:
+  `bssEnd=0x3F6834` / `bootptEnd=0x3FE000`, 8 KiB headroom under 4 MiB.
+  Regression: `test-partition-unit` 15/15, `test-boot` PASS.
+- **ASIX driver finalized.** RX bundle parser now advances `data_off`
+  through the bundle, bounds each frame to the data region (`off = rx_hdr >>
+  16`), skips `pkt_len==0` dummy entries, and drops error/runt frames while
+  still advancing by their padded length; the frame is copied from
+  `rxbuf + data_off + 2` (2 IP-align pseudo-header bytes stripped) into a
+  `pbuf_alloc(pkt_len - 2)` frame. TX header padding flag corrected to LE
+  `0x80008000` (`00 80 00 80`) when `(len + 8) % mps_out == 0`. Reset now
+  writes the resolved MAC back to `AX_NODE_ID` instead of read-back. All
+  `#ifndef ASIX_OFF` build guards removed (recover/reconnect/dispatch/KTEST);
+  `usb_asix_tear_down` now guards on `ready` like the ECM/RNDIS tear-downs so
+  it never issues a vendor control write to device 0. RX during the
+  selftest's synchronous DHCP/ping/UDP/TCP waits is pumped by `netif_poll`
+  → `usb_asix_rx_one` (the netdev `poll` op); `softnet` adds the periodic
+  link check only at the end.
+- **Real-LAN acceptance test added.** `scripts/test-qemu-usb-asix.sh` +
+  `make test-usb-net-asix`: passes a physical ASIX into q35 xHCI next to the
+  MSC root, runs the `asix-test` selftest (DHCP DORA, ICMP ping, UDP + TCP
+  echo on `ASIX_PEER`), and asserts `USB_ASIX_NIC_OK` + `NET_DHCP_OK`/
+  `NETIF_UP`/`NET_PING_OK`/`NET_UDP_OK`/`NET_TCP_OK`/`NET_SOFTNET_OK` +
+  `ASIX_NET_PASS`, no `ASIX_NET_FAIL`/GPF. SKIPs (exit 0) when the NIC is
+  unplugged, the device node is not writable, or `ASIX_PEER` is unset.
+- **Blocked: physical NIC run.** The device node `/dev/bus/usb/001/106` is
+  `root:root 0664` and `jedld` has no write, so QEMU `usb-host` cannot open
+  it; `sudo` needs a password and no udev rule exists. To unblock (one-time,
+  root): `printf 'SUBSYSTEM=="usb", ATTRS{idVendor}=="0b95",
+  ATTRS{idProduct}=="1790", MODE="0660", GROUP="plugdev"\n' | sudo tee
+  /etc/udev/rules.d/99-asix-usb.rules && sudo udevadm control --reload-rules &&
+  sudo udevadm trigger`, then
+  `make test-usb-net-asix ASIX_PEER=<host LAN IP>` (a non-ASIX host
+  interface, e.g. the wired/Wi-Fi 192.168.0.x IP). `test-usb-net-asix`
+  currently SKIPs cleanly until that lands.
+- **Tier 1 (high-VA kernel split) deferred + documented.** Re-basing the
+  kernel image to `0xFFFF800000000000` (freeing the low 4 GiB / 4 MiB wall)
+  is high-risk: `lscript64.ld`, `startup.S` (early low-VA boot → high map →
+  RIP switch), `dexmem.c`, `process.c`, `ap_trampoline.S`, and the
+  kexec/ELF-loader paths. Recorded as a separate follow-up in
+  `docs/smp-longmode.md` (Memory map). Not part of this USB/ASIX change.
+
+## 2026-09-30 (Manila, UTC+8)
+
+### 16:17 — RNDIS USB NIC binds and passes end-to-end acceptance test
+
+**Current problem / activity:** Add the RNDIS NIC — the *second* configuration of
+QEMU's composite `usb-net` gadget (VID `0525`/PID `a4a2`) — alongside the
+already-working CDC-ECM NIC, and prove it with a QEMU acceptance test
+(`test-usb-net-rndis`) plus a host-native descriptor parser test
+(`test-usb-rndis-unit`).
+
+- **Descriptor / protocol ground truth (from `references/rndis/`):** QEMU's
+  `usb-net` exposes `bNumConfigurations=2`; config **value 2** (index 0) is RNDIS
+  (ACM comm subclass 2 + data interface, bulk IN/OUT ep number 2, 64-byte MPS,
+  interrupt IN ep 1) and config **value 1** (index 1) is the real CDC-ECM.
+  `is_rndis()` is true only when the active config value is 2. RNDIS control
+  messages travel over CDC-encapsulated control transfers on ep0:
+  `SET_ENCAPSULATED_COMMAND` (0x21/0x00) and `GET_ENCAPSULATED_RESPONSE`
+  (0xA1/0x01) both require `wValue==0 && wIndex==0`; a missing completion returns
+  exactly 1 byte with `data[0]=0`.
+- **Binder (`usb_xhci_bind_rndis` in `uhci.c`):** sets config 2, runs
+  INIT → QUERY perm-MAC (6 B) → QUERY max-frame-size → SET packet-filter
+  (`BROADCAST|MULTICAST|ALLMULTI`); the non-zero filter is what moves QEMU into
+  `RNDIS_DATA_INITIALIZED` so it actually delivers RX frames. Completion parsing
+  uses the RNDIS `offset+8` info-buffer convention (QUERY cmplt offset 16 →
+  absolute 24; SET request offset 20 → absolute 28).
+- **Data path:** TX wraps the Ethernet frame in a 44-byte `RNDIS_PACKET`
+  (`DataOffset=36`, frame at byte 44) and issues one xHCI bulk-OUT transfer of
+  `44+flen` bytes; RX bulk-INS up to the buffer, validates
+  type/offset/length, and feeds the inner frame to `netif_input()`. Both
+  directions are full-length single NORMAL TRBs — the 64-byte endpoint MPS is
+  handled by the xHCI hardware splitting, exactly as ECM already relies on.
+- **Bugs found & fixed while validating against QEMU:**
+  - `wIndex` was set to the data-interface number for the encapsulation
+    requests; QEMU stalls unless `wIndex==0`. Now both use `wIndex=0`.
+  - No-response detection now clears the control buffer before GET and treats
+    `cbuf[0]==0` as "no completion" (matches QEMU's 1-byte `data[0]=0` reply),
+    with `MessageLength` read as a bounded DWORD.
+  - The MTU QUERY read only 2 bytes even though QEMU returns a 4-byte
+    (`le32`) value — spec-incorrect and fragile; now reads a DWORD and clamps
+    to `[ETH_HDR_LEN, ETH_MAX_FRAME]`.
+  - Removed an unused `in_comm` state in the parser that tripped `-Werror`.
+- **softnet integration:** `usb_rndis_poll()` runs from the softnet kthread —
+  periodic keepalives (QEMU expects ~5 s) plus a single non-blocking RX poll,
+  so RX and keepalive are serialized on the same kthread and no extra lock is
+  needed; bind-time control transfers happen before softnet starts.
+- **Test coverage:**
+  - `test-usb-net-rndis` (new `scripts/test-qemu-usb-rndis.sh`): boots q35 xHCI
+    with the USB root + `usb-net` NIC under the `usb-rndis-test` cmdline,
+    drives UDP/TCP/DNS probes, and asserts `USB_RNDIS_NIC_OK` +
+    `NET_DHCP_OK`/`NETIF_UP`/`NET_PING_OK`/`NET_UDP_OK`/`NET_TCP_OK`/
+    `NET_TCP_REXMIT_OK`/`NET_DNS_OK`/`NET_SOFTNET_OK` + `NET_RNDIS_PASS`, no
+    `NET_*_FAIL`/GPF. **PASS** (ip=10.0.2.15, mac=52:54:00:12:34:56, mtu=1514).
+  - `test-usb-rndis-unit` (new `tests/usb_rndis_unit.c`): host TAP for
+    `usb_parse_cdc_rndis()` — QEMU RNDIS accept, ECM rejection, missing
+    comm/data interface, endpoint bounds, truncation, overflow, NULL. **12/12 ok**.
+- **Build:** `make -C kernel KTEST=1` links cleanly; `vmdex` regenerated.
+
+### 13:25 — KTEST build flag (production kernels strip self-tests/fault-injection) + ECM recovery regression gate
+
+**Current problem / activity:** Finalize the Phase 3 CDC-ECM closure with two
+deliverables: (1) in-kernel self-tests and fault-injection hooks must NOT ship
+in production/distribution kernels, and (2) the CDC-ECM controller-recovery
+re-bind needs a regression test that fails for the original cause (not merely a
+success marker).
+
+- **KTEST build flag:** default `KTEST=1` (dev/test) keeps every in-kernel
+  self-test and fault-injection path; `KTEST=0` (production/dist) strips them.
+  Guarded with `#ifdef KTEST`: xHCI fault fields + production fault checks
+  (`xhci.c`), UHCI/MSC fault vars + production fault hooks, all xHCI
+  recovery/stall/disconnect/mounted/multi-MSC/ECM self-tests, the probe-path
+  cmdline self-test dispatch, the `register_device` self-test calls, and the
+  cross-file mounted self-test (`usb.h` decl + `kernel32.c` block). Production
+  `usb_init`/`uhci_find_controller`/`usb_xhci_probe_msc`/recovery/reconnect/
+  `usb_xhci_bind_ecm`/`usb_ecm_tear_down` stay unguarded.
+- **Build-system bug found & fixed:** a no-prerequisite `file` target
+  (`build_info.h`) runs its recipe only once, so a KTEST toggle between builds
+  did NOT regenerate the header and the unity `kernel32.o` (which compiles
+  `uhci.c`/`xhci.c`) was reused stale — a `KTEST=1` build after a `KTEST=0`
+  build silently shipped the stripped kernel. Fixed with a `.PHONY ktest-check`
+  driver that rewrites a real `ktest.h` (mtime bump) only when the KTEST value
+  changes; `kernel32.o` now depends on `ktest.h`. Verified: toggle rebuilds in
+  both directions, same-value is a no-op (no rebuild storm), and self-test
+  symbols appear/disappear exactly with the flag.
+- **Dist wiring:** top-level `vmdex` defaults `KTEST=1`; `prep-dist` (used by
+  `dist`/`usb-uefi`/`usb-etcher`/`n150-dist`/`test-dist`) recursively runs
+  `KTEST=0 $(MAKE) prep_image`, so every production image ships a
+  self-test-free kernel.
+- **Build verification:** `KTEST=1` `bootptEnd=0x3fe000`; `KTEST=0`
+  `bootptEnd=0x3fa000` (both `<= 0x400000`). `KTEST=0` links cleanly after
+  splitting a guard that had accidentally swallowed the production
+  `uhci_find_controller`/`usb_xhci_probe_msc` functions.
+- **ECM recovery regression (`test-usb-net-ecm-recover`):** new
+  `scripts/test-qemu-usb-ecm-recover.sh` + Makefile target. Boots q35 xHCI with
+  the USB root + a CDC-ECM `usb-net` NIC and runs the `usb-ecm-recover-test`
+  self-test: prove the NIC works (DHCP+ping), force `usb_xhci_recover()`, then
+  assert the MSC root AND the NIC come back and the NIC works again. Asserts
+  `USB_ECM_NIC_OK`/`ECM_RECOVER_PRE_OK`/`ECM_RECOVER_REBIND_OK`/`ECM_RECOVER_OK`
+  and no `ECM_RECOVER_FAIL`/GPF. Proved it is a real guard: removing
+  `usb_xhci_bind_ecm()` from `usb_xhci_recover()` makes it fail with
+  `ECM_RECOVER_FAIL nic-not-rebound`; restoring it → PASS.
+
+### 03:40 — CDC-ECM USB NIC (Phase 3) binds and passes acceptance test
+
+**Current problem / activity:** Close out Phase 3 of the USB multi-device work:
+make the CDC-ECM NIC (a polled `netif` over xHCI bulk) actually bind in QEMU
+and pass an end-to-end acceptance test (`test-usb-net-ecm`) that proves DHCP,
+ping, UDP, TCP (+RTO retransmit), DNS, and softnet all work over the USB NIC.
+Two blockers had to be cleared: a 4 MiB link overflow and a device-class
+misclassification where QEMU's `usb-net` was being claimed by the CDC-ACM
+serial console instead of the ECM NIC.
+
+- **4 MiB link overflow (fixed):** the ECM driver + selftest pushed
+  `.bss`/`.bootpt` past the 4 MiB user-ELF window (`bootptEnd` had to stay
+  `<= 0x400000`). Shrank the shared USB/MSC bounce buffer from 32 KiB to 16 KiB
+  (`MSC_BULK_MAX`) without touching `USB_BULK_MAX`/`USB_MAX_TD` (those still size
+  the UHCI TD array). `usb_scsi_rw()` now derives `max_per_cmd` from
+  `MSC_BULK_MAX / bsize`. `usb_dma_buf` is used by control, MSC BOT bulk, and
+  ECM RX, so the bound is safe. Result: `bssEnd=0x3f5834`, `bootptEnd=0x3fe000`,
+  headroom `0x2000`. `test-usb-storage-xhci` and `-multi-msc` still pass.
+- **Root cause of the mis-bind (diagnosed):** QEMU `usb-net` is a *composite*
+  CDC gadget with two configurations — config index 0 / value 2 is RNDIS
+  (comm subclass 2) and config index 1 / value 1 is the real CDC-ECM (comm
+  subclass 6). The kernel only ever requested config index 0, so `usb_parse_cdc_acm`
+  matched it (subclass 2) and bound it as a serial console, while
+  `usb_parse_cdc_ecm` never saw the ECM config. Confirmed against QEMU v8.2.2
+  `dev-network.c`/`desc.c` (config chosen by GET_DESCRIPTOR index, activated by
+  SET_CONFIGURATION value).
+- **Fixes in `uhci.c`:**
+  1. `usb_enumerate_ecm()` now iterates every configuration index
+     (`devdesc[17]`), fetches each config, and binds the one `usb_parse_cdc_ecm`
+     accepts; `usb_set_config_dev()` then activates it by value (value 1).
+  2. `register_device` reorders to publish the MSC root, bind secondary MSC,
+     bind the ECM NIC, and *then* bind the CDC console.
+  3. `usb_xhci_bind_cdc()` now skips every port already claimed by any driver
+     (not just the primary MSC port), so a composite network gadget is never
+     mis-bound as a console.
+  4. Fixed a latent off-by in the ECM free-slot loop (the `dev_slot = 0` inside
+     the loop made it oscillate when slot 1 was taken).
+- **Two CDC-ECM descriptor bugs fixed (host-native correctness):**
+  - `usb_parse_cdc_ecm` read the MTU from `bmEthernetStatistics` (`[4..5]`)
+    instead of `wMaxSegmentSize` (`[8..9]`); now reports the real `mtu=1514`.
+  - The MAC was read with a non-existent "GET_ETHERNET_PM" (request 0x43 is
+    actually `SET_ETHERNET_PACKET_FILTER`, an OUT request). Replaced with the
+    spec-correct path: read the `iMACAddress` string descriptor and parse the
+    12-char UTF-16LE hex string. The NIC now advertises QEMU's real MAC
+    (`40:54:00:12:34:56`) instead of a synthetic fallback.
+- **Verification:** `make test-usb-net-ecm` → `test-qemu-usb-ecm PASS`, serial
+  log shows `ecm config value=1 mtu=1514`, `mac=40:54:00:12:34:56`,
+  `USB_ECM_NIC_OK`, `NET_DHCP_OK`, `NETIF_UP`, `NET_DHCP_RENEW_OK`,
+  `NET_DHCP_REBIND_OK`, `NET_PING_OK`, `NET_UDP_OK`, `NET_TCP_OK`,
+  `NET_TCP_REXMIT_OK`, `NET_DNS_OK`, `NET_SOFTNET_OK`, `NET_ECM_PASS`. Regressions
+  all pass: `test-usb-cdc-console` (both MSC-first and CDC-first attach orders),
+  `test-usb-storage-xhci`, `test-usb-storage-xhci-multi-msc`, and `test-net`.
+- **Known gap (owner: USB/xHCI):** the xHCI controller-recovery and reconnect
+  paths (`usb_xhci_recover`/`usb_xhci_reconnect`) re-bind MSC + CDC console but
+  do **not** re-bind the ECM NIC (its `usb_ecm.ready`/netif state survives a
+  controller reset, so `usb_xhci_bind_ecm()` early-returns). No current test
+  combines `usb-net` with hot recovery, so nothing regresses; a NIC must be
+  invalidated and re-enumerated before it is re-bound after a full reset.
+
 ## 2026-09-29 (Manila, UTC+8)
 
 ### 23:35 — USB multi-device, Phase 2 (multi-MSC + device registry) complete & verified

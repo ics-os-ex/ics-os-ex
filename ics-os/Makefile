@@ -34,12 +34,19 @@ DIST_SIZE_MB ?= 128
 # build flags so the .o's match what cc1/as/ld expect).
 HOSTG_RTFLAGS := -m64 -std=gnu89 -w -nostdlib -fno-builtin -static -ffreestanding -fno-pie -fno-pic -fno-stack-protector -fno-asynchronous-unwind-tables -fno-strict-aliasing -mcmodel=large -mno-red-zone -Isdk/include
 
+# KTEST: in-kernel self-tests + deterministic fault-injection hooks. Dev/test
+# builds (default KTEST=1) keep them so the QEMU acceptance gates can drive the
+# recovery/disconnect/ECM regression paths. Production/distribution builds
+# (prep-dist -> KTEST=0) strip the test-only code so a stray or
+# attacker-supplied cmdline cannot reach it. See kernel/Makefile.
+KTEST ?= 1
+
 vmdex:
-	make -C kernel/
+	make -C kernel/ KTEST=$(KTEST)
 
 .PHONY: usb-uefi usb-etcher n150-dist test-usb-uefi-gpt test-vbox-uefi-gpt test-vbox-uefi-gpt-bios test-bochs-uefi-gpt test-usb-cdc-pico test-nethack
 .PHONY: test-screenshot
-.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-netdhcp-unit test-net-stress test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-memcorrupt test-asloop test-fork test-fork-switch-gap test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-selfhost-cert-usb test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-vtcolor-unit test-vtcolor-guest test-vtcolor-xhci test-vim-xhci test-nethack-xhci test-nethack-mmap-xhci test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-pciscan-unit test-termcap-unit test-ttycanon-unit test-usbdbg-unit test-rtwfw-unit test-rtwphy-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-multi-msc test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive
+.PHONY: vmdex clean usb floppy livecd apps dist prep-dist dist-tools test-dist test-selfhost test-tccboot test-kbuild test-tcc-kbuild test-fullhost test-tcc-fullhost test-exec test-iobench test-virtio test-net test-net-unit test-netchecksum-unit test-netarp-unit test-neticmp-unit test-netudp-unit test-nettcp-unit test-netsock-unit test-netdhcp-unit test-net-stress test-smp test-smp-matrix test-boot test-klog test-integration test-posixio test-termtest test-vim test-dup test-spawn test-stress test-stress-user-smp test-apuser test-fatwrite test-fatwrite-coop test-memcorrupt test-asloop test-fork test-fork-switch-gap test-fork-matrix test-make test-bintools test-buildtools test-cc1 test-gcc test-gccdriver test-gcc-kbuild test-selfhost-cert test-selfhost-cert-parallel test-selfhost-cert-usb test-io-unit test-partition-unit test-gpt-unit test-klog-unit test-fatchain-unit test-vfsgrow-unit test-smpclaim-unit test-fbconsole-unit test-vtcolor-unit test-vtcolor-guest test-vtcolor-xhci test-vim-xhci test-nethack-xhci test-nethack-mmap-xhci test-bridge-console-unit test-kbdleds-unit test-lapicx2-unit test-xhcipolicy-unit test-consolemux-unit test-scriptcomment-unit test-cdcacm-unit test-usb-rndis-unit test-usb-asix-unit test-pciscan-unit test-termcap-unit test-ttycanon-unit test-usbdbg-unit test-rtwfw-unit test-rtwphy-unit test-gpt test-vbox-usb-image test-vbox-usb-image-efi test-usb-uefi test-usb-storage test-usb-storage-xhci test-usb-storage-xhci-multi-controller test-usb-storage-xhci-multi-msc test-usb-storage-xhci-sg test-usb-storage-xhci-bounce test-usb-storage-xhci-vtd-discovery test-usb-storage-xhci-msix test-usb-storage-xhci-msix-recovery test-usb-storage-xhci-vector-reservation test-usb-storage-xhci-poll test-usb-storage-xhci-high-bar test-usb-storage-xhci-recovery test-usb-storage-xhci-stall-recovery test-usb-storage-xhci-disconnect test-usb-storage-xhci-mounted-disconnect test-usb-storage-xhci-mounted-reconnect test-usb-storage-xhci-mounted-remount test-usb-storage-xhci-hotplug test-usb-storage-xhci-hotplug-identity-mismatch test-usb-storage-xhci-late-attach test-usb-storage-xhci-reconnect test-usb-storage-xhci-reconnect-mismatch test-usb-storage-xhci-reconnect-identity-mismatch test-usb-storage-xhci-no-device test-usb-cdc-console test-usb-cdc-pico test-ide-thumbdrive test-usb-net-ecm test-usb-net-ecm-recover test-usb-net-rndis
 
 test-io-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -126,6 +133,16 @@ test-cdcacm-unit:
 	@mkdir -p /tmp/icsos-tests
 	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/usb_cdc_acm_unit.c -o /tmp/icsos-tests/usb_cdc_acm_unit
 	@/tmp/icsos-tests/usb_cdc_acm_unit
+
+test-usb-rndis-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/usb_rndis_unit.c -o /tmp/icsos-tests/usb_rndis_unit
+	@/tmp/icsos-tests/usb_rndis_unit
+
+test-usb-asix-unit:
+	@mkdir -p /tmp/icsos-tests
+	@gcc -std=gnu89 -Wall -Wextra -Werror -I. tests/usb_asix_unit.c -o /tmp/icsos-tests/usb_asix_unit
+	@/tmp/icsos-tests/usb_asix_unit
 
 test-pciscan-unit:
 	@mkdir -p /tmp/icsos-tests
@@ -340,7 +357,12 @@ dist-tools: vmdex
 
 # Stage the full distribution content into tmp/ (reuses the plain-USB staging,
 # then adds the GCC toolchain + the runtime objects the driver links against).
-prep-dist: prep_image
+# The distribution ships a PRODUCTION kernel: build the image with KTEST=0 so
+# the in-kernel self-tests + fault-injection hooks are stripped. We invoke
+# prep_image recursively (not as a prerequisite) so the kernel + staging both
+# build with KTEST=0 rather than the dev KTEST=1 default.
+prep-dist:
+	KTEST=0 $(MAKE) prep_image
 	@mkdir -p tmp/apps/ldscripts
 	@test -s tmp/apps/cc1.exe && test -s tmp/apps/gcc.exe
 	@test -s tmp/apps/as.exe && test -s tmp/apps/ld.exe && test -s tmp/apps/ar.exe
@@ -669,6 +691,40 @@ test-usb-storage-xhci: vmdex ics-os-usb.img
 test-usb-storage-xhci-multi-msc: vmdex ics-os-usb.img
 	@chmod +x scripts/test-qemu-xhci-multi-msc.sh
 	@QEMU_X64=$(QEMU_X64) scripts/test-qemu-xhci-multi-msc.sh ics-os-usb.img
+
+# Phase 3: CDC-ECM USB NIC. QEMU usb-net (CDC-ECM) on the xHCI bus backed by
+# SLIRP; the kernel selftest (usb-ecm-test) DHCPs and runs ping/UDP/TCP/rexmit/
+# DNS against host probes, emitting NET_* markers + NET_ECM_PASS.
+test-usb-net-ecm: vmdex ics-os-usb.img
+	@chmod +x scripts/test-qemu-usb-ecm.sh
+	@QEMU_X64=$(QEMU_X64) scripts/test-qemu-usb-ecm.sh ics-os-usb.img
+
+# q35 xHCI CDC-ECM NIC survives a controller recovery: pre-recovery DHCP+ping,
+# usb_xhci_recover() (full controller reset), then the MSC root AND the NIC come
+# back and the NIC works again (DHCP+ping post-reset). Regression: without the
+# usb_xhci_bind_ecm() re-bind in the recovery/reconnect paths the NIC stays down.
+test-usb-net-ecm-recover: vmdex ics-os-usb.img
+	@chmod +x scripts/test-qemu-usb-ecm-recover.sh
+	@QEMU_X64=$(QEMU_X64) scripts/test-qemu-usb-ecm-recover.sh ics-os-usb.img
+
+# q35 xHCI RNDIS USB NIC: QEMU usb-net is bound as a RNDIS NIC (config value
+# 2) because the usb-rndis-test cmdline holds the CDC-ECM binder back. Runs the
+# same DHCP/ping/UDP/TCP/rexmit/DNS suite over the RNDIS bulk endpoints plus
+# the encapsulated-control INIT/QUERY/SET handshake; NET_RNDIS_PASS.
+test-usb-net-rndis: vmdex ics-os-usb.img
+	@chmod +x scripts/test-qemu-usb-rndis.sh
+	@QEMU_X64=$(QEMU_X64) scripts/test-qemu-usb-rndis.sh ics-os-usb.img
+
+# Physical ASIX AX88179/178A USB Gigabit NIC (0b95:1790) passed into q35 xHCI
+# on the host's real Ethernet. The kernel binds it (usb_asix) and the asix-test
+# selftest runs DHCP/ping/UDP/TCP over the live bulk endpoints (ASIX_NET_PASS).
+# Requires a reachable peer on the LAN: set ASIX_PEER=<host LAN IP>. SKIP if
+# the NIC is unplugged, the device node is not writable, or ASIX_PEER is unset.
+test-usb-net-asix: vmdex ics-os-usb.img
+	@chmod +x scripts/test-qemu-usb-asix.sh
+	@QEMU_X64=$(QEMU_X64) ASIX_PEER=$(if $(ASIX_PEER),$(ASIX_PEER),) \
+		ASIX_GW=$(if $(ASIX_GW),$(ASIX_GW),) \
+		scripts/test-qemu-usb-asix.sh ics-os-usb.img
 
 test-usb-storage-xhci-multi-controller: vmdex ics-os-usb.img
 	@chmod +x scripts/test-qemu-uhci-storage.sh

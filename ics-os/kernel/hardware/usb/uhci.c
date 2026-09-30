@@ -12,10 +12,27 @@
 #include "usb.h"
 #include "usb_identity.h"
 #include "usb_cdc_acm.h"
+#include "usb_cdc_ecm.h"
+#include "usb_cdc_rndis.h"
+#include "usb_asix.h"
 #include "usb_debug.h"
 #include "../dma.h"
 #include "../keyboard/kbd_boot_leds.h"
 #include "../../console/klog.h"
+/* CDC-ECM NIC: expose the USB bulk endpoints as a polled netif. The net
+   stack lives in separate net_*.o objects linked with kernel32.o. */
+#include "../../net/netif.h"
+#include "../../net/pbuf.h"
+#include "../../net/ethernet.h"
+#include "../../net/inet_config.h"
+#include "../../net/dhcp.h"
+#include "../../net/icmp.h"
+#include "../../net/udp.h"
+#include "../../net/tcp.h"
+#include "../../net/dns.h"
+#include "../../net/arp.h"
+#include "../../net/net_sync.h"
+#include "../../net/softnet.h"
 
 extern void serial_puts(const char *s);
 extern int console_execute(const char *str);
@@ -38,6 +55,10 @@ extern int sprintf(char *s, const char *fmt, ...);
 
 #define USB_BULK_MAX        (32 * 1024)
 #define USB_MAX_TD          (USB_BULK_MAX / 64)
+/* Max SCSI data per BOT command. Sized to the bounce buffer below; 16 KiB
+   (32 x 512B) keeps the UHCI TD budget comfortable while freeing 16 KiB of
+   BSS so the kernel stays under the 4 MiB user-ELF limit. */
+#define MSC_BULK_MAX        (16 * 1024)
 #define USB_TIMEOUT         2000000
 
 #define UHCI_USBCMD         0x00
@@ -97,6 +118,7 @@ extern int sprintf(char *s, const char *fmt, ...);
 
 #define USB_DESC_DEVICE       1
 #define USB_DESC_CONFIG       2
+#define USB_DESC_STRING       3
 #define USB_DESC_INTERFACE    4
 #define USB_DESC_ENDPOINT     5
 #define USB_DESC_SS_EP_COMPANION 48
@@ -176,6 +198,9 @@ typedef struct {
 #define USB_DRV_NONE      (-1)
 #define USB_DRV_MSC       0
 #define USB_DRV_CDC_ACM   1
+#define USB_DRV_CDC_ECM   2
+#define USB_DRV_RNDIS     3
+#define USB_DRV_ASIX      4
 
 struct usb_device;
 typedef struct usb_driver {
@@ -216,7 +241,7 @@ typedef struct usb_device {
 static volatile DWORD uhci_framelist[1024] __attribute__((aligned(4096)));
 static uhci_qh uhci_qh_ctl  __attribute__((aligned(16)));
 static uhci_td uhci_tds[USB_MAX_TD] __attribute__((aligned(16)));
-static BYTE usb_dma_buf[USB_BULK_MAX] __attribute__((aligned(16)));
+static BYTE usb_dma_buf[MSC_BULK_MAX] __attribute__((aligned(16)));
 static BYTE usb_setup_buf[8] __attribute__((aligned(16)));
 static BYTE usb_cbw_buf[32] __attribute__((aligned(16)));
 static BYTE usb_csw_buf[16] __attribute__((aligned(16)));
@@ -236,10 +261,14 @@ static int usb_xhci_stall_recovery_count;
 static int usb_disconnect_dirty_pages;
 static int usb_hotplug_monitor_started;
 static volatile int usb_hotplug_transition;
+#ifdef KTEST
+/* Deterministic fault-injection latches driven by the in-kernel self-tests.
+   Absent from production kernels (KTEST=0). */
 static int usb_fault_invalid_cbw;
 static int usb_fault_drop_stall_retry;
 static BYTE usb_recovery_before[512];
 static BYTE usb_recovery_after[512];
+#endif
 
 /* Device registry (Phase 2). usb_devices[] holds every bound device; the
    xHCI controller owns one slot per entry. usb_cdc_dev tracks the slot the
@@ -760,11 +789,13 @@ static int usb_msc_bot_once(usb_msc *m, BYTE *cdb, int cdb_len, int in,
     cbw.cb_len = (BYTE)cdb_len;
     memcpy(cbw.cb, cdb, cdb_len);
     memcpy(usb_cbw_buf, &cbw, 31);
+#ifdef KTEST
     if (usb_fault_invalid_cbw) {
         memset(usb_cbw_buf, 0, 4);
         usb_fault_invalid_cbw = 0;
         printf("xhci: test sending invalid BOT CBW\n");
     }
+#endif
 
     if (!usb_bulk_dev(m->dev, m->ep_out, 0, usb_cbw_buf, 31, &m->toggle_out))
         return 0;
@@ -837,10 +868,12 @@ static int usb_msc_bot(usb_msc *m, BYTE *cdb, int cdb_len, int in,
     }
     if (usb_host == USB_HOST_XHCI && usb_xhci_hcd->stalled_endpoints &&
         !usb_xhci_recovering && usb_xhci_recover_stall(m)) {
+#ifdef KTEST
         if (usb_fault_drop_stall_retry) {
             usb_fault_drop_stall_retry = 0;
             usb_xhci_hcd->fault_drop_next = 1;
         }
+#endif
         if (usb_msc_bot_once(m, cdb, cdb_len, in, data, len))
             return 1;
         usb_xhci_hcd->recovery_needed = 1;
@@ -905,9 +938,12 @@ static int usb_scsi_rw(usb_msc *m, int write, DWORD lba, DWORD nblocks,
     BYTE cdb[16];
     DWORD done = 0;
     DWORD bsize = m->drive.block_size ? m->drive.block_size : 512;
-    /* BOT/UHCI TD budget: transfer up to 32KB per SCSI command
-       (classic USB MSC optimal chunk). */
-    DWORD max_per_cmd = 64;
+    /* BOT/UHCI TD budget: transfer up to MSC_BULK_MAX per SCSI command,
+       computed from the drive's block size so the bounce buffer is never
+       overflowed. 16 KiB (32 x 512B) is the classic USB MSC chunk. */
+    DWORD max_per_cmd = MSC_BULK_MAX / bsize;
+    if (max_per_cmd < 1)
+        max_per_cmd = 1;
 
     while (done < nblocks) {
         DWORD n = nblocks - done;
@@ -2332,16 +2368,22 @@ static int usb_enumerate_cdc(void)
 static int usb_xhci_bind_cdc(void)
 {
     DWORD port;
-    DWORD msc_port;
+    DWORD used_ports = 0;
+    int i;
 
     usb_cdc_reset_state();
     if (!usb_xhci_hcd)
         return 0;
-    msc_port = usb_xhci_hcd->usbdevs[0].port;
+    /* Skip every port already claimed by another driver (MSC root, secondary
+       MSC, CDC-ECM NIC). The console must only take a genuine serial gadget,
+       never a network gadget that merely exposes an ACM/RNDIS config. */
+    for (i = 0; i < XHCI_MAX_USBDEVS; i++)
+        if (usb_xhci_hcd->usbdevs[i].port)
+            used_ports |= xhci_ccs_bit(usb_xhci_hcd->usbdevs[i].port);
     usb_xhci_hcd->enumerating = 1;
     usb_xhci_hcd->recovery_needed = 0;
     for (port = 1; port <= usb_xhci_hcd->max_ports && port <= 32; port++) {
-        if (port == msc_port)
+        if (used_ports & xhci_ccs_bit(port))
             continue;
         if (!(xhci_port_ccs_mask(usb_xhci_hcd) & xhci_ccs_bit(port)))
             continue;
@@ -2372,7 +2414,7 @@ static int usb_xhci_bind_cdc(void)
             usb_cdc_pump_flush();
             return 1;
         }
-        printf("xhci: port %u not CDC-ACM\n", port);
+       printf("xhci: port %u not CDC-ACM\n", port);
         xhci_release_dev(usb_xhci_hcd, USB_CDC_DEV);
         usb_xhci_hcd->recovery_needed = 0;
     }
@@ -2380,10 +2422,1853 @@ static int usb_xhci_bind_cdc(void)
     return 0;
 }
 
-static int usb_xhci_recover(void)
+/* =========================================================================
+   CDC-ECM (Ethernet Control Model) NIC
+
+   Presents the bulk IN/OUT endpoints of a CDC-ECM gadget as a polled netif.
+   There is no controller interrupt: RX is a posted bulk-IN (xhci_bulk_in_try)
+   harvested from netif_poll -- driven by the protocol wait loops and softnet
+   -- and TX is a synchronous bulk-OUT. The posted-IN completion stash is the
+   single xhci_cdc_in_* instance shared with the CDC-ACM console, so a console
+   and an ECM NIC must not be active at once; the ECM acceptance boot attaches
+   no CDC console. All USB I/O is serialized by usb_io_lock and the posted-IN
+   state machine, so a user protocol client and softnet may poll concurrently
+   (the first xhci_cdc_in_take() wins the frame; the stash is the mailbox).
+   ========================================================================= */
+
+#define USB_ECM_BUF_SZ   ETH_MAX_FRAME
+
+static struct {
+    int ready;
+    DWORD dev;
+    DWORD port;
+    BYTE  ep_in;
+    BYTE  ep_out;
+    BYTE  mac[ETH_ADDR_LEN];
+    struct netif nif;
+    struct netdev ndev;
+    /* RX DMA buffer: heap-allocated at bind.  The kernel image sits at the
+       4MiB user-ELF cap with no BSS slack, so a static 1514-byte buffer here
+       would push the boot page tables past 0x400000.  The DMA layer maps
+       single buffers with alignment 1, so a plain malloc is DMA-safe. */
+    BYTE  *buf;
+} usb_ecm;
+
+static void usb_ecm_get_mac(void *drv, unsigned char mac[ETH_ADDR_LEN])
+{
+    int i;
+    (void)drv;
+    for (i = 0; i < ETH_ADDR_LEN; i++)
+        mac[i] = usb_ecm.mac[i];
+}
+
+static int usb_ecm_link_up(void *drv)
+{
+    (void)drv;
+    return usb_ecm.ready ? 1 : 0;
+}
+
+static int usb_ecm_transmit(void *drv, struct pbuf *p)
+{
+    (void)drv;
+    if (!usb_ecm.ready || !p || p->len < 1 || p->len > USB_ECM_BUF_SZ)
+        return -1;
+    usb_io_lock_acquire();
+    if (!xhci_bulk(usb_xhci_hcd, usb_ecm.dev, usb_ecm.ep_out, 0,
+                   p->data, (int)p->len)) {
+        usb_io_lock_release();
+        return -1;
+    }
+    usb_io_lock_release();
+    return 0;
+}
+
+static void usb_ecm_rx_one(void *drv)
+{
+    int got = 0;
+    struct pbuf *p;
+    (void)drv;
+    if (!usb_ecm.ready)
+        return;
+    usb_io_lock_acquire();
+    if (!xhci_bulk_in_try(usb_xhci_hcd, usb_ecm.dev, usb_ecm.ep_in,
+                          usb_ecm.buf, USB_ECM_BUF_SZ, &got,
+                          XHCI_ECM_IN_SPINS) ||
+        got < ETH_HDR_LEN || got > USB_ECM_BUF_SZ) {
+        usb_io_lock_release();
+        return;
+    }
+    usb_io_lock_release();
+    p = pbuf_alloc((u16)got);
+    if (!p)
+        return;
+    memcpy(p->data, usb_ecm.buf, (unsigned int)got);
+    net_lock();
+    netif_input(&usb_ecm.nif, p);
+    net_unlock();
+}
+
+static const struct netdev_ops usb_ecm_ops = {
+    .transmit = usb_ecm_transmit,
+    .link_up = usb_ecm_link_up,
+    .poll = usb_ecm_rx_one,
+    .get_mac = usb_ecm_get_mac,
+};
+
+void usb_ecm_poll(void)
+{
+    if (usb_ecm.ready)
+        usb_ecm_rx_one(&usb_ecm);
+}
+
+/* =========================================================================
+   RNDIS USB NIC
+   ---------------------------------------------------------------------------
+   RNDIS (Remote NDIS) is the Microsoft CDC-ACM-shaped USB Ethernet protocol.
+   It is a composite gadget identical in descriptor shape to CDC-ACM serial:
+   a Communications interface (class 2, subclass ACM) plus a CDC Data
+   interface (class 10) with bulk IN/OUT. The difference is the control
+   protocol: RNDIS messages (INIT/QUERY/SET/RESET/KEEPALIVE) travel over the
+   CDC SEND/GET_ENCAPSULATED_COMMAND/RESPONSE class requests on endpoint 0,
+   while Ethernet frames travel over the bulk endpoints wrapped in
+   RNDIS_PACKET_MSG envelopes. There is no Ethernet functional descriptor, so
+   the MAC and MTU come from RNDIS queries, not the descriptor.
+
+   A plain CDC-ACM serial gadget presents the same descriptors, so the bind
+   path commits to RNDIS only after a successful INITIALIZE probe (a serial
+   device STALLs SET_ENCAPSULATED_COMMAND). Ground truth: QEMU usb-net
+   (vendor 0x0525, product 0xa4a2) exposes RNDIS as config value 2 and
+   CDC-ECM as config value 1; the ECM binder runs first and normally claims
+   the gadget, so RNDIS binds only when the port is free or a RNDIS-only
+   gadget is attached.
+   ========================================================================= */
+
+#define USB_RNDIS_HDR_SZ      44    /* sizeof(rndis_packet_msg) */
+#define USB_RNDIS_BUF_SZ      (USB_RNDIS_HDR_SZ + ETH_MAX_FRAME)
+#define USB_RNDIS_CBUF_SZ     128   /* largest RNDIS control message */
+
+#define RNDIS_MSG_PACKET          1
+#define RNDIS_MSG_INITIALIZE      2
+#define RNDIS_MSG_QUERY           4
+#define RNDIS_MSG_SET             5
+#define RNDIS_MSG_RESET           6
+#define RNDIS_MSG_KEEPALIVE       8
+#define RNDIS_MSG_INIT_CMPLT      0x80000002u
+#define RNDIS_MSG_QUERY_CMPLT     0x80000004u
+#define RNDIS_MSG_SET_CMPLT       0x80000005u
+#define RNDIS_MSG_RESET_CMPLT     0x80000006u
+#define RNDIS_MSG_KEEPALIVE_CMPLT 0x80000008u
+#define RNDIS_MSG_INDICATE_STATUS 7
+#define RNDIS_STATUS_SUCCESS      0x00000000u
+#define RNDIS_OID_PERM_MAC        0x01010101u
+#define RNDIS_OID_MAX_FRAME_SIZE  0x00010106u
+#define RNDIS_OID_PACKET_FILTER   0x0001010eu
+#define RNDIS_FILTER_BROADCAST    0x0002u
+#define RNDIS_FILTER_MULTICAST    0x0004u
+#define RNDIS_FILTER_ALLMULTI     0x8000u
+
+/* CDC class-specific interface requests carrying the RNDIS message set. */
+#define USB_CDC_SEND_ENCAP_CMD    0x00
+#define USB_CDC_GET_ENCAP_RESP    0x01
+#define USB_RT_CLASS_IF_H2D       0x21
+#define USB_RT_CLASS_IF_D2H       0xa1
+
+typedef struct __attribute__((packed)) {
+    DWORD MessageType;
+    DWORD MessageLength;
+    DWORD RequestID;
+    DWORD MajorVersion;
+    DWORD MinorVersion;
+    DWORD MaxTransferSize;
+} rndis_init_msg;
+
+typedef struct __attribute__((packed)) {
+    DWORD MessageType;
+    DWORD MessageLength;
+    DWORD RequestID;
+    DWORD Status;
+    DWORD InformationBufferLength;
+    DWORD InformationBufferOffset;
+} rndis_query_cmplt;
+
+typedef struct __attribute__((packed)) {
+    DWORD MessageType;
+    DWORD MessageLength;
+    DWORD RequestID;
+    DWORD Status;
+} rndis_set_cmplt;
+
+typedef struct __attribute__((packed)) {
+    DWORD MessageType;
+    DWORD MessageLength;
+    DWORD DataOffset;
+    DWORD DataLength;
+    DWORD OOBDataOffset;
+    DWORD OOBDataLength;
+    DWORD NumOOBDataElements;
+    DWORD PerPacketInfoOffset;
+    DWORD PerPacketInfoLength;
+    DWORD VcHandle;
+    DWORD Reserved;
+} rndis_packet_msg;
+
+static struct {
+    int ready;
+    DWORD dev;
+    DWORD port;
+    BYTE  ep_in;
+    BYTE  ep_out;
+    BYTE  comm_if;
+    BYTE  mac[ETH_ADDR_LEN];
+    WORD  mtu;
+    DWORD reqid;
+    DWORD last_keepalive_secs;
+    struct netif nif;
+    struct netdev ndev;
+    /* TX/RX envelope buffer (heap at bind) and a small control buffer for
+       the encapsulated RNDIS messages. */
+    BYTE  *buf;
+    BYTE   cbuf[USB_RNDIS_CBUF_SZ];
+} usb_rndis;
+
+static void usb_rndis_get_mac(void *drv, unsigned char mac[ETH_ADDR_LEN])
+{
+    int i;
+    (void)drv;
+    for (i = 0; i < ETH_ADDR_LEN; i++)
+        mac[i] = usb_rndis.mac[i];
+}
+
+static int usb_rndis_link_up(void *drv)
+{
+    (void)drv;
+    return usb_rndis.ready ? 1 : 0;
+}
+
+/* Wrap the Ethernet frame in a RNDIS_PACKET_MSG envelope and push it on the
+   bulk OUT endpoint. The device reads the frame at 8 + DataOffset. */
+static int usb_rndis_transmit(void *drv, struct pbuf *p)
+{
+    rndis_packet_msg *h;
+    unsigned int flen;
+    (void)drv;
+    if (!usb_rndis.ready || !p || p->len < 1 ||
+        p->len > ETH_MAX_FRAME || !usb_rndis.buf)
+        return -1;
+    flen = (unsigned int)p->len;
+    h = (rndis_packet_msg *)usb_rndis.buf;
+    memset(h, 0, sizeof(*h));
+    h->MessageType = RNDIS_MSG_PACKET;
+    h->MessageLength = USB_RNDIS_HDR_SZ + flen;
+    h->DataOffset = USB_RNDIS_HDR_SZ - 8;
+    h->DataLength = flen;
+    memcpy(usb_rndis.buf + USB_RNDIS_HDR_SZ, p->data, flen);
+    usb_io_lock_acquire();
+    if (!xhci_bulk(usb_xhci_hcd, usb_rndis.dev, usb_rndis.ep_out, 0,
+                   usb_rndis.buf, (int)(USB_RNDIS_HDR_SZ + flen))) {
+        usb_io_lock_release();
+        return -1;
+    }
+    usb_io_lock_release();
+    return 0;
+}
+
+/* Harvest one posted bulk-IN. The device NAKs when no frame is pending, so a
+   0-byte result simply means idle. A RNDIS_PACKET_MSG carries the frame at
+   8 + DataOffset; an INDICATE_STATUS message carries link state. */
+static void usb_rndis_rx_one(void *drv)
+{
+    int got = 0;
+    struct pbuf *p;
+    rndis_packet_msg *h;
+    DWORD type, mlen, doff, dlen;
+    (void)drv;
+    if (!usb_rndis.ready || !usb_rndis.buf)
+        return;
+    usb_io_lock_acquire();
+    if (!xhci_bulk_in_try(usb_xhci_hcd, usb_rndis.dev, usb_rndis.ep_in,
+                          usb_rndis.buf, USB_RNDIS_BUF_SZ, &got,
+                          XHCI_ECM_IN_SPINS) ||
+        got < 8) {
+        usb_io_lock_release();
+        return;
+    }
+    h = (rndis_packet_msg *)usb_rndis.buf;
+    type = h->MessageType;
+    mlen = h->MessageLength;
+    doff = h->DataOffset;
+    dlen = h->DataLength;
+    usb_io_lock_release();
+    if (type == RNDIS_MSG_PACKET) {
+        unsigned int off = 8 + (unsigned int)doff;
+        if (dlen < ETH_HDR_LEN || dlen > ETH_MAX_FRAME ||
+            off + (unsigned int)dlen > (unsigned int)got ||
+            off + (unsigned int)dlen > USB_RNDIS_BUF_SZ)
+            return;
+        p = pbuf_alloc((u16)dlen);
+        if (!p)
+            return;
+        memcpy(p->data, usb_rndis.buf + off, (unsigned int)dlen);
+        net_lock();
+        netif_input(&usb_rndis.nif, p);
+        net_unlock();
+    } else if (type == RNDIS_MSG_INDICATE_STATUS) {
+        (void)mlen;
+    }
+}
+
+static const struct netdev_ops usb_rndis_ops = {
+    .transmit = usb_rndis_transmit,
+    .link_up = usb_rndis_link_up,
+    .poll = usb_rndis_rx_one,
+    .get_mac = usb_rndis_get_mac,
+};
+
+/* Issue a RNDIS message on the CDC SEND_ENCAPSULATED_COMMAND request (data
+   out) and read the matching completion off GET_ENCAPSULATED_RESPONSE (data
+   in). The CDC encapsulation requests carry wIndex = 0 (QEMU rejects any
+   non-zero index). When no completion is queued the device returns a single
+   zero byte, so we clear the buffer first and treat a zero MessageType as
+   "no response". *resp_len is set to the RNDIS MessageLength when a valid
+   completion arrives, else 0. */
+static int usb_rndis_cmd(const void *req, int reqlen, int *resp_len)
+{
+    usb_setup s;
+    DWORD mlen;
+    int n;
+
+    if (!usb_rndis.ready && !usb_rndis.dev)
+        return 0;
+    memset(&s, 0, sizeof(s));
+    s.bmRequestType = USB_RT_CLASS_IF_H2D;
+    s.bRequest = USB_CDC_SEND_ENCAP_CMD;
+    s.wValue = 0;
+    s.wIndex = 0;
+    s.wLength = (WORD)reqlen;
+    if (!usb_ctrl_dev(usb_rndis.dev, &s, (void *)req, reqlen))
+        return 0;
+    memset(usb_rndis.cbuf, 0, sizeof(usb_rndis.cbuf));
+    memset(&s, 0, sizeof(s));
+    s.bmRequestType = USB_RT_CLASS_IF_D2H;
+    s.bRequest = USB_CDC_GET_ENCAP_RESP;
+    s.wValue = 0;
+    s.wIndex = 0;
+    s.wLength = USB_RNDIS_CBUF_SZ;
+    if (!usb_ctrl_dev(usb_rndis.dev, &s, usb_rndis.cbuf, USB_RNDIS_CBUF_SZ))
+        return 0;
+    /* cbuf[0] is the low byte of MessageType; 0 means the device returned
+       the no-response marker (a lone 0 byte) rather than a completion. */
+    if (usb_rndis.cbuf[0] == 0) {
+        *resp_len = 0;
+        return 1;
+    }
+    mlen = (DWORD)usb_rndis.cbuf[4] | ((DWORD)usb_rndis.cbuf[5] << 8) |
+           ((DWORD)usb_rndis.cbuf[6] << 16) | ((DWORD)usb_rndis.cbuf[7] << 24);
+    n = (int)mlen;
+    if (n < 4 || n > USB_RNDIS_CBUF_SZ)
+        n = 0;
+    *resp_len = n;
+    return 1;
+}
+
+static int usb_rndis_init(void)
+{
+    rndis_init_msg m;
+    rndis_query_cmplt *c;
+    int n;
+
+    m.MessageType = RNDIS_MSG_INITIALIZE;
+    m.MessageLength = sizeof(m);
+    m.RequestID = ++usb_rndis.reqid;
+    m.MajorVersion = 1;
+    m.MinorVersion = 0;
+    m.MaxTransferSize = USB_RNDIS_HDR_SZ + ETH_MAX_FRAME;
+    if (!usb_rndis_cmd(&m, (int)sizeof(m), &n) || n < 4)
+        return 0;
+    c = (rndis_query_cmplt *)usb_rndis.cbuf;
+    if (c->MessageType != RNDIS_MSG_INIT_CMPLT ||
+        c->Status != RNDIS_STATUS_SUCCESS)
+        return 0;
+    return 1;
+}
+
+/* Query an OID. The information buffer (MAC bytes / MTU) follows the
+   24-byte completion at 8 + InformationBufferOffset. */
+static int usb_rndis_query(DWORD oid, void *out, int outlen)
+{
+    BYTE req[28];
+    DWORD *w;
+    rndis_query_cmplt *c;
+    int n;
+    int i;
+
+    memset(req, 0, sizeof(req));
+    w = (DWORD *)req;
+    w[0] = RNDIS_MSG_QUERY;
+    w[1] = 28;
+    w[2] = ++usb_rndis.reqid;
+    w[3] = oid;
+    w[4] = 0;
+    w[5] = 0;
+    w[6] = 0;
+    if (!usb_rndis_cmd(req, 28, &n) || n < 24)
+        return 0;
+    c = (rndis_query_cmplt *)usb_rndis.cbuf;
+    if (c->MessageType != RNDIS_MSG_QUERY_CMPLT ||
+        c->Status != RNDIS_STATUS_SUCCESS)
+        return 0;
+    /* RNDIS offsets are measured from the byte after the 8-byte
+       MessageType/MessageLength header, so the buffer sits at
+       8 + InformationBufferOffset (QEMU: offset 16 -> absolute 24). */
+    if ((int)c->InformationBufferLength < outlen)
+        return 0;
+    if (8 + (unsigned int)c->InformationBufferOffset + (unsigned int)outlen
+        > USB_RNDIS_CBUF_SZ)
+        return 0;
+    for (i = 0; i < outlen; i++)
+        ((BYTE *)out)[i] =
+            usb_rndis.cbuf[8 + c->InformationBufferOffset + i];
+    return 1;
+}
+
+static int usb_rndis_set(DWORD oid, const void *val, int vallen)
+{
+    BYTE req[32];
+    DWORD *w;
+    rndis_set_cmplt *c;
+    int n;
+
+    if (vallen < 0 || 28 + (unsigned int)vallen > sizeof(req))
+        return 0;
+    memset(req, 0, sizeof(req));
+    w = (DWORD *)req;
+    w[0] = RNDIS_MSG_SET;
+    w[1] = 28 + (DWORD)vallen;
+    w[2] = ++usb_rndis.reqid;
+    w[3] = oid;
+    w[4] = (DWORD)vallen;
+    w[5] = 20;
+    w[6] = 0;
+    memcpy(req + 28, val, (unsigned int)vallen);
+    if (!usb_rndis_cmd(req, 28 + (int)vallen, &n) || n < 16)
+        return 0;
+    c = (rndis_set_cmplt *)usb_rndis.cbuf;
+    if (c->MessageType != RNDIS_MSG_SET_CMPLT ||
+        c->Status != RNDIS_STATUS_SUCCESS)
+        return 0;
+    return 1;
+}
+
+static int usb_rndis_keepalive(void)
+{
+    BYTE req[12];
+    DWORD *w;
+    rndis_set_cmplt *c;
+    int n;
+
+    w = (DWORD *)req;
+    w[0] = RNDIS_MSG_KEEPALIVE;
+    w[1] = 12;
+    w[2] = ++usb_rndis.reqid;
+    if (!usb_rndis_cmd(req, 12, &n) || n < 12)
+        return 0;
+    c = (rndis_set_cmplt *)usb_rndis.cbuf;
+    if (c->MessageType != RNDIS_MSG_KEEPALIVE_CMPLT ||
+        c->Status != RNDIS_STATUS_SUCCESS)
+        return 0;
+    return 1;
+}
+
+/* Enumerate a RNDIS config on an already-claimed device: activate it by
+   value, configure the bulk endpoints, then run the control handshake
+   (INIT -> QUERY MAC -> QUERY MTU -> SET packet filter). The filter SET is
+   what moves the device into DATA_INITIALIZED and starts delivering frames
+   on the bulk IN endpoint. */
+static int usb_enumerate_rndis(DWORD dev)
+{
+    BYTE devdesc[18];
+    BYTE cfghdr[9];
+    BYTE cfg[256];
+    WORD total;
+    usb_cdc_rndis_info info;
+    DWORD filter;
+    int nconf, ci, found = 0;
+    int i;
+
+    if (!usb_get_desc_dev(dev, USB_DESC_DEVICE, 0, devdesc, 8))
+        return 0;
+    if (!xhci_set_ep0_packet_size(usb_xhci_hcd, dev, devdesc[7]))
+        return 0;
+    if (!usb_get_desc_dev(dev, USB_DESC_DEVICE, 0, devdesc, 18))
+        return 0;
+    printf("usb: rndis vid=%04x pid=%04x class=%u\n",
+           (unsigned)(devdesc[8] | (devdesc[9] << 8)),
+           (unsigned)(devdesc[10] | (devdesc[11] << 8)),
+           (unsigned)devdesc[4]);
+    if (devdesc[4] == 9)
+        return 0;
+    nconf = devdesc[17];
+    if (nconf < 1)
+        nconf = 1;
+    if (nconf > 8)
+        nconf = 8;
+    for (ci = 0; ci < nconf && !found; ci++) {
+        if (!usb_get_desc_dev(dev, USB_DESC_CONFIG, (BYTE)ci, cfghdr, 9))
+            break;
+        total = (WORD)(cfghdr[2] | (cfghdr[3] << 8));
+        if (total < 9 || total > (WORD)sizeof(cfg))
+            total = 9;
+        if (!usb_get_desc_dev(dev, USB_DESC_CONFIG, (BYTE)ci, cfg, total))
+            break;
+        if (usb_parse_cdc_rndis(cfg, (unsigned int)total, &info))
+            found = 1;
+    }
+    if (!found) {
+        printf("usb: no RNDIS data interface (tried %d config%s)\n",
+               nconf, nconf == 1 ? "" : "s");
+        return 0;
+    }
+    if (!usb_set_config_dev(dev, info.cfgval))
+        return 0;
+    if (!xhci_configure_endpoints(usb_xhci_hcd, dev,
+                                  info.ep_in, info.mps_in, info.burst_in,
+                                  info.ep_out, info.mps_out, info.burst_out))
+        return 0;
+    usb_rndis.dev = dev;
+    usb_rndis.ep_in = info.ep_in;
+    usb_rndis.ep_out = info.ep_out;
+    usb_rndis.comm_if = info.comm_if;
+    /* Probe: a real RNDIS device answers INITIALIZE_CMPLT; a CDC-ACM serial
+       gadget STALLs the encapsulation request and this bails. */
+    if (!usb_rndis_init()) {
+        printf("usb: rndis INIT probe failed (not RNDIS)\n");
+        return 0;
+    }
+    if (!usb_rndis_query(RNDIS_OID_PERM_MAC, usb_rndis.mac, ETH_ADDR_LEN)) {
+        usb_rndis.mac[0] = 0x02;
+        usb_rndis.mac[1] = 0x00;
+        usb_rndis.mac[2] = (BYTE)(dev + 1);
+        usb_rndis.mac[3] = (BYTE)(info.data_if + 1);
+        usb_rndis.mac[4] = 0x52;
+        usb_rndis.mac[5] = (BYTE)(dev + 0x41);
+        printf("usb: rndis MAC query failed; using fallback MAC\n");
+    }
+    {
+        DWORD mtu = 0;
+        if (usb_rndis_query(RNDIS_OID_MAX_FRAME_SIZE, &mtu, (int)sizeof(mtu)))
+            usb_rndis.mtu =
+                (mtu >= ETH_HDR_LEN && mtu <= ETH_MAX_FRAME) ? (WORD)mtu
+                                                            : ETH_MTU;
+        else
+            usb_rndis.mtu = ETH_MTU;
+    }
+    filter = RNDIS_FILTER_BROADCAST | RNDIS_FILTER_MULTICAST |
+             RNDIS_FILTER_ALLMULTI;
+    if (!usb_rndis_set(RNDIS_OID_PACKET_FILTER, &filter, 4)) {
+        printf("usb: rndis packet-filter SET failed\n");
+        return 0;
+    }
+    printf("usb: rndis in=%d out=%d mtu=%u mac=",
+           (int)usb_rndis.ep_in, (int)usb_rndis.ep_out,
+           (unsigned)usb_rndis.mtu);
+    for (i = 0; i < ETH_ADDR_LEN; i++)
+        printf("%02x%s", usb_rndis.mac[i], i == ETH_ADDR_LEN - 1 ? "\n" : ":");
+    return 1;
+}
+
+/*
+  Drop the RNDIS NIC's driver-visible state ahead of a full controller reset
+  (mirrors usb_ecm_tear_down). transmit()/rx_one() are gated on
+  usb_rndis.ready, so clearing it stops any in-flight polling; the netif is
+  re-initialized in place by usb_xhci_bind_rndis().
+ */
+static void usb_rndis_tear_down(void)
+{
+    if (!usb_rndis.ready)
+        return;
+    usb_rndis.ready = 0;
+    usb_rndis.nif.link_up = 0;
+}
+
+static int usb_xhci_bind_rndis(void)
+{
+    DWORD used_ports = 0;
+    DWORD dev_slot = 0;
+    DWORD port;
+    int i;
+
+    if (!usb_xhci_hcd || usb_rndis.ready)
+        return 0;
+    for (i = 0; i < XHCI_MAX_USBDEVS; i++)
+        if (usb_xhci_hcd->usbdevs[i].port)
+            used_ports |= xhci_ccs_bit(usb_xhci_hcd->usbdevs[i].port);
+    for (dev_slot = 2; dev_slot < XHCI_MAX_USBDEVS; dev_slot++) {
+        if (!usb_xhci_hcd->usbdevs[dev_slot].port)
+            break;
+    }
+    if (dev_slot >= XHCI_MAX_USBDEVS)
+        dev_slot = 0;
+    if (!dev_slot) {
+        printf("usb: no free xHCI slot for RNDIS NIC\n");
+        return 0;
+    }
+    usb_xhci_hcd->enumerating = 1;
+    usb_xhci_hcd->recovery_needed = 0;
+    for (port = 1; port <= usb_xhci_hcd->max_ports && port <= 32; port++) {
+        if (!(xhci_port_ccs_mask(usb_xhci_hcd) & xhci_ccs_bit(port)))
+            continue;
+        if (used_ports & xhci_ccs_bit(port))
+            continue;
+        printf("xhci: trying RNDIS port %u (slot %u)\n", port, dev_slot);
+        if (!xhci_claim_port_dev(usb_xhci_hcd, port, dev_slot))
+            continue;
+        if (usb_enumerate_rndis(dev_slot)) {
+            if (!usb_rndis.buf)
+                usb_rndis.buf = (BYTE *)malloc(USB_RNDIS_BUF_SZ);
+            if (!usb_rndis.buf) {
+                printf("xhci: no DMA buffer for RNDIS NIC\n");
+                xhci_release_dev(usb_xhci_hcd, dev_slot);
+                usb_xhci_hcd->recovery_needed = 0;
+                continue;
+            }
+            usb_rndis.port = port;
+            usb_rndis.ndev.drv = &usb_rndis;
+            usb_rndis.ndev.ops = &usb_rndis_ops;
+            usb_rndis.ndev.name[0] = 'r';
+            usb_rndis.ndev.name[1] = 'n';
+            usb_rndis.ndev.name[2] = 'd';
+            usb_rndis.ndev.name[3] = 'i';
+            usb_rndis.ndev.name[4] = 's';
+            usb_rndis.ndev.name[5] = '0';
+            usb_rndis.ndev.name[6] = 0;
+            netif_init(&usb_rndis.nif, &usb_rndis.ndev);
+            if (usb_rndis.mtu)
+                usb_rndis.nif.mtu = usb_rndis.mtu;
+            if (!netif_default())
+                netif_set_default(&usb_rndis.nif);
+            usb_rndis.ready = 1;
+            usb_registry_add((int)dev_slot, port, (int)dev_slot,
+                             USB_DRV_RNDIS, &usb_rndis, "usb-rndis");
+            usb_xhci_hcd->enumerating = 0;
+            serial_puts("USB_RNDIS_NIC_OK\n");
+            return 1;
+        }
+        printf("xhci: port %u not RNDIS\n", port);
+        xhci_release_dev(usb_xhci_hcd, dev_slot);
+        usb_xhci_hcd->recovery_needed = 0;
+    }
+    usb_xhci_hcd->enumerating = 0;
+    return 0;
+}
+
+void usb_rndis_poll(void)
+{
+    extern unsigned int time_count;
+    if (usb_rndis.ready)
+        usb_rndis_rx_one(&usb_rndis);
+    /* RNDIS spec: host must keep the session alive with a KEEPALIVE roughly
+       every 5 seconds or the device drops the link. QEMU tolerates silence,
+       but real RNDIS gadgets do not, so send one on a 4-second cadence. */
+    if (usb_rndis.ready && time_count != usb_rndis.last_keepalive_secs) {
+        if (usb_rndis.last_keepalive_secs &&
+            time_count - usb_rndis.last_keepalive_secs >= 4) {
+            if (usb_rndis_keepalive())
+                usb_rndis.last_keepalive_secs = time_count;
+        } else {
+            usb_rndis.last_keepalive_secs = time_count;
+        }
+    }
+}
+
+#ifdef KTEST
+/* In-kernel RNDIS acceptance self-test (KTEST builds only). Boots with a
+   QEMU usb-net gadget bound as a RNDIS NIC (the ECM binder is held back on
+   the usb-rndis-test cmdline) and runs the same protocol suite as the CDC-ECM
+   self-test -- DHCP DORA + renew/rebind, ARP/ICMP ping, UDP echo, TCP echo +
+   RTO retransmit, DNS A, softnet -- over the RNDIS bulk endpoints, proving
+   the RNDIS_PACKET_MSG framing and the encapsulated-control path both work
+   end to end. Prints NET_RNDIS_PASS/FAIL plus the shared NET_* markers. */
+static void usb_rndis_selftest(void)
+{
+    struct inet_config cfg;
+    unsigned int dip;
+    int dhcp_ok = 0;
+    int pass = 1;
+
+    if (!usb_rndis.ready) {
+        printf("NET_RNDIS_FAIL not-ready\n");
+        return;
+    }
+    printf("NET_RNDIS_START\n");
+    inet_config_from_cmdline(&cfg, kernel_cmdline);
+    arp_init(&usb_rndis.nif);
+    tcp_init();
+    usb_rndis.nif.link_up = 1;
+    if (dhcp_client(&usb_rndis.nif, &cfg, 4000000) == 0) {
+        dhcp_ok = 1;
+        printf("NET_DHCP_OK ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
+               (cfg.ip >> 24) & 0xFF, (cfg.ip >> 16) & 0xFF,
+               (cfg.ip >> 8) & 0xFF, cfg.ip & 0xFF,
+               (cfg.gateway >> 24) & 0xFF, (cfg.gateway >> 16) & 0xFF,
+               (cfg.gateway >> 8) & 0xFF, cfg.gateway & 0xFF);
+    } else {
+        printf("NET_DHCP_FAIL\n");
+        inet_config_from_cmdline(&cfg, kernel_cmdline);
+    }
+    netif_set_addr(&usb_rndis.nif, cfg.ip, cfg.netmask, cfg.gateway);
+    netif_set_up(&usb_rndis.nif);
+    printf("NETIF_UP ip=%u.%u.%u.%u gw=%u.%u.%u.%u dhcp=%d\n",
+           (cfg.ip >> 24) & 0xFF, (cfg.ip >> 16) & 0xFF,
+           (cfg.ip >> 8) & 0xFF, cfg.ip & 0xFF,
+           (cfg.gateway >> 24) & 0xFF, (cfg.gateway >> 16) & 0xFF,
+           (cfg.gateway >> 8) & 0xFF, cfg.gateway & 0xFF, dhcp_ok);
+    if (dhcp_ok) {
+        dhcp_force_timer_due(1, 0);
+        if (dhcp_service(&usb_rndis.nif, &cfg, 1, 4000000) == 0)
+            printf("NET_DHCP_RENEW_OK\n");
+        else {
+            printf("NET_DHCP_RENEW_FAIL\n");
+            pass = 0;
+        }
+        dhcp_force_timer_due(1, 1);
+        if (dhcp_service(&usb_rndis.nif, &cfg, 1, 4000000) == 0)
+            printf("NET_DHCP_REBIND_OK\n");
+        else {
+            printf("NET_DHCP_REBIND_FAIL\n");
+            pass = 0;
+        }
+    }
+    tcp_listen_echo(TCP_ECHO_PORT);
+    if (icmp_ping(&usb_rndis.nif, cfg.gateway, 300) == 0)
+        printf("NET_PING_OK\n");
+    else {
+        printf("NET_PING_FAIL\n");
+        pass = 0;
+    }
+    if (udp_echo_client(&usb_rndis.nif, cfg.gateway, UDP_TEST_PORT,
+                        2000000) == 0)
+        printf("NET_UDP_OK\n");
+    else {
+        printf("NET_UDP_FAIL\n");
+        pass = 0;
+    }
+    if (tcp_echo_client(&usb_rndis.nif, cfg.gateway, TCP_TEST_PORT,
+                        4000000) == 0)
+        printf("NET_TCP_OK\n");
+    else {
+        printf("NET_TCP_FAIL\n");
+        pass = 0;
+    }
+    if (tcp_echo_rexmit_selftest(&usb_rndis.nif, cfg.gateway, TCP_TEST_PORT,
+                                 8000000) == 0)
+        printf("NET_TCP_REXMIT_OK\n");
+    else {
+        printf("NET_TCP_REXMIT_FAIL\n");
+        pass = 0;
+    }
+    dip = 0;
+    if (dns_query_a(&usb_rndis.nif, cfg.gateway, DNS_TEST_PORT, "icsos.test",
+                    &dip, 4000000) == 0 && dip == 0x0A000202u)
+        printf("NET_DNS_OK ip=%u.%u.%u.%u\n",
+               (dip >> 24) & 0xFF, (dip >> 16) & 0xFF,
+               (dip >> 8) & 0xFF, dip & 0xFF);
+    else {
+        printf("NET_DNS_FAIL\n");
+        pass = 0;
+    }
+    softnet_init();
+    printf("NET_SOFTNET_OK\n");
+    if (pass)
+        printf("NET_RNDIS_PASS\n");
+    else
+        printf("NET_RNDIS_FAIL\n");
+}
+#endif /* KTEST: usb_rndis_selftest */
+
+static int usb_ecm_read_mac(DWORD dev, BYTE imac)
+{
+    BYTE sbuf[34];
+    int digits[12];
+    int i;
+
+    if (!imac)
+        return 0;
+    memset(sbuf, 0, sizeof(sbuf));
+    if (!usb_get_desc_dev(dev, USB_DESC_STRING, imac, sbuf,
+                          (WORD)sizeof(sbuf)))
+        return 0;
+    if (sbuf[1] != USB_DESC_STRING || sbuf[0] < 26)
+        return 0;
+    /* iMACAddress is a 12-char ASCII hex string in UTF-16LE; each 16-bit
+       unit holds one hex digit (high byte 0). */
+    for (i = 0; i < 12; i++) {
+        BYTE c = sbuf[2 + (unsigned int)i * 2];
+        if (c >= '0' && c <= '9')
+            digits[i] = c - '0';
+        else if (c >= 'a' && c <= 'f')
+            digits[i] = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F')
+            digits[i] = c - 'A' + 10;
+        else
+            return 0;
+    }
+    for (i = 0; i < ETH_ADDR_LEN; i++)
+        usb_ecm.mac[i] = (BYTE)((digits[i * 2] << 4) | digits[i * 2 + 1]);
+    return 1;
+}
+
+static int usb_enumerate_ecm(DWORD dev)
+{
+    BYTE devdesc[18];
+    BYTE cfghdr[9];
+    BYTE cfg[256];
+    WORD total;
+    usb_cdc_ecm_info info;
+    int i;
+
+    if (!usb_get_desc_dev(dev, USB_DESC_DEVICE, 0, devdesc, 8))
+        return 0;
+    if (!xhci_set_ep0_packet_size(usb_xhci_hcd, dev, devdesc[7]))
+        return 0;
+    if (!usb_get_desc_dev(dev, USB_DESC_DEVICE, 0, devdesc, 18))
+        return 0;
+    printf("usb: ecm vid=%04x pid=%04x class=%u\n",
+           (unsigned)(devdesc[8] | (devdesc[9] << 8)),
+           (unsigned)(devdesc[10] | (devdesc[11] << 8)),
+           (unsigned)devdesc[4]);
+    if (devdesc[4] == 9)
+        return 0;
+    /*
+     * A composite gadget can expose several configurations. QEMU usb-net is
+     * the canonical case: config[0] is RNDIS (comm subclass 2) while
+     * config[1] is the real CDC-ECM (Ethernet Networking, comm subclass 6).
+     * Enumerate every configuration by index and bind the one that presents a
+     * CDC-ECM data interface; SET_CONFIGURATION then activates it by value.
+     */
+    {
+        int nconf = devdesc[17];
+        int found = 0;
+        int ci;
+        if (nconf < 1)
+            nconf = 1;
+        if (nconf > 8)
+            nconf = 8;
+        for (ci = 0; ci < nconf && !found; ci++) {
+            if (!usb_get_desc_dev(dev, USB_DESC_CONFIG, (BYTE)ci, cfghdr, 9))
+                break;
+            total = (WORD)(cfghdr[2] | (cfghdr[3] << 8));
+            if (total < 9 || total > (WORD)sizeof(cfg))
+                total = 9;
+            if (!usb_get_desc_dev(dev, USB_DESC_CONFIG, (BYTE)ci, cfg, total))
+                break;
+            if (usb_parse_cdc_ecm(cfg, (unsigned int)total, &info))
+                found = 1;
+        }
+        if (!found) {
+            printf("usb: no CDC-ECM data interface (tried %d config%s)\n",
+                   nconf, nconf == 1 ? "" : "s");
+            return 0;
+        }
+        printf("usb: ecm config value=%u mtu=%u\n",
+               (unsigned)info.cfgval, (unsigned)info.mtu);
+    }
+    if (!usb_set_config_dev(dev, info.cfgval))
+        return 0;
+    if (!xhci_configure_endpoints(usb_xhci_hcd, dev,
+                                  info.ep_in, info.mps_in, info.burst_in,
+                                  info.ep_out, info.mps_out, info.burst_out))
+        return 0;
+    usb_ecm.dev = dev;
+    usb_ecm.ep_in = info.ep_in;
+    usb_ecm.ep_out = info.ep_out;
+    if (!usb_ecm_read_mac(dev, info.imac)) {
+        usb_ecm.mac[0] = 0x02;
+        usb_ecm.mac[1] = 0x00;
+        usb_ecm.mac[2] = (BYTE)(dev + 1);
+        usb_ecm.mac[3] = (BYTE)(info.data_if + 1);
+        usb_ecm.mac[4] = 0x53;
+        usb_ecm.mac[5] = (BYTE)(dev + 0xA1);
+        printf("usb: ecm iMACAddress string unreadable; using fallback MAC\n");
+    }
+    printf("usb: ecm in=%d out=%d mtu=%u mac=",
+           (int)usb_ecm.ep_in, (int)usb_ecm.ep_out, (unsigned)info.mtu);
+    for (i = 0; i < ETH_ADDR_LEN; i++)
+        printf("%02x%s", usb_ecm.mac[i], i == ETH_ADDR_LEN - 1 ? "\n" : ":");
+    return 1;
+}
+
+/*
+  Drop the ECM NIC's driver-visible state ahead of a full controller reset
+  (xhci_stop_hcd + xhci_init_hcd). The xHCI slot/endpoint context is cleared
+  by xhci_init_hcd() and the heap RX buffer is reused by the re-bind, so only
+  readiness and link state are cleared here. transmit()/rx_one() are already
+  gated on usb_ecm.ready, so clearing it stops any in-flight polling. The
+  netif object is re-initialized in place by usb_xhci_bind_ecm() (it is a
+  single global default pointer, not a list, so in-place re-init is safe).
+ */
+static void usb_ecm_tear_down(void)
+{
+    if (!usb_ecm.ready)
+        return;
+    usb_ecm.ready = 0;
+    usb_ecm.nif.link_up = 0;
+}
+
+static int usb_xhci_bind_ecm(void)
+{
+    DWORD used_ports = 0;
+    DWORD dev_slot = 0;
+    DWORD port;
+    int i;
+
+    if (!usb_xhci_hcd || usb_ecm.ready)
+        return 0;
+    for (i = 0; i < XHCI_MAX_USBDEVS; i++)
+        if (usb_xhci_hcd->usbdevs[i].port)
+            used_ports |= xhci_ccs_bit(usb_xhci_hcd->usbdevs[i].port);
+    for (dev_slot = 2; dev_slot < XHCI_MAX_USBDEVS; dev_slot++) {
+        if (!usb_xhci_hcd->usbdevs[dev_slot].port)
+            break;
+    }
+    if (dev_slot >= XHCI_MAX_USBDEVS)
+        dev_slot = 0;
+    if (!dev_slot) {
+        printf("usb: no free xHCI slot for ECM NIC\n");
+        return 0;
+    }
+    usb_xhci_hcd->enumerating = 1;
+    usb_xhci_hcd->recovery_needed = 0;
+    for (port = 1; port <= usb_xhci_hcd->max_ports && port <= 32; port++) {
+        if (!(xhci_port_ccs_mask(usb_xhci_hcd) & xhci_ccs_bit(port)))
+            continue;
+        if (used_ports & xhci_ccs_bit(port))
+            continue;
+        printf("xhci: trying CDC-ECM port %u (slot %u)\n", port, dev_slot);
+        if (!xhci_claim_port_dev(usb_xhci_hcd, port, dev_slot))
+            continue;
+        if (usb_enumerate_ecm(dev_slot)) {
+            /* Reused across re-binds (controller recovery); allocated once. */
+            if (!usb_ecm.buf)
+                usb_ecm.buf = (BYTE *)malloc(USB_ECM_BUF_SZ);
+            if (!usb_ecm.buf) {
+                printf("xhci: no DMA buffer for ECM NIC\n");
+                xhci_release_dev(usb_xhci_hcd, dev_slot);
+                usb_xhci_hcd->recovery_needed = 0;
+                continue;
+            }
+            usb_ecm.port = port;
+            usb_ecm.ndev.drv = &usb_ecm;
+            usb_ecm.ndev.ops = &usb_ecm_ops;
+            usb_ecm.ndev.name[0] = 'e';
+            usb_ecm.ndev.name[1] = 'c';
+            usb_ecm.ndev.name[2] = 'm';
+            usb_ecm.ndev.name[3] = '0';
+            usb_ecm.ndev.name[4] = 0;
+            netif_init(&usb_ecm.nif, &usb_ecm.ndev);
+            if (!netif_default())
+                netif_set_default(&usb_ecm.nif);
+            usb_ecm.ready = 1;
+            usb_registry_add((int)dev_slot, port, (int)dev_slot,
+                             USB_DRV_CDC_ECM, &usb_ecm, "usb-ecm");
+            usb_xhci_hcd->enumerating = 0;
+            serial_puts("USB_ECM_NIC_OK\n");
+            return 1;
+        }
+        printf("xhci: port %u not CDC-ECM\n", port);
+        xhci_release_dev(usb_xhci_hcd, dev_slot);
+        usb_xhci_hcd->recovery_needed = 0;
+    }
+    usb_xhci_hcd->enumerating = 0;
+    return 0;
+}
+
+#ifdef KTEST
+/* In-kernel acceptance self-tests (KTEST builds only). A production kernel
+   (KTEST=0) omits these plus the fault-injection latches they drive. */
+static void usb_ecm_selftest(void)
+{
+    struct inet_config cfg;
+    unsigned int dip;
+    int dhcp_ok = 0;
+    int pass = 1;
+
+    if (!usb_ecm.ready)
+        return;
+    inet_config_from_cmdline(&cfg, kernel_cmdline);
+    arp_init(&usb_ecm.nif);
+    tcp_init();
+    usb_ecm.nif.link_up = 1;
+    if (dhcp_client(&usb_ecm.nif, &cfg, 4000000) == 0) {
+        dhcp_ok = 1;
+        printf("NET_DHCP_OK ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
+               (cfg.ip >> 24) & 0xFF, (cfg.ip >> 16) & 0xFF,
+               (cfg.ip >> 8) & 0xFF, cfg.ip & 0xFF,
+               (cfg.gateway >> 24) & 0xFF, (cfg.gateway >> 16) & 0xFF,
+               (cfg.gateway >> 8) & 0xFF, cfg.gateway & 0xFF);
+    } else {
+        printf("NET_DHCP_FAIL\n");
+        inet_config_from_cmdline(&cfg, kernel_cmdline);
+    }
+    netif_set_addr(&usb_ecm.nif, cfg.ip, cfg.netmask, cfg.gateway);
+    netif_set_up(&usb_ecm.nif);
+    printf("NETIF_UP ip=%u.%u.%u.%u gw=%u.%u.%u.%u dhcp=%d\n",
+           (cfg.ip >> 24) & 0xFF, (cfg.ip >> 16) & 0xFF,
+           (cfg.ip >> 8) & 0xFF, cfg.ip & 0xFF,
+           (cfg.gateway >> 24) & 0xFF, (cfg.gateway >> 16) & 0xFF,
+           (cfg.gateway >> 8) & 0xFF, cfg.gateway & 0xFF, dhcp_ok);
+    if (dhcp_ok) {
+        dhcp_force_timer_due(1, 0);
+        if (dhcp_service(&usb_ecm.nif, &cfg, 1, 4000000) == 0)
+            printf("NET_DHCP_RENEW_OK\n");
+        else {
+            printf("NET_DHCP_RENEW_FAIL\n");
+            pass = 0;
+        }
+        dhcp_force_timer_due(1, 1);
+        if (dhcp_service(&usb_ecm.nif, &cfg, 1, 4000000) == 0)
+            printf("NET_DHCP_REBIND_OK\n");
+        else {
+            printf("NET_DHCP_REBIND_FAIL\n");
+            pass = 0;
+        }
+    }
+    tcp_listen_echo(TCP_ECHO_PORT);
+    if (icmp_ping(&usb_ecm.nif, cfg.gateway, 300) == 0)
+        printf("NET_PING_OK\n");
+    else {
+        printf("NET_PING_FAIL\n");
+        pass = 0;
+    }
+    if (udp_echo_client(&usb_ecm.nif, cfg.gateway, UDP_TEST_PORT,
+                        2000000) == 0)
+        printf("NET_UDP_OK\n");
+    else {
+        printf("NET_UDP_FAIL\n");
+        pass = 0;
+    }
+    if (tcp_echo_client(&usb_ecm.nif, cfg.gateway, TCP_TEST_PORT,
+                        4000000) == 0)
+        printf("NET_TCP_OK\n");
+    else {
+        printf("NET_TCP_FAIL\n");
+        pass = 0;
+    }
+    if (tcp_echo_rexmit_selftest(&usb_ecm.nif, cfg.gateway, TCP_TEST_PORT,
+                                 8000000) == 0)
+        printf("NET_TCP_REXMIT_OK\n");
+    else {
+        printf("NET_TCP_REXMIT_FAIL\n");
+        pass = 0;
+    }
+    dip = 0;
+    if (dns_query_a(&usb_ecm.nif, cfg.gateway, DNS_TEST_PORT, "icsos.test",
+                    &dip, 4000000) == 0 && dip == 0x0A000202u)
+        printf("NET_DNS_OK ip=%u.%u.%u.%u\n",
+               (dip >> 24) & 0xFF, (dip >> 16) & 0xFF,
+               (dip >> 8) & 0xFF, dip & 0xFF);
+    else {
+        printf("NET_DNS_FAIL\n");
+        pass = 0;
+    }
+    softnet_init();
+    printf("NET_SOFTNET_OK\n");
+    if (pass)
+        printf("NET_ECM_PASS\n");
+    else
+        printf("NET_ECM_FAIL\n");
+}
+
+/*
+  Regression for the xHCI recovery path re-binding the CDC-ECM NIC.
+
+  Boots with a live usb-net (ECM NIC bound alongside the MSC root), proves the
+  NIC is functional (DHCP + ping to the gateway), then forces a full controller
+  reset via usb_xhci_recover(). After the reset it asserts BOTH the MSC root and
+  the ECM NIC come back and the NIC is functional again. Without the
+  usb_xhci_bind_ecm() call in the recovery/reconnect paths, the NIC stays down
+  after the reset (usb_ecm.ready == 0) and this fails with nic-not-rebound.
+ */
+static int usb_xhci_ecm_recover_selftest(void)
+{
+    int before = usb_xhci_recovery_count;
+    struct inet_config cfg;
+
+    if (usb_host != USB_HOST_XHCI || !usb_xhci_hcd || !usb_ecm.ready) {
+        serial_puts("ECM_RECOVER_FAIL no-nic\n");
+        return 0;
+    }
+    inet_config_from_cmdline(&cfg, kernel_cmdline);
+    usb_ecm.nif.link_up = 1;
+    if (dhcp_client(&usb_ecm.nif, &cfg, 4000000) != 0) {
+        serial_puts("ECM_RECOVER_FAIL pre-dhcp\n");
+        return 0;
+    }
+    netif_set_addr(&usb_ecm.nif, cfg.ip, cfg.netmask, cfg.gateway);
+    netif_set_up(&usb_ecm.nif);
+    if (icmp_ping(&usb_ecm.nif, cfg.gateway, 300) != 0) {
+        serial_puts("ECM_RECOVER_FAIL pre-ping\n");
+        return 0;
+    }
+    serial_puts("ECM_RECOVER_PRE_OK\n");
+
+    if (!usb_xhci_recover()) {
+        serial_puts("ECM_RECOVER_FAIL reset\n");
+        return 0;
+    }
+    if (usb_xhci_recovery_count != before + 1) {
+        serial_puts("ECM_RECOVER_FAIL count\n");
+        return 0;
+    }
+    if (!usb_msc0.drive.present) {
+        serial_puts("ECM_RECOVER_FAIL msc-gone\n");
+        return 0;
+    }
+    if (!usb_ecm.ready) {
+        serial_puts("ECM_RECOVER_FAIL nic-not-rebound\n");
+        return 0;
+    }
+    serial_puts("ECM_RECOVER_REBIND_OK\n");
+
+    /* The re-bound NIC must be usable again, not merely marked ready. */
+    inet_config_from_cmdline(&cfg, kernel_cmdline);
+    usb_ecm.nif.link_up = 1;
+    if (dhcp_client(&usb_ecm.nif, &cfg, 4000000) != 0) {
+        serial_puts("ECM_RECOVER_FAIL post-dhcp\n");
+        return 0;
+    }
+    netif_set_addr(&usb_ecm.nif, cfg.ip, cfg.netmask, cfg.gateway);
+    netif_set_up(&usb_ecm.nif);
+    if (icmp_ping(&usb_ecm.nif, cfg.gateway, 300) != 0) {
+        serial_puts("ECM_RECOVER_FAIL post-ping\n");
+        return 0;
+    }
+    serial_puts("ECM_RECOVER_OK\n");
+    return 1;
+}
+   #endif /* KTEST: usb_ecm_selftest / usb_xhci_ecm_recover_selftest */
+
+/* =========================================================================
+    ASIX AX88179 / AX88178A USB Gigabit Ethernet NIC
+   ---------------------------------------------------------------------------
+   Vendor-specific control protocol over endpoint 0:
+     READ  bmRequestType=0xA0 (IN|VENDOR|DEVICE), bRequest=cmd, wValue, wIndex,
+           wLength=size
+     WRITE bmRequestType=0x20 (OUT|VENDOR|DEVICE), same fields
+   MAC register access: cmd=AX_ACCESS_MAC, wValue=register, wIndex=size.
+   PHY (MDIO) access:   cmd=AX_ACCESS_PHY,   wValue=phy_id(0x03), wIndex=reg.
+   2- and 4-byte register values are little-endian on the wire.
+
+   The NIC is a CDC-Ethernet (class 2) device: one Communications interface
+   (interrupt IN 0x81) plus one Data interface (bulk IN 0x82, bulk OUT 0x03).
+   The status interrupt endpoint is not used; link state is polled from the
+   PHY PHYSR register.  TX prepends an 8-byte header (le32 len, le32 flags);
+   RX returns a bundled multi-packet buffer whose last 4 bytes are
+   {pkt_cnt, hdr_off} and whose per-packet metadata gives each frame length.
+
+   Polling driver: softnet calls usb_asix_poll(), which posts a bulk IN and,
+   on data, parses the bundle and feeds netif_input().  This mirrors the
+   CDC-ECM and RNDIS NICs in this file.
+   ========================================================================= */
+
+#define USB_ASIX_VID          0x0b95
+#define USB_ASIX_PID          0x1790
+#define USB_ASIX_TXHDR_SZ     8
+#define USB_ASIX_TXBUF_SZ     (USB_ASIX_TXHDR_SZ + ETH_MAX_FRAME)
+#define USB_ASIX_RXBUF_SZ     20480   /* AX88179_BULKIN_SIZE[0] -> 1024*20 */
+
+#define AX_ACCESS_MAC         0x01
+#define AX_ACCESS_PHY         0x02
+#define AX_RT_IN_VENDOR       0xa0
+#define AX_RT_OUT_VENDOR      0x20
+#define AX_PHY_ID             0x03
+
+#define AX_NODE_ID            0x10
+#define AX_GENERAL_STATUS     0x03
+#define AX_PHYSICAL_LINK_STAT 0x02
+#define AX_RX_CTL             0x0b
+#define AX_MONITOR_MOD        0x24
+#define AX_PHYPWR_RSTCTL      0x26
+#define AX_RX_BULKIN_QCTRL    0x2e
+#define AX_CLK_SELECT         0x33
+#define AX_RXCOE_CTL          0x34
+#define AX_TXCOE_CTL          0x35
+#define AX_MEDIUM_STATUS_MODE 0x22
+#define AX_PAUSE_WATERLVL_LOW  0x55
+#define AX_PAUSE_WATERLVL_HIGH 0x54
+
+#define AX_RX_CTL_DROPCRCERR  0x0100
+#define AX_RX_CTL_IPE         0x0200
+#define AX_RX_CTL_START       0x0080
+#define AX_RX_CTL_AP          0x0020
+#define AX_RX_CTL_AB          0x0008
+#define AX_RX_CTL_AMALL       0x0002
+
+#define AX_CLK_SELECT_BCS     0x01
+#define AX_CLK_SELECT_ACS     0x02
+#define AX_PHYPWR_RSTCTL_IPRL 0x0020
+
+#define AX_RXCOE_IP           0x01
+#define AX_RXCOE_TCP          0x02
+#define AX_RXCOE_UDP          0x04
+#define AX_RXCOE_TCPV6        0x20
+#define AX_RXCOE_UDPV6        0x40
+
+#define AX_MONITOR_MODE_RWMP    0x04
+#define AX_MONITOR_MODE_PMEPOL  0x20
+#define AX_MONITOR_MODE_PMETYPE 0x40
+
+#define AX_MEDIUM_GIGAMODE       0x01
+#define AX_MEDIUM_FULL_DUPLEX    0x02
+#define AX_MEDIUM_EN_125MHZ      0x08
+#define AX_MEDIUM_RXFLOW_CTRLEN  0x10
+#define AX_MEDIUM_TXFLOW_CTRLEN  0x20
+#define AX_MEDIUM_RECEIVE_EN     0x100
+#define AX_MEDIUM_PS             0x200
+
+#define AX_USB_SS  0x04
+#define AX_USB_HS  0x02
+
+#define GMII_PHY_PHYSR        0x11
+#define GMII_PHY_PHYSR_SMASK  0xc000
+#define GMII_PHY_PHYSR_GIGA   0x8000
+#define GMII_PHY_PHYSR_100    0x4000
+#define GMII_PHY_PHYSR_FULL   0x2000
+#define GMII_PHY_PHYSR_LINK   0x400
+
+static const BYTE ax_bulk_in_size[4][5] = {
+    { 7, 0x4f, 0x00, 0x12, 0xff },
+    { 7, 0x20, 0x03, 0x16, 0xff },
+    { 7, 0xae, 0x07, 0x18, 0xff },
+    { 7, 0xcc, 0x4c, 0x18, 0x08 }
+};
+
+static struct {
+    int   ready;
+    DWORD dev;
+    DWORD port;
+    BYTE  ep_in;
+    BYTE  ep_out;
+    WORD  mps_in;
+    WORD  mps_out;
+    BYTE  burst_in;
+    BYTE  burst_out;
+    BYTE  cfgval;
+    BYTE  mac[ETH_ADDR_LEN];
+    DWORD last_link_secs;
+    int   link;
+    BYTE  *txbuf;
+    BYTE  *rxbuf;
+    struct netif  nif;
+    struct netdev ndev;
+} usb_asix;
+
+static int usb_asix_read_reg(int cmd, WORD value, WORD index, void *data,
+                              int size)
+{
+    usb_setup s;
+    int i;
+    /* The ASIX USB-to-MAC bridge firmware can STALL the first vendor
+       control right after SET_CONFIGURATION while it finishes coming up.
+       Retry a bounded number of times with a short settle between. */
+    for (i = 0; i < 4; i++) {
+        memset(&s, 0, sizeof(s));
+        s.bmRequestType = (BYTE)AX_RT_IN_VENDOR;
+        s.bRequest = (BYTE)cmd;
+        s.wValue = value;
+        s.wIndex = index;
+        s.wLength = (WORD)size;
+        if (usb_ctrl_dev(usb_asix.dev, &s, data, size))
+            return 1;
+        if (i < 3)
+            usb_wait_ms(25);
+    }
+    return 0;
+}
+
+static int usb_asix_write_reg(int cmd, WORD value, WORD index, const void *data,
+                              int size)
+{
+    usb_setup s;
+    int i;
+    for (i = 0; i < 4; i++) {
+        memset(&s, 0, sizeof(s));
+        s.bmRequestType = (BYTE)AX_RT_OUT_VENDOR;
+        s.bRequest = (BYTE)cmd;
+        s.wValue = value;
+        s.wIndex = index;
+        s.wLength = (WORD)size;
+        if (usb_ctrl_dev(usb_asix.dev, &s, (void *)data, size))
+            return 1;
+        if (i < 3)
+            usb_wait_ms(25);
+    }
+    return 0;
+}
+
+static int usb_asix_mac_read(WORD reg, void *data, int size)
+{
+    return usb_asix_read_reg(AX_ACCESS_MAC, reg, (WORD)size, data, size);
+}
+
+static int usb_asix_mac_write(WORD reg, const void *data, int size)
+{
+    return usb_asix_write_reg(AX_ACCESS_MAC, reg, (WORD)size, data, size);
+}
+
+static int usb_asix_mdio_read(int loc, WORD *res)
+{
+    return usb_asix_read_reg(AX_ACCESS_PHY, AX_PHY_ID, (WORD)loc, res, 2);
+}
+
+static int usb_asix_mdio_write(int loc, WORD val)
+{
+    return usb_asix_write_reg(AX_ACCESS_PHY, AX_PHY_ID, (WORD)loc, &val, 2);
+}
+
+static int usb_asix_parse_config(BYTE *cfg, unsigned int total)
+{
+    unsigned int off = 0;
+    int have_bulk = 0;
+    BYTE last_ep = 0;
+
+    if (!cfg || total < 9)
+        return 0;
+    usb_asix.cfgval = 1;
+    usb_asix.ep_in = 0;
+    usb_asix.ep_out = 0;
+    usb_asix.mps_in = 64;
+    usb_asix.mps_out = 64;
+    usb_asix.burst_in = 0;
+    usb_asix.burst_out = 0;
+    while (off + 2 <= total) {
+        int len = cfg[off];
+        int type = cfg[off + 1];
+        if (len < 2 || off + (unsigned int)len > total)
+            break;
+        if (type == 2 && len >= 9 && off == 0) {
+            usb_asix.cfgval = cfg[5] ? cfg[5] : 1;
+        } else if (type == 5 && len >= 7) {
+            int addr = cfg[off + 2];
+            int attr = cfg[off + 3];
+            int mps = cfg[off + 4] | (cfg[off + 5] << 8);
+            if ((attr & 3) == 2) {
+                if (addr & 0x80) {
+                    usb_asix.ep_in = (BYTE)(addr & 0x0F);
+                    usb_asix.mps_in = (WORD)(mps ? mps : 64);
+                } else {
+                    usb_asix.ep_out = (BYTE)(addr & 0x0F);
+                    usb_asix.mps_out = (WORD)(mps ? mps : 64);
+                }
+                have_bulk = 1;
+                last_ep = (BYTE)addr;
+            } else {
+                last_ep = 0;
+            }
+        } else if (type == 48 && len >= 6 && last_ep) {
+            if (cfg[off + 2] > 15)
+                last_ep = 0;
+            else if (last_ep & 0x80)
+                usb_asix.burst_in = cfg[off + 2];
+            else
+                usb_asix.burst_out = cfg[off + 2];
+            last_ep = 0;
+        } else {
+            last_ep = 0;
+        }
+        off += (unsigned int)len;
+    }
+    return have_bulk && usb_asix.ep_in && usb_asix.ep_out;
+}
+
+static int usb_asix_reset(void)
+{
+    BYTE buf[8];
+    BYTE one;
+    WORD two;
+
+    /* Power up + release PHY reset. */
+    two = 0;
+    if (!usb_asix_mac_write(AX_PHYPWR_RSTCTL, &two, 2))
+        return 0;
+    two = AX_PHYPWR_RSTCTL_IPRL;
+    if (!usb_asix_mac_write(AX_PHYPWR_RSTCTL, &two, 2))
+        return 0;
+    usb_wait_ms(200);
+
+    /* 25 MHz crystal + 125 MHz PHY clock. */
+    one = (BYTE)(AX_CLK_SELECT_ACS | AX_CLK_SELECT_BCS);
+    if (!usb_asix_mac_write(AX_CLK_SELECT, &one, 1))
+        return 0;
+    usb_wait_ms(100);
+
+    /* Read the MAC burned in the ASIX EEPROM; fall back to a local one. */
+    if (!usb_asix_mac_read(AX_NODE_ID, usb_asix.mac, ETH_ADDR_LEN) ||
+        (usb_asix.mac[0] == 0 && usb_asix.mac[1] == 0 &&
+         usb_asix.mac[2] == 0 && usb_asix.mac[3] == 0 &&
+         usb_asix.mac[4] == 0 && usb_asix.mac[5] == 0)) {
+        usb_asix.mac[0] = 0x02;
+        usb_asix.mac[1] = 0x00;
+        usb_asix.mac[2] = 0x0A;
+        usb_asix.mac[3] = (BYTE)(usb_asix.dev + 1);
+        usb_asix.mac[4] = 0x51;
+        usb_asix.mac[5] = (BYTE)(usb_asix.dev + 0x79);
+        printf("usb: asix MAC read failed; using fallback MAC\n");
+    }
+    /* Program the resolved MAC into the NIC so its unicast filter and TX
+       source address match what the driver reports. */
+    if (!usb_asix_mac_write(AX_NODE_ID, usb_asix.mac, ETH_ADDR_LEN))
+        return 0;
+
+    /* RX bulk queue configuration (gigabit / SuperSpeed entry). */
+    if (!usb_asix_mac_write(AX_RX_BULKIN_QCTRL, ax_bulk_in_size[0], 5))
+        return 0;
+
+    one = 0x34;
+    usb_asix_mac_write(AX_PAUSE_WATERLVL_LOW, &one, 1);
+    one = 0x52;
+    usb_asix_mac_write(AX_PAUSE_WATERLVL_HIGH, &one, 1);
+
+    /* Checksum offload. */
+    one = (BYTE)(AX_RXCOE_IP | AX_RXCOE_TCP | AX_RXCOE_UDP | AX_RXCOE_TCPV6 |
+                 AX_RXCOE_UDPV6);
+    usb_asix_mac_write(AX_RXCOE_CTL, &one, 1);
+    usb_asix_mac_write(AX_TXCOE_CTL, &one, 1);
+
+    /* Start RX: drop CRC errors, accept unicast+multicast+broadcast. */
+    two = (WORD)(AX_RX_CTL_DROPCRCERR | AX_RX_CTL_IPE | AX_RX_CTL_START |
+                 AX_RX_CTL_AP | AX_RX_CTL_AMALL | AX_RX_CTL_AB);
+    if (!usb_asix_mac_write(AX_RX_CTL, &two, 2))
+        return 0;
+
+    one = (BYTE)(AX_MONITOR_MODE_PMEPOL | AX_MONITOR_MODE_PMETYPE |
+                 AX_MONITOR_MODE_RWMP);
+    usb_asix_mac_write(AX_MONITOR_MOD, &one, 1);
+
+    /* Default medium: gigabit full-duplex, flow control, RX enabled. */
+    two = (WORD)(AX_MEDIUM_RECEIVE_EN | AX_MEDIUM_TXFLOW_CTRLEN |
+                 AX_MEDIUM_RXFLOW_CTRLEN | AX_MEDIUM_FULL_DUPLEX |
+                 AX_MEDIUM_GIGAMODE);
+    usb_asix_mac_write(AX_MEDIUM_STATUS_MODE, &two, 2);
+    (void)buf;
+    return 1;
+}
+
+static int usb_asix_check_link(void)
+{
+    WORD physr = 0;
+    BYTE linksts = 0;
+    WORD mode;
+    BYTE tmp[5];
+
+    if (!usb_asix.ready)
+        return usb_asix.link;
+    if (usb_asix_mdio_read(GMII_PHY_PHYSR, &physr) < 0)
+        return usb_asix.link;
+    if (!(physr & GMII_PHY_PHYSR_LINK)) {
+        usb_asix.link = 0;
+        return 0;
+    }
+    usb_asix.link = 1;
+    (void)usb_asix_mac_read(AX_PHYSICAL_LINK_STAT, &linksts, 1);
+    mode = (WORD)(AX_MEDIUM_RECEIVE_EN | AX_MEDIUM_TXFLOW_CTRLEN |
+                  AX_MEDIUM_RXFLOW_CTRLEN);
+    if (GMII_PHY_PHYSR_GIGA == (physr & GMII_PHY_PHYSR_SMASK)) {
+        mode |= (WORD)(AX_MEDIUM_GIGAMODE | AX_MEDIUM_EN_125MHZ);
+        if (linksts & AX_USB_SS)
+            memcpy(tmp, ax_bulk_in_size[0], 5);
+        else if (linksts & AX_USB_HS)
+            memcpy(tmp, ax_bulk_in_size[1], 5);
+        else
+            memcpy(tmp, ax_bulk_in_size[3], 5);
+    } else if (GMII_PHY_PHYSR_100 == (physr & GMII_PHY_PHYSR_SMASK)) {
+        mode |= AX_MEDIUM_PS;
+        if (linksts & (AX_USB_SS | AX_USB_HS))
+            memcpy(tmp, ax_bulk_in_size[2], 5);
+        else
+            memcpy(tmp, ax_bulk_in_size[3], 5);
+    } else {
+        memcpy(tmp, ax_bulk_in_size[3], 5);
+    }
+    usb_asix_mac_write(AX_RX_BULKIN_QCTRL, tmp, 5);
+    if (physr & GMII_PHY_PHYSR_FULL)
+        mode |= AX_MEDIUM_FULL_DUPLEX;
+    usb_asix_mac_write(AX_MEDIUM_STATUS_MODE, &mode, 2);
+    return 1;
+}
+
+static void usb_asix_get_mac(void *drv, unsigned char mac[ETH_ADDR_LEN])
+{
+    int i;
+    (void)drv;
+    for (i = 0; i < ETH_ADDR_LEN; i++)
+        mac[i] = usb_asix.mac[i];
+}
+
+static int usb_asix_link_up(void *drv)
+{
+    (void)drv;
+    return usb_asix.ready && usb_asix.link ? 1 : 0;
+}
+
+static int usb_asix_transmit(void *drv, struct pbuf *p)
+{
+    DWORD len;
+    (void)drv;
+    if (!usb_asix.ready || !p || !usb_asix.txbuf || p->len < 1 ||
+        p->len > ETH_MAX_FRAME)
+        return -1;
+    len = (DWORD)p->len;
+    asix_tx_header(len, usb_asix.mps_out, usb_asix.txbuf);
+    memcpy(usb_asix.txbuf + USB_ASIX_TXHDR_SZ, p->data, len);
+    usb_io_lock_acquire();
+    if (!xhci_bulk(usb_xhci_hcd, usb_asix.dev, usb_asix.ep_out, 0,
+                   usb_asix.txbuf, (int)(USB_ASIX_TXHDR_SZ + len))) {
+        usb_io_lock_release();
+        return -1;
+    }
+    usb_io_lock_release();
+    return 0;
+}
+
+static void usb_asix_rx_one(void *drv)
+{
+    int got = 0;
+    asix_rx_iter it;
+    asix_rx_frame f;
+    (void)drv;
+    if (!usb_asix.ready || !usb_asix.rxbuf)
+        return;
+    usb_io_lock_acquire();
+    if (!xhci_bulk_in_try(usb_xhci_hcd, usb_asix.dev, usb_asix.ep_in,
+                          usb_asix.rxbuf, USB_ASIX_RXBUF_SZ, &got,
+                          XHCI_ECM_IN_SPINS) ||
+        got < 4 || got > USB_ASIX_RXBUF_SZ) {
+        usb_io_lock_release();
+        return;
+    }
+    usb_io_lock_release();
+    asix_rx_iter_init(&it, usb_asix.rxbuf, (unsigned int)got);
+    while (asix_rx_iter_next(&it, &f)) {
+        struct pbuf *p = pbuf_alloc((u16)f.len);
+        if (!p)
+            continue;
+        /* Each bundled frame is 2 IP-align bytes + the Ethernet frame. */
+        memcpy(p->data, usb_asix.rxbuf + f.off, f.len);
+        net_lock();
+        netif_input(&usb_asix.nif, p);
+        net_unlock();
+    }
+}
+
+static const struct netdev_ops usb_asix_ops = {
+    .transmit = usb_asix_transmit,
+    .link_up = usb_asix_link_up,
+    .poll = usb_asix_rx_one,
+    .get_mac = usb_asix_get_mac,
+};
+
+void usb_asix_poll(void)
+{
+    extern DWORD time_count;
+    DWORD now = time_count;
+    if (!usb_asix.ready)
+        return;
+    if (now - usb_asix.last_link_secs >= 2) {
+        usb_asix.last_link_secs = now;
+        usb_asix.link = usb_asix_check_link();
+        usb_asix.nif.link_up = usb_asix.link ? 1 : 0;
+    }
+    usb_asix_rx_one(&usb_asix);
+}
+
+static int usb_enumerate_asix(DWORD dev)
+{
+    BYTE devdesc[18];
+    BYTE cfghdr[9];
+    BYTE cfg[256];
+    WORD total;
+    DWORD vid, pid;
+
+    if (!usb_get_desc_dev(dev, USB_DESC_DEVICE, 0, devdesc, 8))
+        return 0;
+    if (!xhci_set_ep0_packet_size(usb_xhci_hcd, dev, devdesc[7]))
+        return 0;
+    if (!usb_get_desc_dev(dev, USB_DESC_DEVICE, 0, devdesc, 18))
+        return 0;
+    vid = (DWORD)devdesc[8] | ((DWORD)devdesc[9] << 8);
+    pid = (DWORD)devdesc[10] | ((DWORD)devdesc[11] << 8);
+    if (vid != USB_ASIX_VID || pid != USB_ASIX_PID) {
+        printf("usb: port is not ASIX AX88179 (vid=%04x pid=%04x)\n",
+               (unsigned)vid, (unsigned)pid);
+        return 0;
+    }
+    printf("usb: asix vid=%04x pid=%04x\n", (unsigned)vid, (unsigned)pid);
+    if (!usb_get_desc_dev(dev, USB_DESC_CONFIG, 0, cfghdr, 9))
+        return 0;
+    total = (WORD)(cfghdr[2] | (cfghdr[3] << 8));
+    if (total < 9 || total > (WORD)sizeof(cfg))
+        total = 9;
+    if (!usb_get_desc_dev(dev, USB_DESC_CONFIG, 0, cfg, total))
+        return 0;
+    if (!usb_asix_parse_config(cfg, total)) {
+        printf("usb: no ASIX bulk endpoints in config\n");
+        return 0;
+    }
+    if (!usb_set_config_dev(dev, usb_asix.cfgval))
+        return 0;
+    if (!xhci_configure_endpoints(usb_xhci_hcd, dev, usb_asix.ep_in,
+                                  usb_asix.mps_in, usb_asix.burst_in,
+                                  usb_asix.ep_out, usb_asix.mps_out,
+                                  usb_asix.burst_out))
+        return 0;
+    usb_asix.dev = dev;
+    /* Let the bridge firmware settle after SET_CONFIGURATION + EP config
+       before the first vendor register access. */
+    usb_wait_ms(100);
+    if (!usb_asix_reset()) {
+        printf("usb: asix reset/init failed\n");
+        return 0;
+    }
+    usb_asix.link = usb_asix_check_link();
+    printf("usb: asix ready ep_in=%u ep_out=%u mps=%u/%u link=%d\n",
+           (unsigned)usb_asix.ep_in, (unsigned)usb_asix.ep_out,
+           (unsigned)usb_asix.mps_in, (unsigned)usb_asix.mps_out,
+           usb_asix.link);
+    return 1;
+}
+
+static int usb_xhci_bind_asix(void)
+{
+    extern DWORD time_count;
+    DWORD used_ports = 0;
+    DWORD dev_slot = 0;
+    DWORD port;
+    int i;
+
+    if (!usb_xhci_hcd || usb_asix.ready)
+        return 0;
+    for (i = 0; i < XHCI_MAX_USBDEVS; i++)
+        if (usb_xhci_hcd->usbdevs[i].port)
+            used_ports |= xhci_ccs_bit(usb_xhci_hcd->usbdevs[i].port);
+    for (dev_slot = 2; dev_slot < XHCI_MAX_USBDEVS; dev_slot++) {
+        if (!usb_xhci_hcd->usbdevs[dev_slot].port)
+            break;
+    }
+    if (dev_slot >= XHCI_MAX_USBDEVS)
+        dev_slot = 0;
+    if (!dev_slot) {
+        printf("usb: no free xHCI slot for ASIX NIC\n");
+        return 0;
+    }
+    usb_xhci_hcd->enumerating = 1;
+    usb_xhci_hcd->recovery_needed = 0;
+    for (port = 1; port <= usb_xhci_hcd->max_ports && port <= 32; port++) {
+        if (!(xhci_port_ccs_mask(usb_xhci_hcd) & xhci_ccs_bit(port)))
+            continue;
+        if (used_ports & xhci_ccs_bit(port))
+            continue;
+        printf("xhci: trying ASIX port %u (slot %u)\n", port, dev_slot);
+        if (!xhci_claim_port_dev(usb_xhci_hcd, port, dev_slot))
+            continue;
+        if (usb_enumerate_asix(dev_slot)) {
+            if (!usb_asix.txbuf)
+                usb_asix.txbuf = (BYTE *)malloc(USB_ASIX_TXBUF_SZ);
+            if (!usb_asix.rxbuf)
+                usb_asix.rxbuf = (BYTE *)malloc(USB_ASIX_RXBUF_SZ);
+            if (!usb_asix.txbuf || !usb_asix.rxbuf) {
+                printf("xhci: no DMA buffer for ASIX NIC\n");
+                xhci_release_dev(usb_xhci_hcd, dev_slot);
+                usb_xhci_hcd->recovery_needed = 0;
+                continue;
+            }
+            usb_asix.port = port;
+            usb_asix.last_link_secs = time_count;
+            usb_asix.ndev.drv = &usb_asix;
+            usb_asix.ndev.ops = &usb_asix_ops;
+            usb_asix.ndev.name[0] = 'a';
+            usb_asix.ndev.name[1] = 'x';
+            usb_asix.ndev.name[2] = '0';
+            usb_asix.ndev.name[3] = 0;
+            netif_init(&usb_asix.nif, &usb_asix.ndev);
+            if (!netif_default())
+                netif_set_default(&usb_asix.nif);
+            usb_asix.ready = 1;
+            usb_registry_add((int)dev_slot, port, (int)dev_slot,
+                             USB_DRV_ASIX, &usb_asix, "usb-asix");
+            usb_xhci_hcd->enumerating = 0;
+            serial_puts("ASIX_NIC_OK\n");
+            return 1;
+        }
+        xhci_release_dev(usb_xhci_hcd, dev_slot);
+        usb_xhci_hcd->recovery_needed = 0;
+    }
+    usb_xhci_hcd->enumerating = 0;
+    return 0;
+}
+
+static void usb_asix_tear_down(void)
+{
+    WORD two = 0;
+    if (!usb_asix.ready)
+        return;
+    (void)usb_asix_mac_write(AX_RX_CTL, &two, 2);
+    usb_asix.ready = 0;
+    usb_asix.nif.link_up = 0;
+}
+
+#ifdef KTEST
+/* In-kernel real-LAN acceptance self-test (KTEST builds only).
+   Boot cmdline keys:
+     asix-peer=A.B.C.D  host/peer to ping + run the echo servers on
+     asix-gw=A.B.C.D    optional gateway override (else DHCP gateway)
+     asix-udp=PORT      UDP echo port (default 20001)
+     asix-tcp=PORT      TCP echo port (default 20002) */
+static int asix_cmdline_u32(const char *key, unsigned int def)
+{
+    const char *p;
+    unsigned int v = 0;
+    int digits = 0;
+
+    p = strstr(kernel_cmdline, key);
+    if (!p)
+        return (int)def;
+    p += (unsigned int)strlen(key);
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10u + (unsigned int)(*p - '0');
+        p++;
+        digits = 1;
+    }
+    return digits ? (int)v : (int)def;
+}
+
+static int asix_cmdline_ip(const char *key, unsigned int *out)
+{
+    const char *p;
+    unsigned int a = 0, b = 0, c = 0, d = 0;
+    int da = 0, db = 0, dc = 0, dd = 0;
+
+    p = strstr(kernel_cmdline, key);
+    if (!p)
+        return 0;
+    p += (unsigned int)strlen(key);
+    while (*p >= '0' && *p <= '9') { a = a * 10u + (*p - '0'); p++; da = 1; }
+    if (*p != '.')
+        return 0;
+    p++;
+    while (*p >= '0' && *p <= '9') { b = b * 10u + (*p - '0'); p++; db = 1; }
+    if (*p != '.')
+        return 0;
+    p++;
+    while (*p >= '0' && *p <= '9') { c = c * 10u + (*p - '0'); p++; dc = 1; }
+    if (*p != '.')
+        return 0;
+    p++;
+    while (*p >= '0' && *p <= '9') { d = d * 10u + (*p - '0'); p++; dd = 1; }
+    if (!da || !db || !dc || !dd)
+        return 0;
+    *out = (a << 24) | (b << 16) | (c << 8) | d;
+    return 1;
+}
+
+static void usb_asix_selftest(void)
+{
+    struct inet_config cfg;
+    unsigned int peer = 0, gw = 0;
+    unsigned int udp_port = 20001, tcp_port = 20002;
+    int have_peer = 0, have_gw = 0, dhcp_ok = 0;
+    int pass = 1;
+
+    if (!usb_asix.ready) {
+        printf("ASIX_NET_FAIL not-ready\n");
+        return;
+    }
+    printf("ASIX_START\n");
+    inet_config_from_cmdline(&cfg, kernel_cmdline);
+    if (asix_cmdline_ip("asix-peer=", &peer))
+        have_peer = 1;
+    if (asix_cmdline_ip("asix-gw=", &gw))
+        have_gw = 1;
+    udp_port = (unsigned int)asix_cmdline_u32("asix-udp=", 20001);
+    tcp_port = (unsigned int)asix_cmdline_u32("asix-tcp=", 20002);
+
+    arp_init(&usb_asix.nif);
+    tcp_init();
+    usb_asix.nif.link_up = 1;
+    if (dhcp_client(&usb_asix.nif, &cfg, 8000000) == 0) {
+        dhcp_ok = 1;
+        printf("NET_DHCP_OK ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
+               (cfg.ip >> 24) & 0xFF, (cfg.ip >> 16) & 0xFF,
+               (cfg.ip >> 8) & 0xFF, cfg.ip & 0xFF,
+               (cfg.gateway >> 24) & 0xFF, (cfg.gateway >> 16) & 0xFF,
+               (cfg.gateway >> 8) & 0xFF, cfg.gateway & 0xFF);
+    } else {
+        printf("NET_DHCP_FAIL\n");
+        inet_config_from_cmdline(&cfg, kernel_cmdline);
+    }
+    netif_set_addr(&usb_asix.nif, cfg.ip, cfg.netmask, cfg.gateway);
+    netif_set_up(&usb_asix.nif);
+    if (have_gw)
+        usb_asix.nif.gateway = gw;
+    printf("NETIF_UP ip=%u.%u.%u.%u gw=%u.%u.%u.%u dhcp=%d peer=%d\n",
+           (cfg.ip >> 24) & 0xFF, (cfg.ip >> 16) & 0xFF,
+           (cfg.ip >> 8) & 0xFF, cfg.ip & 0xFF,
+           (usb_asix.nif.gateway >> 24) & 0xFF,
+           (usb_asix.nif.gateway >> 16) & 0xFF,
+           (usb_asix.nif.gateway >> 8) & 0xFF, usb_asix.nif.gateway & 0xFF,
+           dhcp_ok, have_peer);
+
+    /* Primary ping target is the host peer (always answers ICMP); the DHCP
+       gateway is best-effort (routers often block ICMP). */
+    if (have_peer) {
+        if (icmp_ping(&usb_asix.nif, peer, 300) == 0)
+            printf("NET_PING_OK peer\n");
+        else {
+            printf("NET_PING_FAIL peer\n");
+            pass = 0;
+        }
+    } else if (icmp_ping(&usb_asix.nif, cfg.gateway, 300) == 0) {
+        printf("NET_PING_OK gw\n");
+    } else {
+        printf("NET_PING_FAIL gw\n");
+        pass = 0;
+    }
+
+    if (have_peer) {
+        if (udp_echo_client(&usb_asix.nif, peer, (unsigned short)udp_port,
+                            4000000) == 0)
+            printf("NET_UDP_OK\n");
+        else {
+            printf("NET_UDP_FAIL\n");
+            pass = 0;
+        }
+        if (tcp_echo_client(&usb_asix.nif, peer, (unsigned short)tcp_port,
+                            8000000) == 0)
+            printf("NET_TCP_OK\n");
+        else {
+            printf("NET_TCP_FAIL\n");
+            pass = 0;
+        }
+    } else {
+        printf("ASIX_NET_FAIL no-peer\n");
+        pass = 0;
+    }
+
+    softnet_init();
+    printf("NET_SOFTNET_OK\n");
+    if (pass && dhcp_ok && have_peer)
+        printf("ASIX_NET_PASS\n");
+    else
+        printf("ASIX_NET_FAIL\n");
+}
+#endif /* KTEST: usb_asix_selftest */
+
+ static int usb_xhci_recover(void)
 {
     usb_xhci_recovering = 1;
     usb_cdc_reset_state();
+    usb_ecm_tear_down();
+    usb_rndis_tear_down();
+    usb_asix_tear_down();
     xhci_stop_hcd(usb_xhci_hcd);
     usb_xhci_hcd->recovery_needed = 0;
     if (!xhci_init_hcd(usb_xhci_hcd) || !usb_xhci_bind_msc()) {
@@ -2394,8 +4279,14 @@ static int usb_xhci_recover(void)
         usb_invalidate_storage_cache();
         usb_xhci_recovering = 0;
         usb_cdc_reset_state();
+        usb_ecm_tear_down();
+        usb_rndis_tear_down();
+        usb_asix_tear_down();
         return 0;
     }
+    usb_xhci_bind_ecm();
+    usb_xhci_bind_rndis();
+    usb_xhci_bind_asix();
     usb_xhci_bind_cdc();
     usb_xhci_recovery_count++;
     usb_xhci_hcd->recovery_needed = 0;
@@ -2417,10 +4308,16 @@ static int usb_xhci_reconnect(void)
     int initial_attach = (old_blocks == 0);
     usb_xhci_recovering = 1;
     usb_cdc_reset_state();
+    usb_ecm_tear_down();
+    usb_rndis_tear_down();
+    usb_asix_tear_down();
     xhci_stop_hcd(usb_xhci_hcd);
     usb_xhci_hcd->recovery_needed = 0;
     if (!xhci_init_hcd(usb_xhci_hcd) || !usb_xhci_bind_msc())
         goto fail;
+    usb_xhci_bind_ecm();
+    usb_xhci_bind_rndis();
+    usb_xhci_bind_asix();
     usb_xhci_bind_cdc();
     if (!initial_attach) {
         if (usb_msc0.drive.total_blocks != old_blocks ||
@@ -2445,6 +4342,9 @@ fail:
     usb_msc0.drive.block_size = old_block_size;
     usb_msc0.drive.present = 0;
     usb_xhci_recovering = 0;
+    usb_ecm_tear_down();
+    usb_rndis_tear_down();
+    usb_asix_tear_down();
     return 0;
 }
 
@@ -2506,6 +4406,9 @@ static void usb_xhci_hotplug_monitor(void)
     }
 }
 
+#ifdef KTEST
+/* xHCI fault-injection / recovery / disconnect / multi-MSC self-tests.
+   Compiled only into KTEST (dev/test) kernels; stripped from production. */
 static int usb_xhci_recovery_selftest(void)
 {
     int before = usb_xhci_recovery_count;
@@ -2686,10 +4589,12 @@ int usb_xhci_mounted_disconnect_selftest(void)
     serial_puts("XHCI_MOUNTED_DISCONNECT_CACHE_OK\n");
     return 1;
 fail:
-    serial_puts("XHCI_MOUNTED_DISCONNECT_CACHE_FAIL\n");
+    serial_puts("XCHI_MOUNTED_DISCONNECT_CACHE_FAIL\n");
     return 0;
 }
+#endif /* KTEST: end xHCI recovery/stall/disconnect/mounted self-tests */
 
+/* Production: locate the UHCI host controller (class 0C/03, prog-if 00). */
 static int uhci_find_controller(BYTE *bus, BYTE *slot, BYTE *func)
 {
     BYTE b, s, f;
@@ -2735,6 +4640,7 @@ static int usb_xhci_probe_msc(void)
     return 0;
 }
 
+#ifdef KTEST
 /* Phase 2 two-disk gate (cmdline: xhci-multi-msc-test). Confirms the primary
    (usb0) and a secondary (usb1) are both bound as independent MSC drives:
    each is readable at block 0, their media identities differ (two real disks,
@@ -2799,6 +4705,7 @@ static void usb_xhci_multi_msc_selftest(void)
     }
     serial_puts("XHCI_MULTI_MSC_OK primary=usb0 secondary=usb1 block=512\n");
 }
+#endif /* KTEST: xHCI recovery/disconnect/multi-MSC self-tests */
 
 int usb_init(void)
 {
@@ -2823,6 +4730,7 @@ int usb_init(void)
             printf("usb: no xHCI mass-storage device\n");
             return -1;
         }
+#ifdef KTEST
         if (strstr(kernel_cmdline, "xhci-msix-test") &&
             !usb_xhci_hcd->has_msix) {
             serial_puts("XHCI_MSIX_FAIL\n");
@@ -2850,6 +4758,7 @@ int usb_init(void)
             xhci_stop_hcd(usb_xhci_hcd);
             return pass ? 0 : -1;
         }
+#endif
         found_dev = 1;
         goto register_device;
     }
@@ -2903,6 +4812,7 @@ int usb_init(void)
             printf("usb: no xHCI mass-storage device\n");
             return -1;
         }
+#ifdef KTEST
         if (strstr(kernel_cmdline, "xhci-msix-test") &&
             !usb_xhci_hcd->has_msix) {
             serial_puts("XHCI_MSIX_FAIL\n");
@@ -2930,21 +4840,52 @@ int usb_init(void)
             xhci_stop_hcd(usb_xhci_hcd);
             return pass ? 0 : -1;
         }
+#endif
         found_dev = 1;
     }
 
 register_device:
-    if (usb_host == USB_HOST_XHCI)
-        usb_xhci_bind_cdc();
     usb_msc0.drive.present = 1;
     if (!usb_publish_storage_devices(&usb_msc0, 0))
         return -1;
     /* Multi-MSC: bind every other connected drive as usb1, usb2, ... */
     if (usb_host == USB_HOST_XHCI)
         usb_bind_secondary_msc();
+   /* CDC-ECM NIC: claim a free xHCI slot and expose it as a polled netif.
+        Bind before the CDC-ACM console so a composite network gadget (QEMU
+        usb-net advertises RNDIS as config[0] and CDC-ECM as config[1]) is
+        claimed by the NIC, not mis-bound as a serial console. */
+    if (usb_host == USB_HOST_XHCI) {
+        /* The RNDIS self-test wants the same QEMU usb-net gadget as a RNDIS
+           NIC (config value 2), so hold the ECM binder back on that path;
+           the RNDIS binder below then claims the free port. */
+        if (!strstr(kernel_cmdline, "usb-rndis-test"))
+             usb_xhci_bind_ecm();
+         usb_xhci_bind_rndis();
+         /* ASIX AX88179 (0b95:1790) is a real usb-host passthrough NIC; the
+            binder is a no-op unless that exact VID/PID is present, so it never
+          steals the QEMU usb-net (RNDIS/ECM) gadget. */
+    usb_xhci_bind_asix();
+    }
+    if (usb_host == USB_HOST_XHCI)
+        usb_xhci_bind_cdc();
+ #ifdef KTEST
     if (usb_host == USB_HOST_XHCI &&
         strstr(kernel_cmdline, "xhci-multi-msc-test"))
         usb_xhci_multi_msc_selftest();
+    if (usb_host == USB_HOST_XHCI &&
+        strstr(kernel_cmdline, "usb-ecm-test"))
+        usb_ecm_selftest();
+  if (usb_host == USB_HOST_XHCI &&
+        strstr(kernel_cmdline, "usb-ecm-recover-test"))
+        usb_xhci_ecm_recover_selftest();
+ if (usb_host == USB_HOST_XHCI &&
+        strstr(kernel_cmdline, "usb-rndis-test"))
+        usb_rndis_selftest();
+    if (usb_host == USB_HOST_XHCI &&
+        strstr(kernel_cmdline, "asix-test"))
+        usb_asix_selftest();
+  #endif
     return 0;
 }
 

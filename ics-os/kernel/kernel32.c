@@ -1021,6 +1021,7 @@ void dex_init(){
       printf("Initializing RTL8821CE Wi-Fi...\n");
       rtw8821ce_init();
 
+   #ifdef KTEST
         if (mounted &&
            (strstr(kernel_cmdline, "xhci-mounted-disconnect-test") ||
             strstr(kernel_cmdline, "xhci-mounted-reconnect-test") ||
@@ -1042,12 +1043,13 @@ void dex_init(){
                 vfs_remount_device("fat","usb0p0","icsos") != -1 &&
                 vfs_searchname("icsos/vmdex"))
                printf("XHCI_MOUNTED_REMOUNT_OK\n");
-            else
-               printf("XHCI_MOUNTED_REMOUNT_FAIL\n");
-         }
-      }
+           else
+               printf("XCHI_MOUNTED_REMOUNT_FAIL\n");
+          }
+       }
+#endif
 
-      /* Writable scratch FS for in-OS compiles (selfhost / tccboot).
+       /* Writable scratch FS for in-OS compiles (selfhost / tccboot).
          Start the console before xHCI hotplug/CDC pump: Intel ADL-N can
          block forever in usb_cdc_pump after Root mount, which used to
          leave GOP stuck there with no prompt. */

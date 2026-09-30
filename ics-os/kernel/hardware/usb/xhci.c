@@ -132,9 +132,13 @@ typedef struct {
     DWORD scratchpad_count;
     volatile int recovery_needed;
     int enumerating;
+#ifdef KTEST
+    /* Deterministic fault-injection latches; only reachable from the
+       in-kernel self-tests (KTEST=1). Absent from production kernels. */
     volatile int fault_drop_next;
     volatile int fault_fail_init;
     volatile int fault_disconnect_inflight;
+#endif
     volatile int connection_lost;
     DWORD stalled_endpoints;
     volatile DWORD irq_count;
@@ -1082,7 +1086,9 @@ static int xhci_transfer_sg(xhci_hcd *hcd, DWORD dev, xhci_ring *ring,
     DWORD index;
     DWORD len = 0;
     DWORD trb_count = 0;
+#ifdef KTEST
     int drop = hcd->fault_drop_next;
+#endif
     int result = 0;
     dma_sg_mapping mapping = { { { 0 } }, 0, 0, 0 };
     xhci_trb *last;
@@ -1112,7 +1118,8 @@ static int xhci_transfer_sg(xhci_hcd *hcd, DWORD dev, xhci_ring *ring,
         if (!last)
             goto out;
     }
-    xhci_mb();
+  xhci_mb();
+#ifdef KTEST
     if (drop) {
         hcd->fault_drop_next = 0;
         printf("xhci: test dropping bulk doorbell ep=%u\n", endpoint);
@@ -1125,9 +1132,13 @@ static int xhci_transfer_sg(xhci_hcd *hcd, DWORD dev, xhci_ring *ring,
         hcd->fault_disconnect_inflight = 0;
         printf("XHCI_DISCONNECT_INFLIGHT\n");
            for (waits = 0; waits < XHCI_TIMEOUT &&
-               xhci_usbdev_connected(hcd, dev); waits++)
-            usb_io_delay();
+                xhci_usbdev_connected(hcd, dev); waits++)
+             usb_io_delay();
     }
+#else
+    hcd->doorbell[ud->slot] = endpoint;
+    xhci_mb();
+#endif
     {
         DWORD wait_spins;
         if (xhci_ring_is_cdc(hcd, ring))
@@ -1738,11 +1749,13 @@ static int xhci_init_hcd(xhci_hcd *hcd)
     bus = hcd->pci_bus;
     slot = hcd->pci_slot;
     func = hcd->pci_func;
+#ifdef KTEST
     if (hcd->fault_fail_init) {
         hcd->fault_fail_init = 0;
         printf("xhci: test forcing recovery initialization failure\n");
         return 0;
     }
+#endif
     if (!xhci_pci_bar(bus, slot, func, &bar, &bar_size) ||
         bar + bar_size < bar) {
         printf("xhci: unsupported BAR 0x%llx\n", (unsigned long long)bar);

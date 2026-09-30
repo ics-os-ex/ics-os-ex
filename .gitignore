@@ -27,6 +27,7 @@ ics-os/kernel/**/*.d
 ics-os/kernel/cpu/*.o
 j.img
 ics-os/kernel/build_info.h
+ics-os/kernel/ktest.h
 ics-os/tmp/
 ics-os/tmp-usb/
 ics-os/contrib/**/*.exe

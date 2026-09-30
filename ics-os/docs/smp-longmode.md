@@ -357,12 +357,37 @@ concurrent TCP/UDP clients under `user-smp` (`NETSTRESS_PASS`). Host TAP:
 
 Identity-mapped low 4GiB. **Source of truth:** `kernel/memory/memlayout.h`.
 The page allocator skips that reserved-range table; the linker
-`ASSERT`s `bssEnd <= 0x3F0000` (a 64KiB guard under the 4MiB user-ELF base;
-the former 256KiB "frame stack" was replaced by the global frame pool) so the
-kernel cannot grow into TinyCC's ELF window. `KMMIO_BASE` reserves a 2 MiB kernel-only MMIO window for
-device BARs above 4 GiB. Kernel stacks are `.bss` arrays. Kernel heap is a
-closed 32MiB interval; `sbrk` must not `mempop`. Add new regions to
-the header first.
+`ASSERT`s `bssEnd <= 0x3FB000` and `bootptEnd <= 0x400000` so the whole
+kernel image (BSS plus the `.bootpt` boot page tables that follow it) stays
+below the 4 MiB user-ELF base (TinyCC `ELF_START_ADDR`). The former 256KiB
+"frame stack" after `bssEnd` was replaced by the global frame pool, so only
+a small guard is needed. As of 2026-10-01 the kernel sits at
+`bssEnd=0x3F6834` / `bootptEnd=0x3FE000` (8 KiB headroom under 4 MiB);
+`PARTDEV_MAX=64` keeps the partition table small enough to fit. The boot
+PML4 maps the low 4 GiB identity (index 0) *and* a high canonical direct
+alias `KDIRECT_BASE=0xFFFF800000000000` (PML4 index 256) for the same low
+4 GiB; user PML4s keep index 256 so kernel code can reach physical frames
+via `KDIRECT()` even when CR3 points at a privatized user map. `KMMIO_BASE`
+reserves a 2 MiB kernel-only MMIO window for device BARs above 4 GiB. Kernel
+stacks are `.bss` arrays. Kernel heap is a closed 32MiB interval; `sbrk`
+must not `mempop`. Add new regions to the header first.
+
+**Tier 1 follow-up (deferred): high-VA kernel split.** The kernel *image*
+(text/data/BSS) is still linked at the legacy low VA `0x0`, so it shares the
+low 4 GiB identity map with user pages and the 4 MiB user-ELF window — that
+sharing is exactly what the `bssEnd`/`bootptEnd` ceiling above enforces. The
+planned split re-bases the kernel image onto the high canonical VA
+(`0xFFFF800000000000`), so kernel code/data no longer occupy the low 4 GiB
+and the 4 MiB user-ELF base is freed for a larger kernel. Only the physical
+load address stays low (GRUB multiboot2); the ELF virtual addresses move to
+the high base, and the boot must run at low VA long enough to publish the
+high map before switching the kernel's RIP up. It is a high-risk change
+touching `lscript64.ld` (link base), `startup.S` (early low-VA boot → high
+map → RIP switch), `dexmem.c` (user PTs, `getphys64`, KDIRECT), `process.c`
+(VA windows, kstacks), `ap_trampoline.S` (AP CR3/KBASE), and the
+kexec/ELF-loader paths; the high base must stay consistent across the link
+script, the boot high map (PML4 index 256), and `KDIRECT_BASE`. Tracked as a
+separate task — not part of the current USB/ASIX work.
 
 Next: GCC 4.7.4 self-host (`docs/gcc-selfhost.md`) / ring-3 / user processes
 on any CPU. TinyCC kbuild is deferred.

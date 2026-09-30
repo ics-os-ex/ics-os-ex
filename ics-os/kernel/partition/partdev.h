@@ -13,7 +13,9 @@
 #ifndef PARTDEV_H
 #define PARTDEV_H
 
-#define PARTDEV_MAX           192
+/* Global partition cap. 192 pushed the kernel BSS to the 4MiB user-ELF wall;
+   64 keeps generous headroom for boot+data+test images while freeing BSS. */
+#define PARTDEV_MAX           64
 #define PARTDEV_MAX_PER_DISK  32
 #define PARTDEV_MAX_DISKS     16
 

@@ -11,7 +11,9 @@
 int usb_init(void);
 int usb_storage_available(void);
 int usb_start_hotplug_monitor(void);
+#ifdef KTEST
 int usb_xhci_mounted_disconnect_selftest(void);
+#endif
 
 void usb_cdc_putc(int c);
 int usb_cdc_present(void);

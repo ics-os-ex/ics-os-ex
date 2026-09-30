@@ -25,6 +25,26 @@ void softnet_tick(void)
         rtw8821ce_poll();
     }
 
+    /* CDC-ECM USB NIC RX: no controller IRQ, harvest the posted bulk-IN. */
+    {
+        extern void usb_ecm_poll(void);
+        usb_ecm_poll();
+    }
+
+   /* RNDIS USB NIC RX + periodic KEEPALIVE: harvest the posted bulk-IN and
+        keep the session alive on real gadgets. */
+    {
+        extern void usb_rndis_poll(void);
+        usb_rndis_poll();
+    }
+
+    /* ASIX AX88179 USB NIC RX: harvest the posted bulk-IN bundle and poll
+        link state from the PHY. */
+    {
+        extern void usb_asix_poll(void);
+        usb_asix_poll();
+    }
+
     nif = netif_default();
     if (!nif || !nif->configured)
         return;
